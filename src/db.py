@@ -1462,6 +1462,15 @@ def _migrate_metrics_to_evaluators(
     """One-time migration: copy rows from legacy `metrics` table to `evaluators` and rewrite the
     `simulation_metrics` pivot as `simulation_evaluators`. Idempotent via `source_metric_uuid`.
     """
+    def _legacy_metric_criteria(row: sqlite3.Row) -> str:
+        return (row["description"]).strip()
+
+    def _simulation_prompt_for_metric(row: sqlite3.Row) -> str:
+        return DEFAULT_PROMPTS_BY_PURPOSE["simulation"]["system_prompt"].replace(
+            "<ENTER EVALUATION CRITERIA HERE>",
+            _legacy_metric_criteria(row),
+        )
+
     try:
         cursor.execute(
             "SELECT uuid, name, description, config, user_id, created_at, updated_at, deleted_at "
@@ -1484,6 +1493,18 @@ def _migrate_metrics_to_evaluators(
         if legacy_uuid in migrated:
             continue
 
+        cursor.execute(
+            "SELECT 1 FROM simulation_metrics WHERE metric_id = ? AND deleted_at IS NULL LIMIT 1",
+            (legacy_uuid,),
+        )
+        is_simulation_metric = cursor.fetchone() is not None
+        evaluator_type = "simulation" if is_simulation_metric else "llm"
+        system_prompt = (
+            _simulation_prompt_for_metric(row)
+            if is_simulation_metric
+            else _legacy_metric_criteria(row)
+        )
+
         evaluator_uuid = str(uuid.uuid4())
         cursor.execute(
             """
@@ -1492,13 +1513,14 @@ def _migrate_metrics_to_evaluators(
                  evaluator_type, data_type, kind,
                  output_type, source_metric_uuid,
                  created_at, updated_at, deleted_at)
-            VALUES (?, ?, ?, ?, 'llm', 'text', 'single', 'binary', ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'text', 'single', 'binary', ?, ?, ?, ?)
             """,
             (
                 evaluator_uuid,
                 row["name"],
                 row["description"],
                 row["user_id"],
+                evaluator_type,
                 legacy_uuid,
                 row["created_at"],
                 row["updated_at"],
@@ -1518,7 +1540,7 @@ def _migrate_metrics_to_evaluators(
                 version_uuid,
                 evaluator_uuid,
                 DEFAULT_TEXT_JUDGE_MODEL,
-                row["description"] or row["name"],
+                system_prompt,
                 json.dumps(_BINARY_CONFIG),
             ),
         )
@@ -1581,8 +1603,8 @@ def _backfill_test_evaluator_links(
             continue
 
         cursor.execute(
-            "SELECT 1 FROM test_evaluators WHERE test_id = ? AND evaluator_id = ? AND deleted_at IS NULL",
-            (test_uuid, default_evaluator_uuid),
+            "SELECT 1 FROM test_evaluators WHERE test_id = ? AND deleted_at IS NULL",
+            (test_uuid,),
         )
         if cursor.fetchone():
             continue

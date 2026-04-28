@@ -219,6 +219,7 @@ class JudgeResult(BaseModel):
 class TestCaseResult(BaseModel):
     """Result for a single test case matching calibrate results.json structure"""
 
+    test_case_id: Optional[str] = None
     name: Optional[str] = None  # Test name, present during in-progress and done states
     passed: Optional[bool] = None  # Only present when done
     reasoning: Optional[str] = (
@@ -368,7 +369,10 @@ async def get_agent_test_runs(agent_uuid: str):
         # Extract results from job
         job_results = job.get("results") or {}
         job_details = job.get("details") or {}
-        evaluators_snapshot = job_details.get("evaluators_by_test_name") or {}
+        evaluators_snapshot = (
+            job_details.get("evaluators_by_test_id")
+            or {}
+        )
 
         # Refresh evaluator names + uuids on per-row judge_results before serializing
         _enrich_test_results_with_evaluators(
@@ -446,7 +450,10 @@ async def get_all_test_runs_for_user(
     for job in jobs:  # already newest-first
         job_results = job.get("results") or {}
         job_details = job.get("details") or {}
-        evaluators_snapshot = job_details.get("evaluators_by_test_name") or {}
+        evaluators_snapshot = (
+            job_details.get("evaluators_by_test_id")
+            or {}
+        )
 
         # Refresh evaluator names + uuids on per-row judge_results before serializing
         _enrich_test_results_with_evaluators(
@@ -548,9 +555,9 @@ def _build_calibrate_config(
         model: Optional model override. If None, uses agent's llm.model or defaults to gpt-4.1
 
     Returns:
-        Tuple of (config, evaluators_by_test_name).
+        Tuple of (config, evaluators_by_test_id).
 
-        ``evaluators_by_test_name`` maps test name → ordered list of evaluator
+        ``evaluators_by_test_id`` maps test UUID → ordered list of evaluator
         snapshot dicts for response-type tests. Each entry has:
           - ``uuid`` / ``name`` — evaluator UUID and the calibrate-rendered name
             (the key calibrate uses inside ``metrics.judge_results``), used to
@@ -632,7 +639,7 @@ def _build_calibrate_config(
         tests_with_evaluators
     )
 
-    # Snapshot mapping test name → ordered list of evaluator snapshot dicts for
+    # Snapshot mapping test UUID → ordered list of evaluator snapshot dicts for
     # response-type evaluators. Each entry carries enough info to reconstruct
     # the API response at read time without re-reading the (possibly edited
     # since) evaluator-version row:
@@ -641,8 +648,7 @@ def _build_calibrate_config(
     #   - variable_values: {{var}} substitutions sent to calibrate (frozen)
     #   - scale_min / scale_max: rating bounds from the pinned version's
     #     output_config.scale; omitted for binary
-    test_uuid_to_name = {t["uuid"]: t.get("name") for t in tests}
-    evaluators_by_test_name: Dict[str, List[Dict[str, Any]]] = {}
+    evaluators_by_test_id: Dict[str, List[Dict[str, Any]]] = {}
     for entry in tests_with_evaluators:
         test_uuid = entry["test_uuid"]
         refs = criteria_per_test.get(test_uuid) or []
@@ -678,9 +684,7 @@ def _build_calibrate_config(
                             snap_entry["scale_max"] = max(numeric_values)
             pairs.append(snap_entry)
         if pairs:
-            tn = test_uuid_to_name.get(test_uuid)
-            if tn:
-                evaluators_by_test_name[tn] = pairs
+            evaluators_by_test_id[test_uuid] = pairs
 
     # Second pass: shape each test case with its evaluation.criteria refs.
     all_test_cases = []
@@ -691,6 +695,7 @@ def _build_calibrate_config(
             continue
 
         test_config["name"] = test_name
+        test_config["id"] = test["uuid"]
         evaluation = test_config.get("evaluation", {})
 
         if evaluation.get("type") == "tool_call":
@@ -724,7 +729,7 @@ def _build_calibrate_config(
             config["evaluators"] = top_level_evaluators
         if agent_config.get("agent_headers"):
             config["agent_headers"] = agent_config["agent_headers"]
-        return config, evaluators_by_test_name
+        return config, evaluators_by_test_id
 
     # Calibrate agent mode
     if model is None:
@@ -742,7 +747,7 @@ def _build_calibrate_config(
     }
     if top_level_evaluators:
         config["evaluators"] = top_level_evaluators
-    return config, evaluators_by_test_name
+    return config, evaluators_by_test_id
 
 
 def _calibrate_config_from_agent_test_job(
@@ -811,6 +816,7 @@ def _parse_agent_test_results(results_data: Optional[List[dict]]) -> List[dict]:
         test_results.append(
             {
                 "name": test_case.get("name"),
+                "test_case_id": r.get("test_case_id") or test_case.get("id"),
                 "passed": metrics.get("passed", False),
                 "reasoning": metrics.get("reasoning"),
                 "output": {
@@ -826,18 +832,17 @@ def _parse_agent_test_results(results_data: Optional[List[dict]]) -> List[dict]:
 
 def _enrich_test_results_with_evaluators(
     test_results: Optional[List[Dict[str, Any]]],
-    evaluators_by_test_name: Optional[Dict[str, List[Dict[str, Any]]]],
+    evaluators_by_test_id: Optional[Dict[str, List[Dict[str, Any]]]],
 ) -> None:
     """Mutate ``test_results`` in place: convert each row's raw ``judge_results``
     dict (keyed by calibrate evaluator name) into a structured list of
     ``{evaluator_uuid, name, reasoning, match, score, variable_values,
     scale_min, scale_max}`` entries.
 
-    ``name`` reflects the **current** evaluator name from the DB (latest), with
-    fallback to the calibrate snapshot name when the evaluator can't be resolved
-    (e.g. legacy run, evaluator deleted, snapshot missing). ``variable_values``
-    and the rating ``scale_min``/``scale_max`` come from the snapshot frozen at
-    submission time, so they always match what the run actually used.
+    ``name`` reflects the **current** evaluator name from the DB (latest).
+    ``variable_values`` and the rating ``scale_min``/``scale_max`` come from
+    the snapshot frozen at submission time, so they always match what the run
+    actually used.
 
     Idempotent: if ``judge_results`` is already a list (e.g. re-enriched), only
     the ``name`` field is refreshed against the current DB row — the other
@@ -847,7 +852,7 @@ def _enrich_test_results_with_evaluators(
         return
     from db import get_evaluator
 
-    snapshot_map = evaluators_by_test_name or {}
+    snapshot_map = evaluators_by_test_id or {}
     for r in test_results:
         if not isinstance(r, dict):
             continue
@@ -870,20 +875,21 @@ def _enrich_test_results_with_evaluators(
         if not isinstance(raw, dict):
             continue
 
-        test_name = r.get("name")
-        snapshot = snapshot_map.get(test_name) if test_name else None
-        name_to_meta: Dict[str, Dict[str, Any]] = {}
+        test_id = r.get("test_case_id")
+        snapshot = snapshot_map.get(test_id) if test_id else None
+        uuid_to_meta: Dict[str, Dict[str, Any]] = {}
         if isinstance(snapshot, list):
             for e in snapshot:
-                if isinstance(e, dict) and e.get("name") and e.get("uuid"):
-                    name_to_meta[e["name"]] = e
+                if isinstance(e, dict) and e.get("uuid"):
+                    uuid_to_meta[e["uuid"]] = e
 
         out: List[Dict[str, Any]] = []
         for cal_name, entry in raw.items():
             if not isinstance(entry, dict):
                 continue
-            meta = name_to_meta.get(cal_name) or {}
-            uid = meta.get("uuid")
+            echoed_uid = entry.get("evaluator_id")
+            meta = (uuid_to_meta.get(echoed_uid) if echoed_uid else None) or {}
+            uid = echoed_uid
             current_name: Optional[str] = None
             if uid:
                 ev = get_evaluator(uid)
@@ -906,7 +912,7 @@ def _enrich_test_results_with_evaluators(
 
 def _enrich_model_results_with_evaluators(
     model_results: Optional[List[Dict[str, Any]]],
-    evaluators_by_test_name: Optional[Dict[str, List[Dict[str, Any]]]],
+    evaluators_by_test_id: Optional[Dict[str, List[Dict[str, Any]]]],
 ) -> None:
     """Run ``_enrich_test_results_with_evaluators`` for each model's nested
     ``test_results`` list. The same snapshot applies to every model in a
@@ -916,7 +922,7 @@ def _enrich_model_results_with_evaluators(
     for mr in model_results:
         if isinstance(mr, dict):
             _enrich_test_results_with_evaluators(
-                mr.get("test_results"), evaluators_by_test_name
+                mr.get("test_results"), evaluators_by_test_id
             )
 
 
@@ -1409,7 +1415,7 @@ async def run_agent_test(agent_uuid: str, request: RunTestRequest):
 
     # Snapshot calibrate config and per-test evaluator metadata at submission so the
     # worker (and enrichment) stay aligned even if links or live versions change later.
-    calibrate_config, evaluators_by_test_name = _build_calibrate_config(agent, tests)
+    calibrate_config, evaluators_by_test_id = _build_calibrate_config(agent, tests)
 
     # Create job in database with details for recovery
     test_uuids = [t["uuid"] for t in tests]
@@ -1423,7 +1429,7 @@ async def run_agent_test(agent_uuid: str, request: RunTestRequest):
             "test_names": test_names,
             "s3_bucket": s3_bucket,
             "calibrate_config": calibrate_config,
-            "evaluators_by_test_name": evaluators_by_test_name,
+            "evaluators_by_test_id": evaluators_by_test_id,
         },
         results={"test_results": [{"name": name} for name in test_names]},
     )
@@ -1516,7 +1522,8 @@ async def get_agent_test_run_status(task_id: str):
 
     _enrich_test_results_with_evaluators(
         results.get("test_results"),
-        details.get("evaluators_by_test_name") or {},
+        details.get("evaluators_by_test_id")
+        or {},
     )
 
     return TestRunStatusResponse(
@@ -2082,7 +2089,7 @@ async def run_agent_benchmark(agent_uuid: str, request: BenchmarkRequest):
     # Extract test names for progress tracking
     test_names = [test.get("name") for test in tests if test.get("name")]
 
-    calibrate_config, evaluators_by_test_name = _build_calibrate_config(agent, tests)
+    calibrate_config, evaluators_by_test_id = _build_calibrate_config(agent, tests)
 
     # Create job in database with details for recovery
     test_uuids = [t["uuid"] for t in tests]
@@ -2097,7 +2104,7 @@ async def run_agent_benchmark(agent_uuid: str, request: BenchmarkRequest):
             "models": request.models,
             "s3_bucket": s3_bucket,
             "calibrate_config": calibrate_config,
-            "evaluators_by_test_name": evaluators_by_test_name,
+            "evaluators_by_test_id": evaluators_by_test_id,
         },
         results={"test_results": [{"name": name} for name in test_names]},
     )
@@ -2181,7 +2188,8 @@ async def get_benchmark_status(task_id: str):
 
     _enrich_model_results_with_evaluators(
         results.get("model_results"),
-        details.get("evaluators_by_test_name") or {},
+        details.get("evaluators_by_test_id")
+        or {},
     )
 
     return BenchmarkStatusResponse(

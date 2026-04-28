@@ -518,14 +518,12 @@ def apply_simulation_job_evaluator_enrichment(
     details: Dict[str, Any],
     simulation_results: Optional[List[Any]],
 ) -> tuple[Optional[List[SimulationEvaluatorRef]], Optional[List[Any]]]:
-    """Attach evaluator_uuid to each evaluation_results row by index; build top-level refs with current names."""
+    """Attach evaluator_uuid from each evaluation_results row's echoed evaluator_id."""
     snaps = details.get("evaluators") or []
-    uuids: List[str] = []
     refs: List[SimulationEvaluatorRef] = []
     for s in snaps:
         if isinstance(s, dict) and s.get("uuid"):
             uid = s["uuid"]
-            uuids.append(uid)
             ev = get_evaluator(uid)
             refs.append(
                 SimulationEvaluatorRef(
@@ -540,9 +538,12 @@ def apply_simulation_job_evaluator_enrichment(
             er = sim.get("evaluation_results")
             if not isinstance(er, list):
                 continue
-            for i, row in enumerate(er):
-                if isinstance(row, dict) and i < len(uuids):
-                    row["evaluator_uuid"] = uuids[i]
+            for row in er:
+                if not isinstance(row, dict):
+                    continue
+                echoed_id = row.get("evaluator_id")
+                if echoed_id:
+                    row["evaluator_uuid"] = echoed_id
     top = refs if refs else None
     return top, simulation_results
 
@@ -1194,7 +1195,9 @@ def _parse_text_simulation_directory(
                 for row in reader:
                     eval_results.append(
                         {
+                            "evaluator_id": row.get("evaluator_id"),
                             "name": row.get("name"),
+                            "type": row.get("type"),
                             "value": row.get("value"),
                             "reasoning": row.get("reasoning", ""),
                         }
@@ -1574,7 +1577,9 @@ def _parse_simulation_directory(
             for row in reader:
                 eval_results.append(
                     {
+                        "evaluator_id": row.get("evaluator_id"),
                         "name": row.get("name"),
+                        "type": row.get("type"),
                         "value": row.get("value"),
                         "reasoning": row.get("reasoning", ""),
                     }

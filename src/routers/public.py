@@ -222,10 +222,7 @@ async def get_public_stt(share_token: str):
         if pr.get("metrics"):
             pr["metrics"] = normalize_metrics(pr["metrics"])
 
-    enrich_evaluator_runs_with_current_names(
-        provider_results,
-        details.get("evaluators") or [],
-    )
+    enrich_evaluator_runs_with_current_names(provider_results)
 
     # Enrich result rows with presigned audio URLs from the dataset
     audio_paths = details.get("audio_paths", [])
@@ -282,10 +279,7 @@ async def get_public_tts(share_token: str):
         if pr.get("metrics"):
             pr["metrics"] = normalize_metrics(pr["metrics"])
 
-    enrich_evaluator_runs_with_current_names(
-        provider_results,
-        details.get("evaluators") or [],
-    )
+    enrich_evaluator_runs_with_current_names(provider_results)
 
     # Regenerate presigned audio URLs for completed/failed jobs
     provider_results = _build_tts_provider_results_with_presigned_urls(
@@ -322,7 +316,7 @@ async def get_public_test_run(share_token: str):
 
     _enrich_test_results_with_evaluators(
         results.get("test_results"),
-        details.get("evaluators_by_test_name") or {},
+        details.get("evaluators_by_test_id") or {},
     )
 
     return PublicTestRunResponse(
@@ -354,7 +348,7 @@ async def get_public_benchmark(share_token: str):
 
     _enrich_model_results_with_evaluators(
         results.get("model_results"),
-        details.get("evaluators_by_test_name") or {},
+        details.get("evaluators_by_test_id") or {},
     )
 
     return PublicBenchmarkResponse(

@@ -228,14 +228,15 @@ def _calibrate_evaluator_def(
     ev: Dict[str, Any],
     rendered_prompt: str,
 ) -> Dict[str, Any]:
-    """Shape a single evaluator dict into calibrate's expected contract: only the keys calibrate
-    accepts (name, system_prompt, judge_model, type, scale_min/scale_max for rating)."""
+    """Shape a single evaluator dict into calibrate's expected contract."""
     out: Dict[str, Any] = {
         "name": ev.get("name"),
         "system_prompt": rendered_prompt,
         "judge_model": ev.get("judge_model"),
         "type": ev.get("output_type", "binary"),
     }
+    if ev.get("uuid"):
+        out["id"] = ev["uuid"]
     if out["type"] == "rating":
         scale_min, scale_max = _scale_bounds(ev.get("output_config"))
         if scale_min is not None and scale_max is not None:

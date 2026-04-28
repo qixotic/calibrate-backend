@@ -4,6 +4,7 @@ import signal
 import logging
 import threading
 import time
+import json
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -826,30 +827,47 @@ def ordered_evaluator_metric_keys(metrics: Optional[Dict[str, Any]]) -> List[str
     return [k for k, v in metrics.items() if is_evaluator_metric_aggregate(v)]
 
 
+def read_evaluators_map_from_config(output_dir: Optional[Path]) -> Dict[str, str]:
+    """Read root config.json evaluators_map as {metric_key: evaluator_uuid}."""
+    if not output_dir:
+        return {}
+    config_path = output_dir / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to read evaluator map from {config_path}: {e}")
+        return {}
+
+    raw = config.get("evaluators_map")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(name): str(evaluator_id)
+        for evaluator_id, name in raw.items()
+        if evaluator_id and name
+    }
+
+
 def build_evaluator_runs_for_eval_job(
-    job_evaluators: List[dict],
     metrics: Any,
+    evaluator_id_by_metric_key: Optional[Dict[str, str]] = None,
 ) -> List[EvaluatorRunEntry]:
-    """Zip job evaluator list (submission order) to ordered nested keys in metrics.json."""
+    """Pair evaluator aggregates with UUIDs from calibrate's config map."""
     metrics_dict = normalize_metrics(metrics)
     if not isinstance(metrics_dict, dict):
         return []
     keys = ordered_evaluator_metric_keys(metrics_dict)
-    if not keys or not job_evaluators:
+    if not keys:
         return []
-    n = min(len(job_evaluators), len(keys))
-    if len(job_evaluators) != len(keys):
-        logger.warning(
-            "Evaluator count (%d) != nested evaluator metric count (%d); pairing truncated",
-            len(job_evaluators),
-            len(keys),
-        )
+    evaluator_id_by_metric_key = evaluator_id_by_metric_key or {}
     runs: List[EvaluatorRunEntry] = []
-    for i in range(n):
-        eu = job_evaluators[i].get("uuid")
+    for mk in keys:
+        eu = evaluator_id_by_metric_key.get(mk)
         if not eu:
             continue
-        mk = keys[i]
         agg = metrics_dict.get(mk)
         if agg is None:
             continue
@@ -865,29 +883,14 @@ def build_evaluator_runs_for_eval_job(
 
 def enrich_evaluator_runs_with_current_names(
     provider_results: Optional[List[Any]],
-    job_evaluators: List[dict],
 ) -> None:
-    """Mutates each provider result dict in place: backfills evaluator_runs from metrics if missing,
-    then sets ``name`` on each run from ``get_evaluator`` with fallback to job snapshot names."""
+    """Mutates each provider result dict in place and refreshes evaluator run names."""
     if not provider_results:
         return
     from db import get_evaluator
 
-    fallback_names = {
-        e["uuid"]: e.get("name")
-        for e in job_evaluators
-        if e.get("uuid")
-    }
     for pr in provider_results:
-        metrics = pr.get("metrics")
         runs_raw = pr.get("evaluator_runs")
-        if not runs_raw and metrics is not None and job_evaluators:
-            built = build_evaluator_runs_for_eval_job(job_evaluators, metrics)
-            if built:
-                pr["evaluator_runs"] = [
-                    r.model_dump(exclude_none=True) for r in built
-                ]
-                runs_raw = pr["evaluator_runs"]
         if not runs_raw:
             continue
         for run in runs_raw:
@@ -897,7 +900,6 @@ def enrich_evaluator_runs_with_current_names(
             row = get_evaluator(uid) if uid else None
             run["name"] = (
                 (row.get("name") if row else None)
-                or (fallback_names.get(uid) if uid else None)
                 or run.get("metric_key")
                 or ""
             )

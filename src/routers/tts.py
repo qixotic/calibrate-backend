@@ -43,6 +43,7 @@ from utils import (
     capture_exception_to_sentry,
     normalize_metrics,
     read_leaderboard_xlsx,
+    read_evaluators_map_from_config,
     upload_directory_tree_to_s3,
     upload_file_to_s3,
     upload_top_level_files_to_s3,
@@ -92,14 +93,13 @@ def _collect_tts_intermediate_results(
     providers: list,
     task_id: str,
     s3_bucket: str,
-    job_evaluators: Optional[list] = None,
 ) -> list:
     """Read whatever intermediate results are available from disk for each provider.
 
     Uploads audio files to S3 and replaces local paths with S3 keys.
     Returns a list of ProviderResult objects preserving any partial results.
     """
-    je = job_evaluators or []
+    evaluator_id_by_metric_key = read_evaluators_map_from_config(output_dir)
     s3 = get_s3_client()
     provider_results = []
     for provider in providers:
@@ -132,7 +132,9 @@ def _collect_tts_intermediate_results(
                         result_row["audio_path"] = audio_s3_key
 
             runs = (
-                build_evaluator_runs_for_eval_job(je, metrics_data)
+                build_evaluator_runs_for_eval_job(
+                    metrics_data, evaluator_id_by_metric_key
+                )
                 if metrics_data is not None
                 else []
             )
@@ -156,6 +158,8 @@ def _collect_tts_intermediate_results(
 
 
 class TTSEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     # Option 1: reuse an existing dataset
     dataset_id: Optional[str] = None
     # Option 2: inline texts (legacy / new inputs)
@@ -364,8 +368,6 @@ def run_tts_evaluation_task(
                         )
                     eval_cmd.extend(["--config", str(config_path)])
 
-                evaluators_for_runs = job_details.get("evaluators") or []
-
                 logger.info(f"Running TTS eval command: {' '.join(eval_cmd)}")
 
                 # Create temp files for stdout/stderr
@@ -421,6 +423,7 @@ def run_tts_evaluation_task(
 
                 # Read results for each provider
                 provider_results = []
+                evaluator_id_by_metric_key = read_evaluators_map_from_config(output_dir)
                 for provider in request.providers:
                     provider_output_dir = _find_tts_provider_output_dir(
                         output_dir, provider
@@ -466,7 +469,8 @@ def run_tts_evaluation_task(
 
                         eruns = (
                             build_evaluator_runs_for_eval_job(
-                                evaluators_for_runs, metrics_data
+                                metrics_data,
+                                evaluator_id_by_metric_key,
                             )
                             if metrics_data is not None
                             else []
@@ -533,15 +537,17 @@ def run_tts_evaluation_task(
                         f"Leaderboard directory does not exist: {leaderboard_dir}"
                     )
 
-                # Create and upload config file to S3
-                config_data = {
-                    "providers": request.providers,
-                    "language": request.language,
-                    "text_count": len(request.texts),
-                }
-                config_file = temp_path / "config.json"
-                with open(config_file, "w", encoding="utf-8") as f:
-                    json.dump(config_data, f, indent=2)
+                # Prefer calibrate's run-root config.json because it contains evaluator IDs/maps.
+                config_file = output_dir / "config.json"
+                if not config_file.exists():
+                    config_data = {
+                        "providers": request.providers,
+                        "language": request.language,
+                        "text_count": len(request.texts),
+                    }
+                    config_file = temp_path / "config.json"
+                    with open(config_file, "w", encoding="utf-8") as f:
+                        json.dump(config_data, f, indent=2)
                 config_s3_key = f"tts/evals/{task_id}/config.json"
                 upload_file_to_s3(s3, config_file, s3_bucket, config_s3_key)
                 logger.info(f"Uploaded config file to S3: {config_s3_key}")
@@ -577,15 +583,11 @@ def run_tts_evaluation_task(
                 # Preserve any intermediate results already written to disk
                 try:
                     if output_dir.exists():
-                        _jev = (
-                            (get_job(task_id) or {}).get("details", {}) or {}
-                        ).get("evaluators") or []
                         intermediate = _collect_tts_intermediate_results(
                             output_dir,
                             request.providers,
                             task_id,
                             s3_bucket,
-                            _jev,
                         )
                         if intermediate:
                             error_results["provider_results"] = [
@@ -614,15 +616,11 @@ def run_tts_evaluation_task(
                 # Preserve any intermediate results already written to disk
                 try:
                     if output_dir.exists():
-                        _jev = (
-                            (get_job(task_id) or {}).get("details", {}) or {}
-                        ).get("evaluators") or []
                         intermediate = _collect_tts_intermediate_results(
                             output_dir,
                             request.providers,
                             task_id,
                             s3_bucket,
-                            _jev,
                         )
                         if intermediate:
                             error_results["provider_results"] = [
@@ -823,7 +821,6 @@ async def get_tts_evaluation_status(
                             requested_providers,
                             task_id,
                             s3_bucket,
-                            details.get("evaluators") or [],
                         )
                         # Merge: keep existing successful results, add new ones from disk
                         merged_results = []
@@ -956,10 +953,7 @@ async def get_tts_evaluation_status(
         if provider_result.get("metrics"):
             provider_result["metrics"] = normalize_metrics(provider_result["metrics"])
 
-    enrich_evaluator_runs_with_current_names(
-        provider_results,
-        details.get("evaluators") or [],
-    )
+    enrich_evaluator_runs_with_current_names(provider_results)
 
     # Generate presigned URLs on the fly for completed or failed jobs
     if status in (TaskStatus.DONE.value, TaskStatus.FAILED.value):
