@@ -929,6 +929,76 @@ def _enrich_model_results_with_evaluators(
             _enrich_test_results_with_evaluators(
                 mr.get("test_results"), evaluators_by_test_id
             )
+            _enrich_evaluator_summary(mr.get("evaluator_summary"))
+
+
+def _build_evaluator_summary(metrics_data: Optional[dict]) -> Optional[List[Dict[str, Any]]]:
+    """Extract per-evaluator benchmark aggregates from calibrate metrics.json."""
+    if not isinstance(metrics_data, dict):
+        return None
+    criteria = metrics_data.get("criteria")
+    if not isinstance(criteria, dict):
+        return None
+
+    summary: List[Dict[str, Any]] = []
+    for metric_key, aggregate in criteria.items():
+        if not isinstance(aggregate, dict):
+            continue
+        evaluator_type = aggregate.get("type")
+        if evaluator_type not in {"binary", "rating"}:
+            continue
+
+        entry: Dict[str, Any] = {
+            "metric_key": metric_key,
+            "name": metric_key,
+            "type": evaluator_type,
+            "evaluator_uuid": aggregate.get("evaluator_id"),
+        }
+
+        if evaluator_type == "binary":
+            entry.update(
+                {
+                    "passed": aggregate.get("passed"),
+                    "total": aggregate.get("total"),
+                    "pass_rate": aggregate.get("pass_rate"),
+                }
+            )
+        else:
+            entry.update(
+                {
+                    "mean": aggregate.get("mean"),
+                    "min": aggregate.get("min"),
+                    "max": aggregate.get("max"),
+                    "count": aggregate.get("count"),
+                    "scale_min": aggregate.get("scale_min"),
+                    "scale_max": aggregate.get("scale_max"),
+                }
+            )
+
+        summary.append(entry)
+
+    return summary or None
+
+
+def _enrich_evaluator_summary(
+    evaluator_summary: Optional[List[Dict[str, Any]]],
+) -> None:
+    """Refresh evaluator names/descriptions in per-model aggregate summaries."""
+    if not evaluator_summary:
+        return
+    from db import get_evaluator
+
+    for entry in evaluator_summary:
+        if not isinstance(entry, dict):
+            continue
+        uid = entry.get("evaluator_uuid")
+        if not uid:
+            entry.setdefault("description", None)
+            continue
+        ev = get_evaluator(uid)
+        if ev and ev.get("name"):
+            entry["name"] = ev["name"]
+        entry["description"] = ev.get("description") if ev else None
 
 
 def _find_all_results_in_output(output_dir: Path) -> Dict[str, tuple]:
@@ -1559,6 +1629,7 @@ class ModelResult(BaseModel):
     total_tests: Optional[int] = None
     passed: Optional[int] = None
     failed: Optional[int] = None
+    evaluator_summary: Optional[List[Dict[str, Any]]] = None
     test_results: Optional[List[Dict[str, Any]]] = None
 
 
@@ -1614,6 +1685,7 @@ def _update_benchmark_intermediate_results(
             if metrics_data:
                 total = metrics_data.get("total", 0)
                 passed = metrics_data.get("passed", 0)
+                evaluator_summary = _build_evaluator_summary(metrics_data)
                 model_results.append(
                     {
                         "model": model,
@@ -1622,6 +1694,7 @@ def _update_benchmark_intermediate_results(
                         "total_tests": total,
                         "passed": passed,
                         "failed": total - passed,
+                        "evaluator_summary": evaluator_summary,
                         "test_results": test_results,
                     }
                 )
@@ -1638,6 +1711,7 @@ def _update_benchmark_intermediate_results(
                         "total_tests": total,
                         "passed": passed,
                         "failed": total - passed,
+                        "evaluator_summary": None,
                         "test_results": test_results,
                     }
                 )
@@ -1651,6 +1725,7 @@ def _update_benchmark_intermediate_results(
                         "total_tests": None,
                         "passed": None,
                         "failed": None,
+                        "evaluator_summary": None,
                         "test_results": None,
                     }
                 )
@@ -1664,6 +1739,7 @@ def _update_benchmark_intermediate_results(
                     "total_tests": None,
                     "passed": None,
                     "failed": None,
+                    "evaluator_summary": None,
                     "test_results": None,
                 }
             )
@@ -1858,6 +1934,7 @@ def run_benchmark_task(
                         if metrics_data:
                             total = metrics_data.get("total", 0)
                             passed = metrics_data.get("passed", 0)
+                            evaluator_summary = _build_evaluator_summary(metrics_data)
                             model_results.append(
                                 ModelResult(
                                     model=model,
@@ -1866,6 +1943,7 @@ def run_benchmark_task(
                                     total_tests=total,
                                     passed=passed,
                                     failed=total - passed,
+                                    evaluator_summary=evaluator_summary,
                                     test_results=test_results,
                                 )
                             )
@@ -1883,6 +1961,7 @@ def run_benchmark_task(
                                     total_tests=total,
                                     passed=passed,
                                     failed=total - passed,
+                                    evaluator_summary=None,
                                     test_results=test_results,
                                 )
                             )
