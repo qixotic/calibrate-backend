@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
-from auth_utils import get_current_user_id, get_user_from_api_key
+from auth_utils import get_current_user_id
 from db import (
     DEFAULT_PROMPTS_BY_PURPOSE,
     create_evaluator,
@@ -28,7 +28,7 @@ from db import (
     set_evaluator_live_version,
     update_evaluator,
 )
-from llm_judge import encode_audio_from_url, invoke_evaluator, render_template
+from llm_judge import render_template
 
 router = APIRouter(prefix="/evaluators", tags=["evaluators"])
 
@@ -154,30 +154,6 @@ class VersionCreateResponse(BaseModel):
 
 class SetLiveVersionRequest(BaseModel):
     version_uuid: str
-
-
-class InvokeEvaluatorRequest(BaseModel):
-    version_uuid: Optional[str] = None
-    variables: Optional[Dict[str, Any]] = None
-    output: Optional[str] = None
-    outputs: Optional[List[Dict[str, str]]] = None
-    audio_url: Optional[str] = None
-
-    @model_validator(mode="after")
-    def _validate_shape(self):
-        has_output = self.output is not None
-        has_outputs = self.outputs is not None and len(self.outputs) > 0
-        has_audio = self.audio_url is not None
-        if not (has_output or has_outputs or has_audio):
-            raise ValueError("Provide one of: output, outputs, audio_url")
-        return self
-
-
-class InvokeEvaluatorResponse(BaseModel):
-    evaluator_uuid: str
-    evaluator_version_uuid: str
-    judge_model: str
-    judgement: Dict[str, Any]
 
 
 # ============ Helpers ============
@@ -460,54 +436,6 @@ async def mark_live(
     if not ok:
         raise HTTPException(status_code=404, detail="Version not found")
     return {"message": "Live version updated"}
-
-
-# ============ Invocation (API key) ============
-
-
-@router.post("/{evaluator_uuid}/invoke", response_model=InvokeEvaluatorResponse)
-async def invoke_evaluator_endpoint(
-    evaluator_uuid: str,
-    payload: InvokeEvaluatorRequest,
-    user_id: str = Depends(get_user_from_api_key),
-):
-    """Invoke an evaluator with a concrete input. Requires a valid API key.
-
-    Users can invoke seeded defaults and any evaluator they own.
-    """
-    evaluator = get_evaluator(evaluator_uuid)
-    if not evaluator:
-        raise HTTPException(status_code=404, detail="Evaluator not found")
-    if evaluator.get("owner_user_id") is not None and evaluator["owner_user_id"] != user_id:
-        raise HTTPException(status_code=404, detail="Evaluator not found")
-
-    version_uuid = payload.version_uuid or evaluator.get("live_version_id")
-    if not version_uuid:
-        raise HTTPException(status_code=400, detail="Evaluator has no live version")
-    version = get_evaluator_version(version_uuid)
-    if not version or version["evaluator_id"] != evaluator_uuid:
-        raise HTTPException(status_code=404, detail="Version not found")
-
-    audio_b64 = None
-    audio_mime = "audio/wav"
-    if payload.audio_url:
-        audio_b64, audio_mime = encode_audio_from_url(payload.audio_url)
-
-    judgement = invoke_evaluator(
-        version=version,
-        evaluator=evaluator,
-        variables=payload.variables or {},
-        output=payload.output,
-        outputs=payload.outputs,
-        audio_base64=audio_b64,
-        audio_mime=audio_mime,
-    )
-    return InvokeEvaluatorResponse(
-        evaluator_uuid=evaluator_uuid,
-        evaluator_version_uuid=version_uuid,
-        judge_model=version["judge_model"],
-        judgement=judgement,
-    )
 
 
 # ============ Prompt preview (authenticated) ============

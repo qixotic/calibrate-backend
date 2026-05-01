@@ -16,7 +16,7 @@ from utils import (
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 # Job types that share the same queue (used for triggering next job on delete)
-EVAL_JOB_TYPES = ["stt-eval", "tts-eval"]
+EVAL_JOB_TYPES = ["stt-eval", "tts-eval", "annotation-eval"]
 
 
 class JobType(str, Enum):

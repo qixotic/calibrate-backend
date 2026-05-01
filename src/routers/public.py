@@ -28,6 +28,15 @@ from db import (
     get_agent_test_job_by_share_token,
     get_simulation_job_by_share_token,
     get_simulation_jobs_for_simulation,
+    get_annotation_job_by_token,
+    get_annotation_task,
+    get_evaluators_for_annotation_task,
+    get_annotator,
+    get_job_items,
+    get_annotations_for_job,
+    get_annotation_item,
+    upsert_annotation,
+    update_annotation_job_status,
 )
 from utils import (
     TaskStatus,
@@ -495,3 +504,134 @@ async def get_public_simulation_run(share_token: str):
         evaluators=evaluators_out,
         error=results.get("error"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Annotation jobs (public, token-only)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_public_annotation_job(token: str) -> Dict[str, Any]:
+    """Fetch a job by its public_token, ensuring it's a real shareable link
+    (not a CSV-import sentinel). Raises 404 otherwise."""
+    job = get_annotation_job_by_token(token)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.get("/annotation-jobs/{token}")
+def get_public_annotation_job(token: str):
+    """Everything an annotator needs to render their job page:
+
+    - Job + status
+    - Annotator's name (so the page can greet them)
+    - Task type + linked evaluators (drives form rendering: binary toggle vs
+      rating scale, plus per-evaluator name/description/output_config)
+    - Items (with their parsed `payload`)
+    - Existing annotations on this job (so the page can resume in-progress work)
+    """
+    job = _resolve_public_annotation_job(token)
+    task = get_annotation_task(job["task_id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Job not found")
+    annotator = get_annotator(job["annotator_id"])
+    evaluators = get_evaluators_for_annotation_task(job["task_id"])
+    items = get_job_items(job["uuid"])
+    annotations = get_annotations_for_job(job["uuid"])
+
+    return {
+        "job": {
+            "uuid": job["uuid"],
+            "status": job["status"],
+            "created_at": job["created_at"],
+            "completed_at": job.get("completed_at"),
+        },
+        "annotator": {
+            "uuid": annotator["uuid"] if annotator else None,
+            "name": annotator["name"] if annotator else None,
+        },
+        "task": {
+            "uuid": task["uuid"],
+            "name": task["name"],
+            "type": task["type"],
+            "description": task.get("description"),
+        },
+        "evaluators": evaluators,
+        "items": items,
+        "annotations": annotations,
+    }
+
+
+class PublicAnnotationEntry(BaseModel):
+    evaluator_id: Optional[str] = None  # None = row-level overall annotation
+    value: Optional[Dict[str, Any]] = None
+
+
+class PublicAnnotationUpsertRequest(BaseModel):
+    item_id: str
+    annotations: List[PublicAnnotationEntry]
+
+
+@router.post("/annotation-jobs/{token}/annotations")
+def upsert_public_annotations(token: str, payload: PublicAnnotationUpsertRequest):
+    """Upsert all judgements for one item in one call. Pass one entry per
+    evaluator (plus optionally one with `evaluator_id = null` for a row-level
+    overall annotation).
+
+    Side effects:
+      - The job auto-flips from `pending` -> `in_progress` on the first save.
+      - After saving, the job auto-flips to `completed` (with `completed_at`)
+        when every item in the job has annotations for every evaluator linked
+        to the task. Row-level annotations are NOT required.
+    """
+    job = _resolve_public_annotation_job(token)
+    if not payload.annotations:
+        raise HTTPException(
+            status_code=400, detail="annotations must be non-empty"
+        )
+
+    item = get_annotation_item(payload.item_id)
+    if not item or item.get("task_id") != job["task_id"]:
+        raise HTTPException(status_code=404, detail="Item not found in this job")
+
+    saved_uuids: List[str] = []
+    for entry in payload.annotations:
+        annotation_uuid = upsert_annotation(
+            job_id=job["uuid"],
+            item_id=payload.item_id,
+            evaluator_id=entry.evaluator_id,
+            value=entry.value,
+        )
+        saved_uuids.append(annotation_uuid)
+
+    if job["status"] == "pending":
+        update_annotation_job_status(job["uuid"], "in_progress")
+
+    # Auto-complete: every (item, evaluator) slot in this job must have a row.
+    # We re-check on every save (including post-completion edits) so the
+    # status remains accurate. `completed_at` is preserved on subsequent
+    # edits — it marks the first time the job was fully filled.
+    job_items = get_job_items(job["uuid"])
+    evaluators = get_evaluators_for_annotation_task(job["task_id"])
+    evaluator_ids = [e["uuid"] for e in evaluators]
+    annotated_pairs = {
+        (a["item_id"], a.get("evaluator_id"))
+        for a in get_annotations_for_job(job["uuid"])
+        if a.get("evaluator_id") is not None
+    }
+    expected_pairs = {
+        (it["uuid"], ev_id) for it in job_items for ev_id in evaluator_ids
+    }
+    completed = bool(expected_pairs) and expected_pairs.issubset(annotated_pairs)
+    if completed and job["status"] != "completed":
+        update_annotation_job_status(
+            job["uuid"], "completed", set_completed_at=True
+        )
+
+    final_status = "completed" if completed else "in_progress"
+    return {
+        "saved": saved_uuids,
+        "count": len(saved_uuids),
+        "status": final_status,
+    }

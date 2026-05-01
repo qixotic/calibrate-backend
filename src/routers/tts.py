@@ -50,7 +50,7 @@ from utils import (
 )
 
 # Job types that share the same queue
-EVAL_JOB_TYPES = ["stt-eval", "tts-eval"]
+EVAL_JOB_TYPES = ["stt-eval", "tts-eval", "annotation-eval"]
 
 
 def _start_tts_job_from_queue(job: dict) -> bool:

@@ -49,7 +49,7 @@ from utils import (
 )
 
 # Job types that share the same queue
-EVAL_JOB_TYPES = ["stt-eval", "tts-eval"]
+EVAL_JOB_TYPES = ["stt-eval", "tts-eval", "annotation-eval"]
 
 
 def _resolve_evaluators_for_job(

@@ -35,7 +35,7 @@ from utils import (
 logger = logging.getLogger(__name__)
 
 # Job type constants
-EVAL_JOB_TYPES = ["stt-eval", "tts-eval"]
+EVAL_JOB_TYPES = ["stt-eval", "tts-eval", "annotation-eval"]
 AGENT_TEST_JOB_TYPES = ["llm-unit-test", "llm-benchmark"]
 SIMULATION_JOB_TYPES = ["text", "voice"]
 
@@ -215,6 +215,8 @@ def recover_pending_jobs():
                     _recover_stt_job(job_id, details)
                 elif job_type == "tts-eval":
                     _recover_tts_job(job_id, details)
+                elif job_type == "annotation-eval":
+                    _recover_annotation_eval_job(job)
                 else:
                     logger.warning(f"Unknown job type: {job_type}, marking as failed")
                     update_job(
@@ -444,6 +446,28 @@ def _recover_llm_benchmark_job(job_id: str, details: dict):
     )
     thread.start()
     logger.info(f"LLM benchmark job {job_id} recovery started")
+
+
+def _recover_annotation_eval_job(job: dict):
+    """Recover an annotation evaluator-run job by killing the orphaned
+    `calibrate` subprocess (if any) and restarting via the queue starter.
+    The runner clears stale `evaluator_runs` rows for the job before
+    re-inserting, so a partial previous run does not double-count.
+    """
+    from annotation_eval_runner import resume_annotation_eval_job
+
+    job_id = job["uuid"]
+    details = job.get("details") or {}
+    logger.info(f"Recovering annotation eval job {job_id}")
+
+    # Best-effort kill of the orphaned subprocess.
+    _kill_orphaned_process(details, job_id)
+
+    if not details.get("evaluators"):
+        raise ValueError("details.evaluators missing — cannot reconstruct run")
+
+    resume_annotation_eval_job(job)
+    logger.info(f"Annotation eval job {job_id} recovery started")
 
 
 def _recover_simulation_job(job_id: str, details: dict, job_type: str):

@@ -514,6 +514,181 @@ def init_db():
         """
         )
 
+        # ============ Annotation tasks ============
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotation_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                type TEXT NOT NULL DEFAULT 'llm',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(uuid)
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(uuid)
+            )
+            """
+        )
+
+        # Enforce unique annotator name per account, ignoring soft-deleted rows.
+        cursor.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_annotators_user_name_active
+              ON annotators(user_id, name) WHERE deleted_at IS NULL
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotation_task_evaluators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                evaluator_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                UNIQUE(task_id, evaluator_id),
+                FOREIGN KEY (task_id) REFERENCES annotation_tasks(uuid),
+                FOREIGN KEY (evaluator_id) REFERENCES evaluators(uuid)
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotation_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                task_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                FOREIGN KEY (task_id) REFERENCES annotation_tasks(uuid)
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotation_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                task_id TEXT NOT NULL,
+                annotator_id TEXT NOT NULL,
+                public_token TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                FOREIGN KEY (task_id) REFERENCES annotation_tasks(uuid),
+                FOREIGN KEY (annotator_id) REFERENCES annotators(uuid)
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotation_job_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(job_id, item_id),
+                FOREIGN KEY (job_id) REFERENCES annotation_jobs(uuid),
+                FOREIGN KEY (item_id) REFERENCES annotation_items(uuid)
+            )
+            """
+        )
+
+        # Migration for DBs created before payload was snapshotted onto the
+        # link row. After this column is added, all assigned items live as
+        # frozen copies — edits/deletes on the source item don't affect jobs.
+        try:
+            cursor.execute(
+                "ALTER TABLE annotation_job_items ADD COLUMN payload TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        # NOTE: Annotation evaluator-run jobs live in the generic `jobs` table
+        # (type='annotation-eval') so they share queue capacity with the other
+        # eval job types. `evaluator_runs.job_id` therefore references
+        # `jobs.uuid` logically; SQLite doesn't enforce the FK so the column
+        # stays untyped.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS evaluator_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                job_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                evaluator_id TEXT NOT NULL,
+                evaluator_version_id TEXT NOT NULL,
+                value TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                FOREIGN KEY (item_id) REFERENCES annotation_items(uuid),
+                FOREIGN KEY (evaluator_id) REFERENCES evaluators(uuid)
+            )
+            """
+        )
+
+        # Migrations for DBs created before columns existed.
+        for stmt in (
+            "ALTER TABLE evaluator_runs ADD COLUMN deleted_at TIMESTAMP DEFAULT NULL",
+            "ALTER TABLE jobs ADD COLUMN deleted_at TIMESTAMP DEFAULT NULL",
+        ):
+            try:
+                cursor.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                job_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                evaluator_id TEXT,
+                value TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(job_id, item_id, evaluator_id),
+                FOREIGN KEY (job_id) REFERENCES annotation_jobs(uuid),
+                FOREIGN KEY (item_id) REFERENCES annotation_items(uuid),
+                FOREIGN KEY (evaluator_id) REFERENCES evaluators(uuid)
+            )
+            """
+        )
+
+        # Migration: add `type` to annotation_tasks for DBs created before the
+        # column was introduced. SQLite rejects non-constant DEFAULTs in ADD
+        # COLUMN, so a literal default is fine here.
+        try:
+            cursor.execute(
+                "ALTER TABLE annotation_tasks ADD COLUMN type TEXT NOT NULL DEFAULT 'llm'"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # Add deleted_at column to existing tables if not present (migration)
         tables_to_migrate = [
             "agents",
@@ -3961,21 +4136,19 @@ def _parse_job_row(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def get_job(job_uuid: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Get a job by UUID, optionally filtered by user_id.
-
-    Args:
-        job_uuid: The UUID of the job
-        user_id: If provided, only return the job if it belongs to this user
-    """
+    """Get a job by UUID, optionally filtered by user_id. Soft-deleted jobs are excluded."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if user_id:
             cursor.execute(
-                "SELECT * FROM jobs WHERE uuid = ? AND user_id = ?",
+                "SELECT * FROM jobs WHERE uuid = ? AND user_id = ? AND deleted_at IS NULL",
                 (job_uuid, user_id),
             )
         else:
-            cursor.execute("SELECT * FROM jobs WHERE uuid = ?", (job_uuid,))
+            cursor.execute(
+                "SELECT * FROM jobs WHERE uuid = ? AND deleted_at IS NULL",
+                (job_uuid,),
+            )
         row = cursor.fetchone()
         if row:
             return _parse_job_row(row)
@@ -3983,22 +4156,17 @@ def get_job(job_uuid: str, user_id: Optional[str] = None) -> Optional[Dict[str, 
 
 
 def get_all_jobs(user_id: str, job_type: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all jobs for a user, optionally filtered by type.
-
-    Args:
-        user_id: UUID of the user who owns the jobs
-        job_type: Optional filter by job type
-    """
+    """Get all jobs for a user, optionally filtered by type. Soft-deleted excluded."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_type:
             cursor.execute(
-                "SELECT * FROM jobs WHERE user_id = ? AND type = ? ORDER BY created_at DESC",
+                "SELECT * FROM jobs WHERE user_id = ? AND type = ? AND deleted_at IS NULL ORDER BY created_at DESC",
                 (user_id, job_type),
             )
         else:
             cursor.execute(
-                "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC",
+                "SELECT * FROM jobs WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
                 (user_id,),
             )
         rows = cursor.fetchall()
@@ -4010,7 +4178,7 @@ def get_pending_jobs() -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM jobs WHERE status = 'in_progress' ORDER BY created_at ASC"
+            "SELECT * FROM jobs WHERE status = 'in_progress' AND deleted_at IS NULL ORDER BY created_at ASC"
         )
         rows = cursor.fetchall()
         return [_parse_job_row(row) for row in rows]
@@ -4023,12 +4191,12 @@ def get_queued_jobs(job_types: Optional[List[str]] = None) -> List[Dict[str, Any
         if job_types:
             placeholders = ",".join("?" for _ in job_types)
             cursor.execute(
-                f"SELECT * FROM jobs WHERE status = 'queued' AND type IN ({placeholders}) ORDER BY created_at ASC",
+                f"SELECT * FROM jobs WHERE status = 'queued' AND type IN ({placeholders}) AND deleted_at IS NULL ORDER BY created_at ASC",
                 job_types,
             )
         else:
             cursor.execute(
-                "SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC"
+                "SELECT * FROM jobs WHERE status = 'queued' AND deleted_at IS NULL ORDER BY created_at ASC"
             )
         rows = cursor.fetchall()
         return [_parse_job_row(row) for row in rows]
@@ -4041,11 +4209,13 @@ def count_running_jobs(job_types: Optional[List[str]] = None) -> int:
         if job_types:
             placeholders = ",".join("?" for _ in job_types)
             cursor.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND type IN ({placeholders})",
+                f"SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND type IN ({placeholders}) AND deleted_at IS NULL",
                 job_types,
             )
         else:
-            cursor.execute("SELECT COUNT(*) FROM jobs WHERE status = 'in_progress'")
+            cursor.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND deleted_at IS NULL"
+            )
         return cursor.fetchone()[0]
 
 
@@ -4058,15 +4228,48 @@ def count_running_jobs_for_user(
         if job_types:
             placeholders = ",".join("?" for _ in job_types)
             cursor.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND user_id = ? AND type IN ({placeholders})",
+                f"SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND user_id = ? AND type IN ({placeholders}) AND deleted_at IS NULL",
                 [user_id] + job_types,
             )
         else:
             cursor.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND user_id = ?",
+                "SELECT COUNT(*) FROM jobs WHERE status = 'in_progress' AND user_id = ? AND deleted_at IS NULL",
                 (user_id,),
             )
         return cursor.fetchone()[0]
+
+
+def soft_delete_job(job_uuid: str) -> bool:
+    """Soft-delete a job. Returns True if the row transitioned to deleted."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE jobs SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+            "WHERE uuid = ? AND deleted_at IS NULL",
+            (job_uuid,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_generic_jobs_for_task(task_uuid: str, job_type: str) -> List[Dict[str, Any]]:
+    """Generic-jobs rows of a given `type` whose `details.task_id` matches.
+    Used to scope generic-jobs reads (e.g. annotation-eval) to a task without
+    clashing with the annotation_jobs table's `get_jobs_for_task`."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM jobs
+             WHERE type = ?
+               AND deleted_at IS NULL
+               AND json_extract(details, '$.task_id') = ?
+             ORDER BY created_at DESC
+            """,
+            (job_type, task_uuid),
+        )
+        rows = cursor.fetchall()
+        return [_parse_job_row(row) for row in rows]
 
 
 def update_job(
@@ -5102,3 +5305,945 @@ def delete_user_limits(user_id: str) -> bool:
         )
         conn.commit()
         return cursor.rowcount > 0
+
+
+# ============ Annotation Tasks ============
+
+
+def _parse_annotation_task_row(row: sqlite3.Row) -> Dict[str, Any]:
+    return dict(row)
+
+
+ANNOTATION_TASK_TYPES = ("llm", "stt", "tts", "simulation")
+
+
+def create_annotation_task(
+    name: str,
+    user_id: str,
+    type: str,
+    description: Optional[str] = None,
+) -> str:
+    """Create a new annotation task and return its UUID."""
+    if not user_id:
+        raise ValueError("user_id is required when creating an annotation task")
+    if type not in ANNOTATION_TASK_TYPES:
+        raise ValueError(
+            f"type must be one of {ANNOTATION_TASK_TYPES}, got {type!r}"
+        )
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        task_uuid = str(uuid.uuid4())
+        cursor.execute(
+            """
+            INSERT INTO annotation_tasks (uuid, user_id, name, description, type)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (task_uuid, user_id, name, description, type),
+        )
+        conn.commit()
+        logger.info(f"Created annotation task with UUID: {task_uuid}")
+        return task_uuid
+
+
+def get_annotation_task(task_uuid: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT t.*,
+                   (SELECT COUNT(*) FROM annotation_items i
+                     WHERE i.task_id = t.uuid AND i.deleted_at IS NULL) AS item_count
+              FROM annotation_tasks t
+             WHERE t.uuid = ? AND t.deleted_at IS NULL
+            """,
+            (task_uuid,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return _parse_annotation_task_row(row)
+        return None
+
+
+def get_all_annotation_tasks(user_id: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT t.*,
+                   (SELECT COUNT(*) FROM annotation_items i
+                     WHERE i.task_id = t.uuid AND i.deleted_at IS NULL) AS item_count
+              FROM annotation_tasks t
+             WHERE t.deleted_at IS NULL AND t.user_id = ?
+             ORDER BY t.created_at DESC
+            """,
+            (user_id,),
+        )
+        return [_parse_annotation_task_row(r) for r in cursor.fetchall()]
+
+
+def update_annotation_task(
+    task_uuid: str,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+) -> bool:
+    updates: List[str] = []
+    params: List[Any] = []
+    if name is not None:
+        updates.append("name = ?")
+        params.append(name)
+    if description is not None:
+        updates.append("description = ?")
+        params.append(description)
+    if not updates:
+        return False
+    updates.append("updated_at = CURRENT_TIMESTAMP")
+    params.append(task_uuid)
+    query = (
+        f"UPDATE annotation_tasks SET {', '.join(updates)} "
+        "WHERE uuid = ? AND deleted_at IS NULL"
+    )
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def delete_annotation_task(task_uuid: str) -> bool:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE annotation_tasks SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE uuid = ? AND deleted_at IS NULL",
+            (task_uuid,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+# ============ Annotation Task Evaluators ============
+
+
+def add_evaluator_to_annotation_task(task_id: str, evaluator_id: str) -> int:
+    """Link an evaluator to an annotation task. Restores soft-deleted links if present."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id FROM annotation_task_evaluators
+             WHERE task_id = ? AND evaluator_id = ? AND deleted_at IS NOT NULL
+            """,
+            (task_id, evaluator_id),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute(
+                "UPDATE annotation_task_evaluators SET deleted_at = NULL WHERE id = ?",
+                (existing["id"],),
+            )
+            conn.commit()
+            return existing["id"]
+        cursor.execute(
+            """
+            INSERT INTO annotation_task_evaluators (task_id, evaluator_id)
+            VALUES (?, ?)
+            """,
+            (task_id, evaluator_id),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def remove_evaluator_from_annotation_task(task_id: str, evaluator_id: str) -> bool:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE annotation_task_evaluators SET deleted_at = CURRENT_TIMESTAMP
+             WHERE task_id = ? AND evaluator_id = ? AND deleted_at IS NULL
+            """,
+            (task_id, evaluator_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def create_annotator(name: str, user_id: str) -> str:
+    """Create a new annotator. Name must be unique per user (active rows)."""
+    if not user_id:
+        raise ValueError("user_id is required when creating an annotator")
+    name = name.strip()
+    if not name:
+        raise ValueError("annotator name must not be empty")
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        # If a soft-deleted annotator exists with the same name, restore it.
+        cursor.execute(
+            """
+            SELECT uuid FROM annotators
+             WHERE user_id = ? AND name = ? AND deleted_at IS NOT NULL
+             ORDER BY id DESC LIMIT 1
+            """,
+            (user_id, name),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute(
+                "UPDATE annotators SET deleted_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE uuid = ?",
+                (existing["uuid"],),
+            )
+            conn.commit()
+            return existing["uuid"]
+
+        annotator_uuid = str(uuid.uuid4())
+        try:
+            cursor.execute(
+                """
+                INSERT INTO annotators (uuid, user_id, name)
+                VALUES (?, ?, ?)
+                """,
+                (annotator_uuid, user_id, name),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as e:
+            raise ValueError(
+                f"Annotator with name '{name}' already exists"
+            ) from e
+        logger.info(f"Created annotator with UUID: {annotator_uuid}")
+        return annotator_uuid
+
+
+def get_annotator(annotator_uuid: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM annotators WHERE uuid = ? AND deleted_at IS NULL",
+            (annotator_uuid,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_all_annotators(user_id: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM annotators
+             WHERE deleted_at IS NULL AND user_id = ?
+             ORDER BY name ASC
+            """,
+            (user_id,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def update_annotator(
+    annotator_uuid: str, name: Optional[str] = None
+) -> bool:
+    if name is None:
+        return False
+    name = name.strip()
+    if not name:
+        raise ValueError("annotator name must not be empty")
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE annotators
+                   SET name = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE uuid = ? AND deleted_at IS NULL
+                """,
+                (name, annotator_uuid),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as e:
+            raise ValueError(
+                f"Annotator with name '{name}' already exists"
+            ) from e
+        return cursor.rowcount > 0
+
+
+def delete_annotator(annotator_uuid: str) -> bool:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE annotators SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE uuid = ? AND deleted_at IS NULL",
+            (annotator_uuid,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+# ============ Annotation Items ============
+
+
+def _parse_annotation_item_row(row: sqlite3.Row) -> Dict[str, Any]:
+    item = dict(row)
+    if item.get("payload"):
+        try:
+            item["payload"] = json.loads(item["payload"])
+        except (TypeError, ValueError):
+            pass
+    return item
+
+
+def create_annotation_items(
+    task_id: str, items: List[Dict[str, Any]]
+) -> List[str]:
+    """Bulk insert annotation items. Each `items[i]` must have a `payload`
+    (dict, list, or any JSON-serialisable value). Returns new item UUIDs."""
+    if not items:
+        return []
+    new_uuids: List[str] = []
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        for it in items:
+            if "payload" not in it or it["payload"] is None:
+                raise ValueError("each item must include a non-null `payload`")
+            item_uuid = str(uuid.uuid4())
+            payload_json = json.dumps(it["payload"])
+            cursor.execute(
+                """
+                INSERT INTO annotation_items (uuid, task_id, payload)
+                VALUES (?, ?, ?)
+                """,
+                (item_uuid, task_id, payload_json),
+            )
+            new_uuids.append(item_uuid)
+        conn.commit()
+    return new_uuids
+
+
+def get_annotation_item(item_uuid: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM annotation_items WHERE uuid = ? AND deleted_at IS NULL",
+            (item_uuid,),
+        )
+        row = cursor.fetchone()
+        return _parse_annotation_item_row(row) if row else None
+
+
+def bulk_update_annotation_items(
+    task_id: str, updates: List[Dict[str, Any]]
+) -> int:
+    """Update `payload` on multiple items in one task. Each `updates[i]` must
+    have `uuid` and `payload`. Items not in this task or soft-deleted are
+    skipped silently. Returns rows updated."""
+    if not updates:
+        return 0
+    rows_updated = 0
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        for u in updates:
+            item_uuid = u.get("uuid")
+            if not item_uuid:
+                raise ValueError("each update must include `uuid`")
+            if "payload" not in u or u["payload"] is None:
+                raise ValueError("each update must include a non-null `payload`")
+            cursor.execute(
+                """
+                UPDATE annotation_items
+                   SET payload = ?
+                 WHERE uuid = ? AND task_id = ? AND deleted_at IS NULL
+                """,
+                (json.dumps(u["payload"]), item_uuid, task_id),
+            )
+            rows_updated += cursor.rowcount
+        conn.commit()
+    return rows_updated
+
+
+def soft_delete_annotation_items(
+    task_id: str, item_uuids: List[str]
+) -> int:
+    """Soft-delete items belonging to `task_id`. Items already deleted, or
+    belonging to another task, are skipped silently. Returns rows updated."""
+    if not item_uuids:
+        return 0
+    placeholders = ",".join("?" for _ in item_uuids)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE annotation_items
+               SET deleted_at = CURRENT_TIMESTAMP
+             WHERE task_id = ? AND deleted_at IS NULL
+               AND uuid IN ({placeholders})
+            """,
+            [task_id, *item_uuids],
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def get_annotation_items_for_task(task_id: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM annotation_items
+             WHERE task_id = ? AND deleted_at IS NULL
+             ORDER BY id ASC
+            """,
+            (task_id,),
+        )
+        return [_parse_annotation_item_row(r) for r in cursor.fetchall()]
+
+
+# ============ Annotation Jobs ============
+
+
+def _parse_annotation_job_row(row: sqlite3.Row) -> Dict[str, Any]:
+    return dict(row)
+
+
+def create_annotation_job(
+    task_id: str,
+    annotator_id: str,
+    item_uuids: List[str],
+    public_token: str,
+    status: str = "pending",
+) -> str:
+    """Create one job (annotator × N rows). Items are SNAPSHOTTED onto the
+    link row at creation time — subsequent edits or soft-deletes on the
+    source `annotation_items` row do not affect the job's view of its items
+    or the auto-completion check."""
+    if not item_uuids:
+        raise ValueError("item_uuids must be non-empty")
+    job_uuid = str(uuid.uuid4())
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        # Snapshot the current payload of every item we're about to assign.
+        placeholders = ",".join("?" for _ in item_uuids)
+        cursor.execute(
+            f"SELECT uuid, payload FROM annotation_items "
+            f"WHERE uuid IN ({placeholders}) AND deleted_at IS NULL",
+            item_uuids,
+        )
+        rows = cursor.fetchall()
+        payload_by_uuid = {r["uuid"]: r["payload"] for r in rows}
+        missing = [u for u in item_uuids if u not in payload_by_uuid]
+        if missing:
+            raise ValueError(
+                f"Cannot snapshot item(s) — not found or already deleted: {missing}"
+            )
+
+        cursor.execute(
+            """
+            INSERT INTO annotation_jobs (uuid, task_id, annotator_id, public_token, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (job_uuid, task_id, annotator_id, public_token, status),
+        )
+        cursor.executemany(
+            "INSERT INTO annotation_job_items (job_id, item_id, payload) "
+            "VALUES (?, ?, ?)",
+            [(job_uuid, item_id, payload_by_uuid[item_id]) for item_id in item_uuids],
+        )
+        conn.commit()
+    return job_uuid
+
+
+def get_annotation_job(job_uuid: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM annotation_jobs WHERE uuid = ?",
+            (job_uuid,),
+        )
+        row = cursor.fetchone()
+        return _parse_annotation_job_row(row) if row else None
+
+
+def get_jobs_for_task(task_id: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM annotation_jobs WHERE task_id = ? ORDER BY created_at DESC",
+            (task_id,),
+        )
+        return [_parse_annotation_job_row(r) for r in cursor.fetchall()]
+
+
+def get_jobs_for_task_detailed(task_id: str) -> List[Dict[str, Any]]:
+    """Jobs for a task with annotator info + item/annotation counts."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                j.uuid          AS uuid,
+                j.task_id       AS task_id,
+                j.annotator_id  AS annotator_id,
+                an.name         AS annotator_name,
+                j.public_token  AS public_token,
+                j.status        AS status,
+                j.created_at    AS created_at,
+                j.completed_at  AS completed_at,
+                (SELECT COUNT(*) FROM annotation_job_items ji WHERE ji.job_id = j.uuid) AS item_count,
+                (SELECT COUNT(*) FROM annotations a WHERE a.job_id = j.uuid) AS annotation_count
+              FROM annotation_jobs j
+              JOIN annotators an ON an.uuid = j.annotator_id
+             WHERE j.task_id = ?
+             ORDER BY j.created_at DESC
+            """,
+            (task_id,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def get_annotation_job_by_token(token: str) -> Optional[Dict[str, Any]]:
+    """Fetch a job by its public_token. Tokens with an `import:` prefix are
+    sentinel jobs for CSV-imported labels and must not be exposed publicly."""
+    if not token or token.startswith("import:"):
+        return None
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM annotation_jobs WHERE public_token = ?",
+            (token,),
+        )
+        row = cursor.fetchone()
+        return _parse_annotation_job_row(row) if row else None
+
+
+def get_annotations_for_job(job_id: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM annotations WHERE job_id = ? ORDER BY created_at ASC",
+            (job_id,),
+        )
+        return [_parse_annotation_row(r) for r in cursor.fetchall()]
+
+
+def get_jobs_for_annotator(annotator_id: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM annotation_jobs WHERE annotator_id = ? ORDER BY created_at DESC",
+            (annotator_id,),
+        )
+        return [_parse_annotation_job_row(r) for r in cursor.fetchall()]
+
+
+def get_jobs_for_annotator_detailed(annotator_id: str) -> List[Dict[str, Any]]:
+    """Jobs for an annotator with task name + item count + completed annotation count."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                j.uuid          AS uuid,
+                j.task_id       AS task_id,
+                t.name          AS task_name,
+                j.public_token  AS public_token,
+                j.status        AS status,
+                j.created_at    AS created_at,
+                j.completed_at  AS completed_at,
+                (SELECT COUNT(*) FROM annotation_job_items ji WHERE ji.job_id = j.uuid) AS item_count,
+                (SELECT COUNT(*) FROM annotations a WHERE a.job_id = j.uuid) AS annotation_count
+              FROM annotation_jobs j
+              JOIN annotation_tasks t ON t.uuid = j.task_id
+             WHERE j.annotator_id = ? AND t.deleted_at IS NULL
+             ORDER BY j.created_at DESC
+            """,
+            (annotator_id,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+# ============ Evaluator runs (annotation feature) ============
+#
+# Annotation evaluator-run JOBS live in the generic `jobs` table with
+# `type='annotation-eval'` so they share queue capacity with `stt-eval` /
+# `tts-eval`. The per-(item, evaluator) RESULTS live below in `evaluator_runs`,
+# keyed by `job_id` = `jobs.uuid`. Soft delete on `evaluator_runs.deleted_at`
+# excludes a job's results from reads after the job is soft-deleted; recovery
+# uses `clear_evaluator_runs_for_job()` to wipe stale results before re-inserting.
+
+
+def clear_evaluator_runs_for_job(job_uuid: str) -> int:
+    """Soft-delete every evaluator_runs row tied to a given job. Used by
+    recovery to avoid duplicate (item, evaluator) entries on rerun."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE evaluator_runs SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE job_id = ? AND deleted_at IS NULL",
+            (job_uuid,),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+
+
+
+def _parse_evaluator_run_row(row: sqlite3.Row) -> Dict[str, Any]:
+    r = dict(row)
+    if r.get("value"):
+        try:
+            r["value"] = json.loads(r["value"])
+        except (TypeError, ValueError):
+            pass
+    return r
+
+
+def create_evaluator_runs(runs: List[Dict[str, Any]]) -> List[str]:
+    """Bulk insert evaluator_runs. Each entry needs job_id, item_id,
+    evaluator_id, evaluator_version_id, value, status."""
+    new_uuids: List[str] = []
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        for r in runs:
+            run_uuid = str(uuid.uuid4())
+            value_json = json.dumps(r["value"]) if r.get("value") is not None else None
+            cursor.execute(
+                """
+                INSERT INTO evaluator_runs
+                  (uuid, job_id, item_id, evaluator_id, evaluator_version_id,
+                   value, status, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?,
+                        CASE WHEN ? = 'completed' THEN CURRENT_TIMESTAMP ELSE NULL END)
+                """,
+                (
+                    run_uuid,
+                    r["job_id"],
+                    r["item_id"],
+                    r["evaluator_id"],
+                    r["evaluator_version_id"],
+                    value_json,
+                    r.get("status", "completed"),
+                    r.get("status", "completed"),
+                ),
+            )
+            new_uuids.append(run_uuid)
+        conn.commit()
+    return new_uuids
+
+
+def get_evaluator_runs_for_job(job_uuid: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM evaluator_runs "
+            "WHERE job_id = ? AND deleted_at IS NULL "
+            "ORDER BY id ASC",
+            (job_uuid,),
+        )
+        return [_parse_evaluator_run_row(r) for r in cursor.fetchall()]
+
+
+def get_evaluator_runs_for_task(task_uuid: str) -> List[Dict[str, Any]]:
+    """All non-deleted evaluator_runs for any item in this task."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT er.*
+              FROM evaluator_runs er
+              JOIN annotation_items ai ON ai.uuid = er.item_id
+             WHERE ai.task_id = ?
+               AND er.deleted_at IS NULL
+               AND ai.deleted_at IS NULL
+             ORDER BY er.id ASC
+            """,
+            (task_uuid,),
+        )
+        return [_parse_evaluator_run_row(r) for r in cursor.fetchall()]
+
+
+def get_evaluator_runs_for_user(user_id: str) -> List[Dict[str, Any]]:
+    """All non-deleted evaluator_runs across every annotation task this user owns."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT er.*
+              FROM evaluator_runs er
+              JOIN annotation_items ai ON ai.uuid = er.item_id
+              JOIN annotation_tasks t ON t.uuid = ai.task_id
+             WHERE t.user_id = ?
+               AND t.deleted_at IS NULL
+               AND ai.deleted_at IS NULL
+               AND er.deleted_at IS NULL
+             ORDER BY er.id ASC
+            """,
+            (user_id,),
+        )
+        return [_parse_evaluator_run_row(r) for r in cursor.fetchall()]
+
+
+def get_evaluator_runs_for_item(item_uuid: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM evaluator_runs "
+            "WHERE item_id = ? AND deleted_at IS NULL "
+            "ORDER BY id ASC",
+            (item_uuid,),
+        )
+        return [_parse_evaluator_run_row(r) for r in cursor.fetchall()]
+
+
+def get_annotations_for_annotator_overlap_slots(
+    user_id: str, annotator_id: str
+) -> List[Dict[str, Any]]:
+    """All annotations on slots (item_id, evaluator_id) where `annotator_id`
+    has annotated, scoped to tasks owned by `user_id`. Returns every annotator's
+    judgement on those slots so pairwise agreement can be computed."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.*, j.annotator_id AS annotator_id, j.task_id AS task_id
+              FROM annotations a
+              JOIN annotation_jobs j ON j.uuid = a.job_id
+              JOIN annotation_tasks t ON t.uuid = j.task_id
+              JOIN annotation_items ai ON ai.uuid = a.item_id
+             WHERE t.user_id = ?
+               AND t.deleted_at IS NULL
+               AND ai.deleted_at IS NULL
+               AND (a.item_id, COALESCE(a.evaluator_id, '')) IN (
+                   SELECT a2.item_id, COALESCE(a2.evaluator_id, '')
+                     FROM annotations a2
+                     JOIN annotation_jobs j2 ON j2.uuid = a2.job_id
+                     JOIN annotation_items ai2 ON ai2.uuid = a2.item_id
+                    WHERE j2.annotator_id = ?
+                      AND ai2.deleted_at IS NULL
+               )
+             ORDER BY a.updated_at ASC
+            """,
+            (user_id, annotator_id),
+        )
+        return [_parse_annotation_row(r) for r in cursor.fetchall()]
+
+
+def get_job_items(job_uuid: str) -> List[Dict[str, Any]]:
+    """Return the snapshotted items for a job. Read from `annotation_job_items.payload`
+    so edits/deletes on the source `annotation_items` row don't affect the
+    job's view. `task_id` comes from the parent job (stable)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT ji.id           AS id,
+                   ji.item_id      AS uuid,
+                   ji.payload      AS payload,
+                   j.task_id       AS task_id
+              FROM annotation_job_items ji
+              JOIN annotation_jobs j ON j.uuid = ji.job_id
+             WHERE ji.job_id = ?
+             ORDER BY ji.id ASC
+            """,
+            (job_uuid,),
+        )
+        out: List[Dict[str, Any]] = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            if d.get("payload"):
+                try:
+                    d["payload"] = json.loads(d["payload"])
+                except (TypeError, ValueError):
+                    pass
+            out.append(d)
+        return out
+
+
+def update_annotation_job_status(
+    job_uuid: str, status: str, set_completed_at: bool = False
+) -> bool:
+    sets = ["status = ?"]
+    params: List[Any] = [status]
+    if set_completed_at:
+        sets.append("completed_at = CURRENT_TIMESTAMP")
+    params.append(job_uuid)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE annotation_jobs SET {', '.join(sets)} WHERE uuid = ?",
+            params,
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+# ============ Annotations (judgements) ============
+
+
+def _parse_annotation_row(row: sqlite3.Row) -> Dict[str, Any]:
+    a = dict(row)
+    if a.get("value"):
+        try:
+            a["value"] = json.loads(a["value"])
+        except (TypeError, ValueError):
+            pass
+    return a
+
+
+def upsert_annotation(
+    job_id: str,
+    item_id: str,
+    value: Optional[Dict[str, Any]],
+    evaluator_id: Optional[str] = None,
+) -> str:
+    """
+    Insert or update a judgement for (job_id, item_id, evaluator_id).
+    Pass evaluator_id=None for a row-level (overall) annotation.
+    """
+    value_json = json.dumps(value) if value is not None else None
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        # SQLite treats NULLs as distinct in UNIQUE constraints, so handle row-level
+        # (evaluator_id IS NULL) explicitly.
+        if evaluator_id is None:
+            cursor.execute(
+                """
+                SELECT uuid FROM annotations
+                 WHERE job_id = ? AND item_id = ? AND evaluator_id IS NULL
+                """,
+                (job_id, item_id),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT uuid FROM annotations
+                 WHERE job_id = ? AND item_id = ? AND evaluator_id = ?
+                """,
+                (job_id, item_id, evaluator_id),
+            )
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute(
+                """
+                UPDATE annotations
+                   SET value = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE uuid = ?
+                """,
+                (value_json, existing["uuid"]),
+            )
+            conn.commit()
+            return existing["uuid"]
+
+        annotation_uuid = str(uuid.uuid4())
+        cursor.execute(
+            """
+            INSERT INTO annotations (uuid, job_id, item_id, evaluator_id, value)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (annotation_uuid, job_id, item_id, evaluator_id, value_json),
+        )
+        conn.commit()
+        return annotation_uuid
+
+
+def get_annotations_for_item(item_id: str) -> List[Dict[str, Any]]:
+    """All annotations on a single item, across jobs/annotators/evaluators."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.*, j.annotator_id AS annotator_id, j.task_id AS task_id
+              FROM annotations a
+              JOIN annotation_jobs j ON j.uuid = a.job_id
+             WHERE a.item_id = ?
+             ORDER BY a.created_at ASC
+            """,
+            (item_id,),
+        )
+        return [_parse_annotation_row(r) for r in cursor.fetchall()]
+
+
+def get_annotations_for_task(
+    task_id: str,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """All annotations across all NON-DELETED items in a task. Annotations on
+    soft-deleted items are excluded so aggregate agreement metrics drop them."""
+    query = (
+        "SELECT a.*, j.annotator_id AS annotator_id, j.task_id AS task_id "
+        "  FROM annotations a "
+        "  JOIN annotation_jobs j ON j.uuid = a.job_id "
+        "  JOIN annotation_items ai ON ai.uuid = a.item_id "
+        " WHERE j.task_id = ? AND ai.deleted_at IS NULL "
+    )
+    params: List[Any] = [task_id]
+    if since:
+        query += " AND a.updated_at >= ? "
+        params.append(since)
+    if until:
+        query += " AND a.updated_at < ? "
+        params.append(until)
+    query += " ORDER BY a.updated_at ASC"
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        return [_parse_annotation_row(r) for r in cursor.fetchall()]
+
+
+def get_annotations_for_user(
+    user_id: str,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """All annotations across all of a user's annotation tasks. Annotations on
+    soft-deleted items (or in soft-deleted tasks) are excluded."""
+    query = (
+        "SELECT a.*, j.annotator_id AS annotator_id, j.task_id AS task_id "
+        "  FROM annotations a "
+        "  JOIN annotation_jobs j ON j.uuid = a.job_id "
+        "  JOIN annotation_tasks t ON t.uuid = j.task_id "
+        "  JOIN annotation_items ai ON ai.uuid = a.item_id "
+        " WHERE t.user_id = ? "
+        "   AND t.deleted_at IS NULL "
+        "   AND ai.deleted_at IS NULL "
+    )
+    params: List[Any] = [user_id]
+    if since:
+        query += " AND a.updated_at >= ? "
+        params.append(since)
+    if until:
+        query += " AND a.updated_at < ? "
+        params.append(until)
+    query += " ORDER BY a.updated_at ASC"
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        return [_parse_annotation_row(r) for r in cursor.fetchall()]
+
+
+def get_evaluators_for_annotation_task(task_id: str) -> List[Dict[str, Any]]:
+    """Return evaluators linked to an annotation task (no version pinned)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                e.uuid AS uuid,
+                e.name AS name,
+                e.description AS description,
+                e.evaluator_type AS evaluator_type,
+                e.data_type AS data_type,
+                e.kind AS kind,
+                e.output_type AS output_type,
+                e.owner_user_id AS owner_user_id,
+                e.slug AS slug,
+                e.live_version_id AS live_version_id,
+                ate.created_at AS linked_at
+              FROM annotation_task_evaluators ate
+              JOIN evaluators e ON e.uuid = ate.evaluator_id
+             WHERE ate.task_id = ?
+               AND ate.deleted_at IS NULL
+               AND e.deleted_at IS NULL
+             ORDER BY ate.created_at ASC
+            """,
+            (task_id,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
