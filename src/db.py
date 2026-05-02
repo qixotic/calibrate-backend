@@ -5904,8 +5904,12 @@ def get_jobs_for_task_detailed(task_id: str) -> List[Dict[str, Any]]:
                        AND a.deleted_at IS NULL
                      GROUP BY a.item_id
                     HAVING COUNT(DISTINCT a.evaluator_id) >= (
-                        SELECT COUNT(*) FROM annotation_task_evaluators ate
-                         WHERE ate.task_id = j.task_id AND ate.deleted_at IS NULL
+                        -- Denominator is the JOB's snapshotted evaluator set,
+                        -- not the task's live linked set — so post-creation
+                        -- link/unlink can't shift `completed_item_count` away
+                        -- from the auto-complete contract.
+                        SELECT COUNT(*) FROM annotation_job_evaluators je
+                         WHERE je.job_id = j.uuid
                     )
                 )) AS completed_item_count
               FROM annotation_jobs j
@@ -6013,8 +6017,12 @@ def get_jobs_for_annotator_detailed(annotator_id: str) -> List[Dict[str, Any]]:
                        AND a.deleted_at IS NULL
                      GROUP BY a.item_id
                     HAVING COUNT(DISTINCT a.evaluator_id) >= (
-                        SELECT COUNT(*) FROM annotation_task_evaluators ate
-                         WHERE ate.task_id = j.task_id AND ate.deleted_at IS NULL
+                        -- Denominator is the JOB's snapshotted evaluator set,
+                        -- not the task's live linked set — so post-creation
+                        -- link/unlink can't shift `completed_item_count` away
+                        -- from the auto-complete contract.
+                        SELECT COUNT(*) FROM annotation_job_evaluators je
+                         WHERE je.job_id = j.uuid
                     )
                 )) AS completed_item_count
               FROM annotation_jobs j

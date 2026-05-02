@@ -27,6 +27,7 @@ from db import (
     get_jobs_for_task,
     get_jobs_for_task_detailed,
     get_job_items,
+    get_evaluator_ids_for_job,
     update_annotation_job_status,
     upsert_annotation,
     get_annotations_for_item,
@@ -503,15 +504,37 @@ async def upsert_annotation_endpoint(
     payload: AnnotationUpsertRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Owner-side upsert of a single annotation. The public-link/token flow
-    will be added in a later slice."""
+    """Owner-side upsert of a single annotation.
+
+    Both the item and the (non-null) evaluator must be in the job's
+    snapshot — same contract as the public token flow. Without these
+    checks, owner-authenticated callers could write annotations against
+    items/evaluators that were never assigned to this specific job (just
+    same task), polluting `completed_item_count`, agreement aggregates,
+    and the summary view.
+    """
     _ensure_owned_task(task_uuid, user_id)
     job = get_annotation_job(payload.job_id)
     if not job or job.get("task_id") != task_uuid:
         raise HTTPException(status_code=404, detail="Job not found")
-    item = get_annotation_item(payload.item_id)
-    if not item or item.get("task_id") != task_uuid:
-        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Validate against the job's snapshotted items, not the source items
+    # table — the source may have been edited or soft-deleted, but the
+    # snapshot is what this job is contracted to label.
+    job_item_ids = {it["uuid"] for it in get_job_items(payload.job_id)}
+    if payload.item_id not in job_item_ids:
+        raise HTTPException(status_code=404, detail="Item not in this job")
+
+    # Validate against the job's snapshotted evaluator set. `evaluator_id IS
+    # NULL` is the row-level overall annotation case and is always allowed.
+    if payload.evaluator_id is not None:
+        snapshot_evaluator_ids = set(get_evaluator_ids_for_job(payload.job_id))
+        if payload.evaluator_id not in snapshot_evaluator_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Evaluator not in this job: {payload.evaluator_id}",
+            )
+
     annotation_uuid = upsert_annotation(
         job_id=payload.job_id,
         item_id=payload.item_id,
