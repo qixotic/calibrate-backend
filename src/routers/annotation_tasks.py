@@ -1139,6 +1139,12 @@ def _human_agreement_for_run(
             annotator = (
                 annotators_by_uuid.get(annotator_id) if annotator_id else None
             )
+            raw_value = a.get("value")
+            reasoning = (
+                raw_value.get("reasoning")
+                if isinstance(raw_value, dict)
+                else None
+            )
             annotations_by_evaluator.setdefault(ev_id, []).append(
                 {
                     "annotation_id": a.get("uuid"),
@@ -1147,7 +1153,8 @@ def _human_agreement_for_run(
                         annotator.get("name") if annotator else None
                     ),
                     "job_id": a.get("job_id"),
-                    "value": a.get("value"),
+                    "value": raw_value,
+                    "reasoning": reasoning,
                     "updated_at": a.get("updated_at"),
                 }
             )
