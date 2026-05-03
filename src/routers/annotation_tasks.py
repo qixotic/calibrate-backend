@@ -2,7 +2,10 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 
+import logging
 import secrets
+
+logger = logging.getLogger(__name__)
 
 from db import (
     ANNOTATION_TASK_TYPES,
@@ -17,9 +20,11 @@ from db import (
     get_evaluator,
     get_evaluator_version,
     get_annotations_for_task,
+    get_annotations_for_slots,
     create_annotation_items,
     bulk_update_annotation_items,
     soft_delete_annotation_items,
+    soft_delete_annotation_job,
     get_annotation_items_for_task,
     get_annotation_item,
     create_annotation_job,
@@ -35,6 +40,8 @@ from db import (
     get_annotators_by_uuids,
     create_job,
     get_job,
+    snapshot_eval_job_items,
+    get_eval_job_items,
     get_generic_jobs_for_task,
     soft_delete_job,
     update_job,
@@ -75,6 +82,33 @@ from annotation_metrics import (
 
 def _live_version_map(evaluators: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
     return {e["uuid"]: e.get("live_version_id") for e in evaluators}
+
+
+def _enrich_evaluators_with_live_version(
+    evaluators: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Mutate `evaluators` in place to add live-version fields the FE
+    needs to render the labelling form / display values against the
+    correct rubric: `output_config`, `scale_min`, `scale_max`,
+    `variables`. Mirrors the public-form enrichment in `routers/public.py`
+    so the owner-side and annotator-side responses match. Versions are
+    fetched via a tiny per-call cache so a task with N evaluators that
+    happen to share a live version (rare) doesn't issue N reads."""
+    from llm_judge import _scale_bounds  # local to avoid module-load cycle
+
+    version_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    for ev in evaluators:
+        live_version_id = ev.get("live_version_id")
+        if live_version_id and live_version_id not in version_cache:
+            version_cache[live_version_id] = get_evaluator_version(live_version_id)
+        version = version_cache.get(live_version_id) if live_version_id else None
+        output_config = version.get("output_config") if version else None
+        scale_min, scale_max = _scale_bounds(output_config)
+        ev["output_config"] = output_config
+        ev["scale_min"] = scale_min
+        ev["scale_max"] = scale_max
+        ev["variables"] = version.get("variables") if version else None
+    return evaluators
 
 
 router = APIRouter(prefix="/annotation-tasks", tags=["annotation-tasks"])
@@ -182,7 +216,9 @@ async def get_annotation_task_endpoint(
     """Get an annotation task by UUID, including its linked evaluators,
     all items (each annotated with per-item agreement stats), and all jobs."""
     task = _ensure_owned_task(task_uuid, user_id)
-    evaluators = get_evaluators_for_annotation_task(task_uuid)
+    evaluators = _enrich_evaluators_with_live_version(
+        get_evaluators_for_annotation_task(task_uuid)
+    )
     task["evaluators"] = evaluators
     task["jobs"] = get_jobs_for_task_detailed(task_uuid)
 
@@ -272,10 +308,27 @@ class AnnotationItemPayload(BaseModel):
     # task `type`. The backend doesn't validate the shape — frontend +
     # downstream consumers (evaluator runs, agreement, etc.) interpret it.
     payload: Any
+    # Optional human annotations to seed alongside the item. Keys are
+    # evaluator UUIDs that must be currently linked to the task; values
+    # follow the canonical annotation shape used by the public form and
+    # the agreement math: `{"value": <bool|number|string>, "reasoning"?:
+    # str}` for EVERY output_type — binary uses a bool in `value`,
+    # rating uses a number in `value`. The agreement helpers in
+    # `annotation_metrics._scalar` only recognise the keys `value`,
+    # `score`, `rating`, `label`, `binary`; using `pass` (or any other
+    # custom key) stores fine but silently zeroes out of the agreement
+    # aggregates. When any item carries this, `BulkItemsRequest.annotator_id`
+    # is required.
+    annotations: Optional[Dict[str, Any]] = None
 
 
 class BulkItemsRequest(BaseModel):
     items: List[AnnotationItemPayload]
+    # Required only if any item in `items` carries `annotations`. The
+    # annotator must be owned by the requesting user. All seeded
+    # annotations are attributed to one synthesised completed job for
+    # this annotator.
+    annotator_id: Optional[str] = None
 
 
 @router.get("/{task_uuid}/items")
@@ -292,13 +345,198 @@ async def bulk_create_items(
     payload: BulkItemsRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Bulk-insert annotation items. Order of insertion is preserved by `id`."""
+    """Bulk-insert annotation items. Order of insertion is preserved by `id`.
+
+    Optionally seeds human annotations alongside the items: when any item
+    in the request carries `annotations`, `annotator_id` must be supplied
+    and one completed `annotation_jobs` row is synthesised for that
+    annotator covering every newly-inserted item. Annotations are upserted
+    as if the annotator had submitted them through the public form.
+    Annotations are validated against the task's *currently linked*
+    evaluator set; the task type (`stt | llm | simulation | tts`) does
+    not affect the contract. Value shape is uniform across output types:
+    `{"value": <bool|number|string>, "reasoning"?: str}` — binary uses a
+    bool, rating uses a number. This matches what the public form writes
+    via `upsert_annotation`, and is the only shape `annotation_metrics`
+    will count toward agreement aggregates."""
     _ensure_owned_task(task_uuid, user_id)
     if not payload.items:
         raise HTTPException(status_code=400, detail="items must be non-empty")
+
+    items_with_annotations = [
+        it for it in payload.items if it.annotations is not None
+    ]
+    if items_with_annotations and not payload.annotator_id:
+        raise HTTPException(
+            status_code=400,
+            detail="annotator_id is required when any item carries `annotations`",
+        )
+
+    annotator: Optional[Dict[str, Any]] = None
+    linked_evaluator_ids: set = set()
+    if items_with_annotations:
+        annotator = get_annotator(payload.annotator_id)
+        if not annotator or annotator.get("user_id") != user_id:
+            # 404 (not 403) — avoid leaking existence
+            raise HTTPException(status_code=404, detail="Annotator not found")
+        linked_evaluator_ids = {
+            e["uuid"] for e in get_evaluators_for_annotation_task(task_uuid)
+        }
+        for idx, it in enumerate(items_with_annotations):
+            if not isinstance(it.annotations, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"items[{idx}].annotations must be an object keyed by evaluator UUID",
+                )
+            unknown = [
+                ev_id
+                for ev_id in it.annotations.keys()
+                if ev_id not in linked_evaluator_ids
+            ]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Evaluator(s) not linked to this task: {unknown}. "
+                        f"Link them via POST /annotation-tasks/{task_uuid}/evaluators "
+                        f"before seeding annotations."
+                    ),
+                )
+            # Validate the value shape on every entry so a malformed dict
+            # can't slip through and silently zero out of the agreement
+            # aggregates (`annotation_metrics._scalar` only recognises
+            # the keys `value`, `score`, `rating`, `label`, `binary`).
+            # Bulk uploads are the only ingress path that doesn't go
+            # through the public form's typed widget, so the canonical
+            # check lives here.
+            for ev_id, raw in it.annotations.items():
+                if not isinstance(raw, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"items[{idx}].annotations[{ev_id!r}] must be an object "
+                            f"like {{\"value\": <bool|number|string>, \"reasoning\"?: str}}; "
+                            f"got {type(raw).__name__}"
+                        ),
+                    )
+                if "value" not in raw:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"items[{idx}].annotations[{ev_id!r}] is missing required key "
+                            f"`value`. Use {{\"value\": <bool|number|string>, "
+                            f"\"reasoning\"?: str}} for every output_type — binary uses a "
+                            f"bool in `value`, rating uses a number. (The keys `pass`, "
+                            f"`score`, `rating`, `label`, `binary` will round-trip on "
+                            f"reads but won't count toward agreement aggregates.)"
+                        ),
+                    )
+
     new_uuids = create_annotation_items(
-        task_uuid, [it.dict() for it in payload.items]
+        task_uuid,
+        [{"payload": it.payload} for it in payload.items],
     )
+
+    if items_with_annotations:
+        # One synthesised job covers every newly-inserted item, so the
+        # annotator shows up exactly once in agreement aggregates per
+        # bulk upload (rather than fragmenting across N tiny jobs).
+        # Items without `annotations` are still included in the job's
+        # snapshot — leaving their slots blank, which the auto-complete
+        # check at job-status-time treats the same as a partial form.
+        public_token = secrets.token_urlsafe(24)
+        job_uuid = create_annotation_job(
+            task_id=task_uuid,
+            annotator_id=payload.annotator_id,
+            item_uuids=new_uuids,
+            public_token=public_token,
+            status="pending",
+        )
+        # Re-validate every requested evaluator_id against the job's own
+        # snapshot, not the pre-creation linked set. Concurrent
+        # link/unlink between the upstream check and `create_annotation_job`
+        # can shift the snapshot under us; without this gate we'd persist
+        # annotations on slots the job doesn't own, polluting downstream
+        # `annotations`-by-task reads. Same contract enforced by the
+        # public-form upsert endpoint in `routers/public.py`.
+        snapshot_evaluator_ids = set(get_evaluator_ids_for_job(job_uuid))
+        snapshot_mismatch: List[str] = []
+        for it in payload.items:
+            if not it.annotations:
+                continue
+            for evaluator_id in it.annotations.keys():
+                if evaluator_id not in snapshot_evaluator_ids:
+                    snapshot_mismatch.append(evaluator_id)
+        if snapshot_mismatch:
+            # Roll back the just-created items + job so the request is
+            # atomic from the caller's perspective. Without this, a 409
+            # leaves orphaned items + a dangling pending job, and a
+            # client retry would duplicate items every time. Annotation
+            # rows haven't been written yet (this gate runs before the
+            # upsert loop), so soft-deleting items + job is sufficient.
+            try:
+                soft_delete_annotation_items(task_uuid, new_uuids)
+            except Exception as e:
+                logger.warning(
+                    f"[bulk-create-items] rollback: failed to soft-delete "
+                    f"items {new_uuids} after snapshot mismatch: {e}"
+                )
+            try:
+                soft_delete_annotation_job(job_uuid)
+            except Exception as e:
+                logger.warning(
+                    f"[bulk-create-items] rollback: failed to soft-delete "
+                    f"job {job_uuid} after snapshot mismatch: {e}"
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Evaluator(s) were unlinked from this task between "
+                    f"validation and job creation: {sorted(set(snapshot_mismatch))}. "
+                    f"Re-link them and retry, or drop them from the request. "
+                    f"(The created items and job have been rolled back; "
+                    f"safe to retry as-is.)"
+                ),
+            )
+        any_annotation_written = False
+        for it, item_uuid in zip(payload.items, new_uuids):
+            if not it.annotations:
+                continue
+            for evaluator_id, value in it.annotations.items():
+                upsert_annotation(
+                    job_id=job_uuid,
+                    item_id=item_uuid,
+                    value=value,
+                    evaluator_id=evaluator_id,
+                )
+                any_annotation_written = True
+        # Auto-complete contract: every item × every evaluator IN THE JOB
+        # SNAPSHOT must have a row. Same source of truth as the public-form
+        # auto-complete path (`get_evaluator_ids_for_job`) — see also the
+        # snapshot-mismatch gate above which uses the same set.
+        items_fully_annotated = all(
+            it.annotations
+            and snapshot_evaluator_ids.issubset(set(it.annotations.keys()))
+            for it in payload.items
+        )
+        if any_annotation_written and items_fully_annotated:
+            update_annotation_job_status(
+                job_uuid, status="completed", set_completed_at=True
+            )
+        elif any_annotation_written:
+            # Partial fill: some slots filled, others left for the
+            # annotator to finish via the public form. Mirror the public
+            # upsert endpoint's "first save flips pending -> in_progress"
+            # transition so status-based consumers (jobs list, dashboards)
+            # don't see a job with real annotation data still labelled
+            # `pending`.
+            update_annotation_job_status(job_uuid, status="in_progress")
+        return {
+            "item_ids": new_uuids,
+            "count": len(new_uuids),
+            "annotation_job_id": job_uuid,
+        }
+
     return {"item_ids": new_uuids, "count": len(new_uuids)}
 
 
@@ -663,6 +901,12 @@ async def start_evaluator_run(
             "item_ids": item_ids_persisted,
         },
     )
+    # Snapshot the resolved item set onto the job so the runner reads
+    # frozen payloads regardless of any subsequent edit / soft-delete on
+    # the source `annotation_items` row. Order matches submission order
+    # (preserved via the loop above) so reproducibility extends to the
+    # exact byte sequence calibrate sees.
+    snapshot_eval_job_items(job_uuid, items)
 
     if can_start:
         start_annotation_eval_job(
@@ -762,12 +1006,201 @@ async def list_evaluator_run_jobs(
     return [_shape_eval_job_for_response(j) for j in jobs]
 
 
+def _human_agreement_for_run(
+    task_uuid: str, job_runs: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Build the `human_agreement` block returned alongside an evaluator-run
+    job. Restricted to slots (item_id, evaluator_id) actually exercised by
+    THIS job's runs — annotations on items/evaluators not in the run are
+    ignored even if present elsewhere on the task.
+
+    Shape:
+        {
+          "evaluators": [
+            { "evaluator_id": str, "evaluator_version_id": str|None,
+              "agreement": float|None, "pair_count": int, "item_count": int }
+          ],
+          "items": [
+            { "item_id": str, "annotator_count": int,
+              "evaluators": [{evaluator_id, agreement, pair_count}] }
+          ]
+        }
+
+    `evaluators[].agreement` reuses `aggregate_human_evaluator_agreement` —
+    so it agrees with the task-level alignment block by construction.
+    `items[]` only includes items where at least one human annotation exists
+    on an evaluator that this job ran (no humans → no row, by design)."""
+    if not job_runs:
+        return {"evaluators": [], "items": []}
+
+    item_ids_in_run = {r["item_id"] for r in job_runs if r.get("item_id")}
+    evaluator_ids_in_run = list(
+        {r["evaluator_id"] for r in job_runs if r.get("evaluator_id")}
+    )
+    if not item_ids_in_run or not evaluator_ids_in_run:
+        return {"evaluators": [], "items": []}
+
+    # Constrain the read to this run's slots at the DB layer rather than
+    # pulling the task's entire annotation history and filtering in
+    # Python — on a large task, the run is a tiny window and the filter
+    # would dominate request latency. `include_deleted_items=True`
+    # preserves annotations on items soft-deleted AFTER this run
+    # completed (the run's `evaluator_runs` rows survive item delete; the
+    # human side has to survive too or the agreement number on the
+    # run-detail view silently shrinks).
+    relevant_annotations = get_annotations_for_slots(
+        task_uuid,
+        item_ids=list(item_ids_in_run),
+        evaluator_ids=evaluator_ids_in_run,
+        include_deleted_items=True,
+    )
+
+    # Per-evaluator aggregate (across every item this job touched).
+    evaluator_blocks: List[Dict[str, Any]] = []
+    # Pre-compute version pin per evaluator from the run rows so the FE can
+    # show "agreement on evaluator X version Y vs humans" without an extra
+    # lookup. A job runs one version per evaluator by construction.
+    version_by_evaluator: Dict[str, Optional[str]] = {}
+    for r in job_runs:
+        ev_id = r.get("evaluator_id")
+        if ev_id and ev_id not in version_by_evaluator:
+            version_by_evaluator[ev_id] = r.get("evaluator_version_id")
+    for ev_id in evaluator_ids_in_run:
+        agreement, pair_count = aggregate_human_evaluator_agreement(
+            relevant_annotations, job_runs, ev_id
+        )
+        # Items with at least one human annotation on this evaluator.
+        item_count = len(
+            {
+                a["item_id"]
+                for a in relevant_annotations
+                if a.get("evaluator_id") == ev_id
+            }
+        )
+        evaluator_blocks.append(
+            {
+                "evaluator_id": ev_id,
+                "evaluator_version_id": version_by_evaluator.get(ev_id),
+                "agreement": agreement,
+                "pair_count": pair_count,
+                "item_count": item_count,
+            }
+        )
+
+    # Per-item agreement, restricted to items that have at least one human
+    # annotation on an evaluator this job ran. The whole point of this view
+    # is "where do machines and humans disagree on this run" — items with
+    # zero human signal contribute nothing.
+    annotations_by_item: Dict[str, List[Dict[str, Any]]] = {}
+    for a in relevant_annotations:
+        annotations_by_item.setdefault(a["item_id"], []).append(a)
+    runs_by_item: Dict[str, List[Dict[str, Any]]] = {}
+    for r in job_runs:
+        if r.get("item_id"):
+            runs_by_item.setdefault(r["item_id"], []).append(r)
+
+    # Resolve annotator names once for every annotator that contributed to
+    # any of the relevant items, so per-item entries can label each value.
+    annotator_uuids = sorted(
+        {
+            a.get("annotator_id")
+            for a in relevant_annotations
+            if a.get("annotator_id")
+        }
+    )
+    annotators_by_uuid = (
+        get_annotators_by_uuids(annotator_uuids) if annotator_uuids else {}
+    )
+
+    item_blocks: List[Dict[str, Any]] = []
+    for item_id, item_annotations in annotations_by_item.items():
+        per_item = per_item_agreement(
+            item_annotations,
+            runs_by_item.get(item_id, []),
+            evaluator_ids_in_run,
+        )
+        # Drop evaluator slots with zero human pair count so the FE only
+        # renders cells that actually compare to a human.
+        ev_entries = [
+            e for e in per_item.get("evaluators", []) if e.get("pair_count")
+        ]
+        if not ev_entries:
+            continue
+        # Bucket the raw human annotations on this item by evaluator so the
+        # FE can show every annotator's exact value alongside the agreement
+        # number. Annotations are already filtered to the run's slot set,
+        # so every entry here is in scope.
+        annotations_by_evaluator: Dict[str, List[Dict[str, Any]]] = {}
+        for a in item_annotations:
+            ev_id = a.get("evaluator_id")
+            if not ev_id:
+                continue
+            annotator_id = a.get("annotator_id")
+            annotator = (
+                annotators_by_uuid.get(annotator_id) if annotator_id else None
+            )
+            annotations_by_evaluator.setdefault(ev_id, []).append(
+                {
+                    "annotation_id": a.get("uuid"),
+                    "annotator_id": annotator_id,
+                    "annotator_name": (
+                        annotator.get("name") if annotator else None
+                    ),
+                    "job_id": a.get("job_id"),
+                    "value": a.get("value"),
+                    "updated_at": a.get("updated_at"),
+                }
+            )
+        # Sort each evaluator's annotations deterministically (oldest first)
+        # so the FE can render them in submission order.
+        for entries in annotations_by_evaluator.values():
+            entries.sort(key=lambda e: (e.get("updated_at") or "", e.get("annotation_id") or ""))
+        # Inline the raw annotations onto each evaluator block keyed by
+        # evaluator_id, so the agreement cell and the underlying values
+        # render together without an extra join on the FE.
+        for entry in ev_entries:
+            entry["human_annotations"] = annotations_by_evaluator.get(
+                entry["evaluator_id"], []
+            )
+        item_blocks.append(
+            {
+                "item_id": item_id,
+                "annotator_count": len(
+                    {
+                        a.get("annotator_id")
+                        for a in item_annotations
+                        if a.get("annotator_id")
+                    }
+                ),
+                "evaluators": ev_entries,
+            }
+        )
+    # Stable order: items in run-row order so the FE can scroll predictably.
+    item_order = [r["item_id"] for r in job_runs if r.get("item_id")]
+    seen: set = set()
+    ordered_item_ids: List[str] = []
+    for i in item_order:
+        if i not in seen:
+            seen.add(i)
+            ordered_item_ids.append(i)
+    pos = {i: idx for idx, i in enumerate(ordered_item_ids)}
+    item_blocks.sort(key=lambda b: pos.get(b["item_id"], len(pos)))
+
+    return {"evaluators": evaluator_blocks, "items": item_blocks}
+
+
 @router.get("/{task_uuid}/evaluator-runs/{job_uuid}")
 async def get_evaluator_run_job(
     task_uuid: str,
     job_uuid: str,
     user_id: str = Depends(get_current_user_id),
 ):
+    """Single evaluator-run job, with raw runs and human-agreement summary.
+
+    `human_agreement` is computed only on slots (item × evaluator) that this
+    job actually exercised AND that have at least one human annotation —
+    so a fresh task with no humans yet returns empty arrays (not zeros)
+    and the FE can fall back to the regular runs view."""
     _ensure_owned_task(task_uuid, user_id)
     job = get_job(job_uuid, user_id=user_id)
     if (
@@ -777,9 +1210,14 @@ async def get_evaluator_run_job(
     ):
         raise HTTPException(status_code=404, detail="Job not found")
     shaped = _shape_eval_job_for_response(job)
-    shaped["runs"] = _enrich_runs_with_live_evaluator(
-        get_evaluator_runs_for_job(job_uuid)
-    )
+    raw_runs = get_evaluator_runs_for_job(job_uuid)
+    shaped["runs"] = _enrich_runs_with_live_evaluator(raw_runs)
+    shaped["human_agreement"] = _human_agreement_for_run(task_uuid, raw_runs)
+    # Frozen item snapshot — what calibrate actually saw, regardless of
+    # any post-submit edits / soft-deletes on the source annotation_items.
+    # Empty for legacy jobs created before snapshotting (those will be
+    # backfilled on first run; see annotation_eval_runner._run_job).
+    shaped["items"] = get_eval_job_items(job_uuid)
     return shaped
 
 

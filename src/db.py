@@ -609,6 +609,27 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        # Snapshot of items assigned to an evaluator-run job. Mirrors
+        # `annotation_job_items` but for the generic-`jobs`-table-backed
+        # `annotation-eval` flow, so evaluator runs survive item edits/
+        # soft-deletes after submission. Reading is via
+        # `get_eval_job_items`; the runner reads payloads from here so the
+        # exact bytes v3 scored against are reproducible even after the
+        # source `annotation_items` row is edited or soft-deleted.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotation_eval_job_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(job_id, item_id),
+                FOREIGN KEY (job_id) REFERENCES jobs(uuid),
+                FOREIGN KEY (item_id) REFERENCES annotation_items(uuid)
+            )
+            """
+        )
+
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS annotation_job_evaluators (
@@ -5710,6 +5731,24 @@ def soft_delete_annotation_items(
         return cursor.rowcount
 
 
+def soft_delete_annotation_job(job_uuid: str) -> bool:
+    """Soft-delete a single annotation_jobs row. Used by the bulk-upload
+    rollback path when a snapshot mismatch is detected after the job has
+    been created — leaves the row in place but flips it out of every
+    `deleted_at IS NULL` filter so it doesn't appear in lists or feed
+    downstream agreement reads. Returns True iff a live row was
+    transitioned (already-deleted UUIDs return False)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE annotation_jobs SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE uuid = ? AND deleted_at IS NULL",
+            (job_uuid,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def get_annotation_items_for_task(task_id: str) -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -6208,6 +6247,64 @@ def get_annotations_for_annotator_overlap_slots(
         return [_parse_annotation_row(r) for r in cursor.fetchall()]
 
 
+def snapshot_eval_job_items(
+    job_uuid: str, items: List[Dict[str, Any]]
+) -> None:
+    """Write `(item_uuid, payload)` rows into `annotation_eval_job_items`
+    for an annotation-eval job. Idempotent: re-snapshotting the same
+    `(job_id, item_id)` is a no-op (UNIQUE constraint with INSERT OR
+    IGNORE), so recovery / retries are safe.
+
+    Caller must pass the items in the order they want preserved — the
+    auto-increment `id` column is what determines the read order in
+    `get_eval_job_items`."""
+    if not items:
+        return
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.executemany(
+            "INSERT OR IGNORE INTO annotation_eval_job_items "
+            "(job_id, item_id, payload) VALUES (?, ?, ?)",
+            [
+                (
+                    job_uuid,
+                    it["uuid"],
+                    json.dumps(it.get("payload")),
+                )
+                for it in items
+            ],
+        )
+        conn.commit()
+
+
+def get_eval_job_items(job_uuid: str) -> List[Dict[str, Any]]:
+    """Read snapshotted items for an annotation-eval job. Order matches
+    submission order (insertion order on `id`). Each row is
+    `{uuid, payload (parsed)}` — no joins to `annotation_items` so the
+    snapshot is independent of post-submit edits / soft-deletes there."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT item_id AS uuid, payload
+              FROM annotation_eval_job_items
+             WHERE job_id = ?
+             ORDER BY id ASC
+            """,
+            (job_uuid,),
+        )
+        out: List[Dict[str, Any]] = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            if d.get("payload"):
+                try:
+                    d["payload"] = json.loads(d["payload"])
+                except (TypeError, ValueError):
+                    pass
+            out.append(d)
+        return out
+
+
 def get_job_items(job_uuid: str) -> List[Dict[str, Any]]:
     """Return the snapshotted items for a job. Read from `annotation_job_items.payload`
     so edits/deletes on the source `annotation_items` row don't affect the
@@ -6351,13 +6448,27 @@ def get_annotations_for_item(item_id: str) -> List[Dict[str, Any]]:
         return [_parse_annotation_row(r) for r in cursor.fetchall()]
 
 
-def get_annotations_for_task(
+def get_annotations_for_slots(
     task_id: str,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
+    item_ids: List[str],
+    evaluator_ids: List[str],
+    include_deleted_items: bool = True,
 ) -> List[Dict[str, Any]]:
-    """All annotations across all NON-DELETED items in a task. Annotations on
-    soft-deleted items are excluded so aggregate agreement metrics drop them."""
+    """All annotations on the given (item × evaluator) slots within a task.
+
+    Avoids the read-everything-then-filter-in-Python pattern when only a
+    specific run's slots are needed (e.g. the run-detail endpoint), which
+    on a large task is dominated by annotation history outside the run.
+
+    `include_deleted_items=True` (default) preserves annotations whose
+    item was soft-deleted after the run's snapshot — matching the
+    eval-run reproducibility contract: what humans said about the row
+    at the time, even if the row was cleaned up later. Soft-deleted
+    JOBS are still excluded (cascade on task delete is intentional)."""
+    if not item_ids or not evaluator_ids:
+        return []
+    item_placeholders = ",".join("?" for _ in item_ids)
+    evaluator_placeholders = ",".join("?" for _ in evaluator_ids)
     query = (
         "SELECT a.*, j.annotator_id AS annotator_id, j.task_id AS task_id "
         "  FROM annotations a "
@@ -6366,8 +6477,48 @@ def get_annotations_for_task(
         " WHERE j.task_id = ? "
         "   AND a.deleted_at IS NULL "
         "   AND j.deleted_at IS NULL "
-        "   AND ai.deleted_at IS NULL "
+        f"  AND a.item_id IN ({item_placeholders}) "
+        f"  AND a.evaluator_id IN ({evaluator_placeholders}) "
     )
+    if not include_deleted_items:
+        query += "   AND ai.deleted_at IS NULL "
+    query += " ORDER BY a.updated_at ASC"
+    params: List[Any] = [task_id, *item_ids, *evaluator_ids]
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        return [_parse_annotation_row(r) for r in cursor.fetchall()]
+
+
+def get_annotations_for_task(
+    task_id: str,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    include_deleted_items: bool = False,
+) -> List[Dict[str, Any]]:
+    """All annotations across all NON-DELETED items in a task. Annotations on
+    soft-deleted items are excluded by default so aggregate agreement metrics
+    drop them.
+
+    `include_deleted_items=True` keeps annotations whose item was soft-deleted
+    after the annotation was written. The run-detail view uses this so an
+    item soft-delete after a run completes doesn't silently shrink the
+    `human_agreement` block under the user — the eval-run pinning contract
+    is "what did v3 score against, vs what humans said about the same row at
+    the time", and that contract has to outlast item soft-delete. Annotations
+    on soft-deleted JOBS are still excluded (cascade on task delete is
+    intentional)."""
+    query = (
+        "SELECT a.*, j.annotator_id AS annotator_id, j.task_id AS task_id "
+        "  FROM annotations a "
+        "  JOIN annotation_jobs j ON j.uuid = a.job_id "
+        "  JOIN annotation_items ai ON ai.uuid = a.item_id "
+        " WHERE j.task_id = ? "
+        "   AND a.deleted_at IS NULL "
+        "   AND j.deleted_at IS NULL "
+    )
+    if not include_deleted_items:
+        query += "   AND ai.deleted_at IS NULL "
     params: List[Any] = [task_id]
     if since:
         query += " AND a.updated_at >= ? "

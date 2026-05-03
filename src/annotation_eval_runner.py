@@ -33,9 +33,11 @@ from db import (
     create_evaluator_runs,
     get_annotation_items_for_task,
     get_annotation_task,
+    get_eval_job_items,
     get_evaluator,
     get_evaluator_version,
     get_job,
+    snapshot_eval_job_items,
     update_job,
 )
 from llm_judge import (
@@ -958,17 +960,41 @@ def _run_job(
         if not task:
             raise RuntimeError(f"Task {task_uuid} disappeared")
 
-        all_items = get_annotation_items_for_task(task_uuid)
-        if not all_items:
-            raise RuntimeError("Task has no items")
-        if item_ids is None:
-            items = all_items
+        # Read the snapshot the submission endpoint wrote into
+        # `annotation_eval_job_items`. This is the exact item set + payloads
+        # the user submitted, frozen against subsequent edits / soft-deletes
+        # on `annotation_items`. Order is preserved by the snapshot's
+        # insertion order so calibrate sees the same sequence on retry.
+        snapshot_items = get_eval_job_items(job_uuid)
+        if snapshot_items:
+            items = snapshot_items
         else:
-            by_id = {it["uuid"]: it for it in all_items}
-            items = [by_id[i] for i in item_ids if i in by_id]
-            if not items:
-                raise RuntimeError(
-                    "None of the requested item_ids are still live on this task"
+            # Backwards-compat: jobs created before snapshotting was added
+            # have no rows in `annotation_eval_job_items`. Fall back to the
+            # live list (old behavior) and write the snapshot now so a later
+            # recovery / re-read goes through the snapshot path. This
+            # branch is also the only path for any in-flight job that
+            # spans the deploy of this change.
+            all_items = get_annotation_items_for_task(task_uuid)
+            if not all_items:
+                raise RuntimeError("Task has no items")
+            if item_ids is None:
+                items = all_items
+            else:
+                by_id = {it["uuid"]: it for it in all_items}
+                items = [by_id[i] for i in item_ids if i in by_id]
+                if not items:
+                    raise RuntimeError(
+                        "None of the requested item_ids are still live on this task"
+                    )
+            try:
+                snapshot_eval_job_items(job_uuid, items)
+            except Exception as e:
+                # Snapshotting is a perf optimisation for next-read; a
+                # failure here shouldn't block the run.
+                logger.warning(
+                    f"[annotation-eval] backfill snapshot failed for "
+                    f"{job_uuid}: {e}"
                 )
 
         task_type = task.get("type", "stt")
