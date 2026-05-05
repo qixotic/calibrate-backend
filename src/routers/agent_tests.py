@@ -1143,8 +1143,17 @@ def _match_model_to_folder(model: str, folder_names: List[str]) -> Optional[str]
     return None
 
 
-def _read_leaderboard_csv(leaderboard_dir: Path) -> Optional[List[dict]]:
-    """Read the leaderboard CSV from the leaderboard directory."""
+def _read_leaderboard_csv(
+    leaderboard_dir: Path, models: Optional[List[str]] = None
+) -> Optional[List[dict]]:
+    """Read the leaderboard CSV from the leaderboard directory.
+
+    The calibrate CLI writes the ``model`` column using the model name converted
+    to a filesystem-safe form (``/`` and ``:`` replaced with ``__``/``_``/``-``).
+    When ``models`` is supplied (the original slash-form names), each row's
+    ``model`` field is normalized back to the matching original string so the
+    API response shape matches ``model_results[].model``.
+    """
     if not leaderboard_dir.exists():
         logger.warning(f"Leaderboard directory does not exist: {leaderboard_dir}")
         return None
@@ -1162,12 +1171,29 @@ def _read_leaderboard_csv(leaderboard_dir: Path) -> Optional[List[dict]]:
     csv_file = csv_files[0]
     logger.info(f"Reading leaderboard from: {csv_file}")
 
+    folder_to_model: Dict[str, str] = {}
+    if models:
+        for original in models:
+            for variant in {
+                original.replace("/", "_").replace(":", "_").lower(),
+                original.replace("/", "-").replace(":", "-").lower(),
+                original.replace("/", "__").replace(":", "__").lower(),
+                original.lower(),
+            }:
+                folder_to_model.setdefault(variant, original)
+
     try:
         leaderboard_summary = []
         with open(csv_file, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                leaderboard_summary.append(dict(row))
+                row_dict = dict(row)
+                folder_name = row_dict.get("model")
+                if folder_name and folder_to_model:
+                    original = folder_to_model.get(folder_name.lower())
+                    if original:
+                        row_dict["model"] = original
+                leaderboard_summary.append(row_dict)
         logger.info(f"Read {len(leaderboard_summary)} rows from leaderboard")
         return leaderboard_summary
     except Exception as e:
@@ -2090,7 +2116,9 @@ def run_benchmark_task(
                 leaderboard_summary = None
                 if leaderboard_dir.exists():
                     logger.info(f"Leaderboard directory exists: {leaderboard_dir}")
-                    leaderboard_summary = _read_leaderboard_csv(leaderboard_dir)
+                    leaderboard_summary = _read_leaderboard_csv(
+                        leaderboard_dir, models=models
+                    )
 
                     # Upload leaderboard to S3
                     results_prefix = f"agent-tests/benchmarks/{task_id}"
