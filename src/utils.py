@@ -122,13 +122,21 @@ class TaskStatus(str, Enum):
 
 
 class EvaluatorRunEntry(BaseModel):
-    """One evaluator's aggregate metrics for an STT/TTS provider, paired with evaluator UUID."""
+    """One evaluator's aggregate metrics for an STT/TTS provider, paired with evaluator UUID.
+
+    Canonical aggregate location: clients should read aggregate stats from
+    here, not from the parallel ``provider_results[i].metrics[<display name>]``
+    entries (those are kept for back-compat and may be retired in a later
+    release).
+    """
 
     evaluator_uuid: str
     metric_key: str  # key as emitted in metrics.json (derived from CLI/config at run time)
     aggregate: Dict[str, Any]
     name: Optional[str] = None  # filled on API read from DB + job snapshot
     description: Optional[str] = None  # filled on API read from current DB row
+    evaluator_version_id: Optional[str] = None  # pinned at job-submit time
+    output_type: Optional[str] = None  # "binary" | "rating" — drives per-row typing
 
 
 class ProviderResult(BaseModel):
@@ -923,6 +931,330 @@ def build_evaluator_runs_for_eval_job(
             )
         )
     return runs
+
+
+# Coerced as floats. Non-evaluator columns calibrate writes as strings into
+# results.csv but that are numeric by contract. Conservative list — anything
+# unknown is left as a string so we don't silently drop a future text column.
+_NUMERIC_ROW_KEYS = frozenset(
+    {
+        "wer",
+        "cer",
+        "string_similarity",
+        "similarity",
+        "processing_time",
+        "ttfb",
+        "latency",
+        "duration",
+        "audio_duration",
+    }
+)
+
+
+def _coerce_numeric(value: Any) -> Any:
+    """Return float(value) when the string parses as numeric; otherwise unchanged."""
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s.lower() in {"nan", "none", "null"}:
+            return None
+        try:
+            f = float(s)
+            return f
+        except ValueError:
+            return value
+    return value
+
+
+def coerce_evaluator_score(raw: Any, output_type: str) -> Any:
+    """Coerce a raw evaluator value out of CSV/JSON into the right Python
+    type per ``output_type``. Falls back to passthrough on unparseable input.
+
+    Single source of truth shared by the API-facing post-processor
+    (`post_process_provider_results`) and the annotation-eval persistence
+    path (`annotation_eval_runner._row_evaluator_value`). Previously these
+    had divergent implementations — annotation-eval handled stringified
+    floats like ``"1.0"`` / ``"0.0"`` (which calibrate's simulation flow
+    emits), the API path didn't, so binary evaluators rendered as the
+    raw string instead of a bool on the FE. Unified here.
+
+    Binary handling has to cope with the full range of representations
+    calibrate emits across its three flows: bool, ``"True"``/``"False"``
+    strings, ``"1"``/``"0"`` strings, ``"1.0"``/``"0.0"`` stringified
+    floats, and bare numerics.
+
+    Rating returns ``int`` when the value is whole-numbered (the common
+    case — 1-5 / 1-10 scales), ``float`` when fractional, preserving
+    precision for any future fractional rating scale.
+    """
+    if output_type == "binary":
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        s = str(raw).strip().lower()
+        if s in ("true", "yes", "pass", "passed"):
+            return True
+        if s in ("false", "no", "fail", "failed"):
+            return False
+        # Numeric strings — covers "1", "0", "1.0", "0.0", "1.00", etc.
+        try:
+            return bool(float(s))
+        except (TypeError, ValueError):
+            return raw
+    if output_type == "rating":
+        try:
+            f = float(raw)
+        except (TypeError, ValueError):
+            return raw
+        return int(f) if f.is_integer() else f
+    return raw
+
+
+def _row_value_looks_like_error(raw_value: Any, reasoning: Any) -> bool:
+    """Heuristic: did calibrate write an error marker instead of a real judgement?
+    Patterns observed: literal string "ERROR" in the value cell, or empty value
+    with reasoning starting with 'Error' / 'Exception'."""
+    if isinstance(raw_value, str) and raw_value.strip().lower() in {"error", "err"}:
+        return True
+    if (raw_value is None or raw_value == "") and isinstance(reasoning, str):
+        head = reasoning.strip().lower()[:20]
+        if head.startswith("error") or head.startswith("exception"):
+            return True
+    return False
+
+
+def post_process_provider_results(
+    provider_results: Optional[List[Dict[str, Any]]],
+    evaluator_snapshots: Optional[List[Dict[str, Any]]] = None,
+    evaluator_id_by_metric_key: Optional[Dict[str, str]] = None,
+) -> None:
+    """Single canonical post-processor for STT/TTS provider_results before they
+    leave the API. Idempotent — safe to call on already-shaped data.
+
+    Mutations performed in place:
+
+    1. ``evaluator_runs`` populated per-provider as soon as that provider's
+       ``metrics.json`` is on disk (the in-progress path historically only
+       set this once the *whole* run finished). Built from
+       ``ordered_evaluator_metric_keys`` + the metric_key→uuid map.
+    2. Each ``evaluator_runs`` entry gets ``evaluator_version_id`` and
+       ``output_type`` filled from the job-time evaluator snapshot, so the
+       FE can render rubric-aware widgets without a second DB roundtrip.
+    3. Per-row outputs are namespaced under ``row["evaluator_outputs"][uuid]``
+       (``{value, reasoning, version_id, output_type, error?}``) by lifting
+       the flat ``<column_name>`` / ``<column_name>_reasoning`` keys.
+       Legacy flat keys are KEPT for one deprecation window — clients that
+       have migrated read from ``evaluator_outputs`` only.
+
+       The lift is driven by ``evaluator_id_by_metric_key`` (calibrate's
+       authoritative ``config.json/evaluators_map``) when present — that's
+       the only string we *know* identifies an evaluator output column.
+       Falls back to the snapshot's display name when the map is missing
+       (in-progress jobs whose config.json hasn't landed, or pre-migration
+       legacy data); the fallback path is vulnerable to collisions with
+       built-in row columns (``id``, ``gt``, ``pred``, ``wer``, ...) and
+       with duplicate evaluator names, so it's a back-compat path only.
+    4. Values are typed: binary → ``bool``, rating → numeric. Known numeric
+       row columns (wer/cer/string_similarity/processing_time/etc.) are
+       parsed from string to ``float`` here too.
+    5. Per-row judge failures (calibrate wrote ``"ERROR"`` instead of a real
+       value, or left it blank with an ``"Error: ..."`` reasoning) surface
+       as ``evaluator_outputs[uuid].error = True`` with the original message
+       preserved in ``.reasoning``.
+    """
+    if not provider_results:
+        return
+
+    snapshot_by_uuid: Dict[str, Dict[str, Any]] = {}
+    snapshot_by_name: Dict[str, Dict[str, Any]] = {}
+    for snap in evaluator_snapshots or []:
+        if not isinstance(snap, dict):
+            continue
+        uid = snap.get("uuid") or snap.get("evaluator_id")
+        if uid:
+            snapshot_by_uuid[str(uid)] = snap
+        nm = snap.get("name")
+        if nm:
+            # Calibrate writes columns under the *rendered* display name. Index
+            # by name so we can recover the UUID when lifting flat row keys.
+            snapshot_by_name[str(nm)] = snap
+
+    evaluator_id_by_metric_key = evaluator_id_by_metric_key or {}
+
+    for pr in provider_results:
+        # ---------- Step 1 + 5: evaluator_runs from metrics.json ----------
+        runs = pr.get("evaluator_runs")
+        metrics = pr.get("metrics")
+        if not runs and metrics is not None and evaluator_id_by_metric_key:
+            try:
+                built = build_evaluator_runs_for_eval_job(
+                    metrics, evaluator_id_by_metric_key
+                )
+                runs = [r.model_dump() for r in built] if built else None
+                if runs:
+                    pr["evaluator_runs"] = runs
+            except Exception as e:
+                logger.warning(f"post_process: failed to build evaluator_runs: {e}")
+
+        # Backfill evaluator_version_id / output_type onto each run entry from
+        # the snapshot — the metric-key map gives us UUIDs but not types.
+        for run in pr.get("evaluator_runs") or []:
+            if not isinstance(run, dict):
+                continue
+            uid = run.get("evaluator_uuid")
+            snap = snapshot_by_uuid.get(uid) if uid else None
+            if snap:
+                # `setdefault` won't overwrite an existing-but-None value
+                # (the Pydantic model dumps these as None when unset), so
+                # explicitly fill any None slot from the snapshot.
+                if run.get("evaluator_version_id") is None:
+                    run["evaluator_version_id"] = snap.get("evaluator_version_id")
+                if run.get("output_type") is None:
+                    run["output_type"] = snap.get("output_type")
+                if run.get("name") is None:
+                    run["name"] = snap.get("name")
+
+        # ---------- Steps 3 + 4 + bonus: per-row evaluator_outputs ----------
+        rows = pr.get("results") or []
+        if not rows:
+            continue
+
+        # Build the {column_name -> snapshot_dict} pairs we'll lift each row
+        # against. Prefer the calibrate-authoritative `evaluators_map` when
+        # available — it's the only string we *know* identifies an evaluator
+        # output column rather than a built-in row column. Fall back to the
+        # snapshot's display name when the map is missing (in-progress reads
+        # before config.json lands, or legacy pre-map data); that fallback
+        # is vulnerable to reserved-column / duplicate-name collisions, so
+        # it's accepted only when there's no better option.
+        if evaluator_id_by_metric_key:
+            lift_pairs = [
+                (col_name, snapshot_by_uuid.get(uid))
+                for col_name, uid in evaluator_id_by_metric_key.items()
+            ]
+        else:
+            lift_pairs = list(snapshot_by_name.items())
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            outputs = row.get("evaluator_outputs")
+            if not isinstance(outputs, dict):
+                outputs = {}
+
+            for column_name, snap in lift_pairs:
+                if not snap:
+                    continue
+                uid = snap.get("uuid") or snap.get("evaluator_id")
+                if not uid:
+                    continue
+                # Calibrate column names: "<column>" carries the value,
+                # "<column>_reasoning" carries the judge's free-text rationale.
+                if column_name not in row and f"{column_name}_reasoning" not in row:
+                    continue
+                raw_value = row.get(column_name)
+                reasoning = row.get(f"{column_name}_reasoning")
+                is_err = _row_value_looks_like_error(raw_value, reasoning)
+
+                if is_err:
+                    typed_value: Any = None
+                else:
+                    output_type = (snap.get("output_type") or "").lower()
+                    if output_type in ("binary", "rating"):
+                        typed_value = coerce_evaluator_score(
+                            raw_value, output_type
+                        )
+                    else:
+                        # Unknown/unspecified — leave as-is so we don't lossy-
+                        # convert future evaluator types we haven't met.
+                        typed_value = raw_value
+
+                entry: Dict[str, Any] = {
+                    "value": typed_value,
+                    "reasoning": reasoning,
+                    "evaluator_version_id": snap.get("evaluator_version_id"),
+                    "output_type": snap.get("output_type"),
+                    # `name` is the human-facing display name from the
+                    # snapshot, not the calibrate column key — they're
+                    # equal in practice but we surface the snapshot's
+                    # name so the FE shows what the user sees in the
+                    # evaluator list, not calibrate's internal key.
+                    "name": snap.get("name") or column_name,
+                }
+                if is_err:
+                    entry["error"] = True
+                outputs[uid] = entry
+
+            if outputs:
+                row["evaluator_outputs"] = outputs
+
+            # Coerce known numeric row columns (wer/cer/...) from string→float
+            # so the FE doesn't need parallel coercion paths.
+            for key in list(row.keys()):
+                if key in _NUMERIC_ROW_KEYS:
+                    row[key] = _coerce_numeric(row[key])
+
+
+def load_evaluator_metric_key_map(details: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Read the calibrate-side ``{metric_key: evaluator_uuid}`` map from a
+    job's on-disk ``output_dir/config.json``. Returns ``{}`` if the dir is
+    missing or the read fails — both are normal mid-flight states (job
+    queued, output_dir already cleaned up, etc.) and should not throw.
+
+    Extracted to share between STT and TTS GET handlers, which both need
+    this map to drive ``post_process_provider_results`` mid-flight.
+    """
+    if not details:
+        return {}
+    output_dir_str = details.get("output_dir")
+    if not output_dir_str:
+        return {}
+    try:
+        candidate = Path(output_dir_str)
+        if not candidate.exists():
+            return {}
+        return read_evaluators_map_from_config(candidate)
+    except Exception:
+        return {}
+
+
+def compute_share_token_toggle(
+    job: Optional[Dict[str, Any]],
+    is_public: bool,
+    *,
+    token_field: str = "share_token",
+    token_factory: Optional[Any] = None,
+) -> tuple:
+    """Shared logic for every visibility-toggle PATCH endpoint.
+
+    Returns ``(token_to_persist, token_to_return)``:
+
+    * ``token_to_persist`` keeps any existing token across off→on→off
+      cycles so a previously-distributed share URL keeps working when
+      sharing is re-enabled. (Codex P2 caught the bug where 3/4
+      handlers were NULLing the token on disable.) Lookup queries
+      already filter on ``is_public = 1``, so a stored-but-disabled
+      token cannot resolve.
+    * ``token_to_return`` is suppressed (None) when sharing is off so
+      the FE never displays a share URL while the link is dead.
+
+    ``token_factory`` defaults to ``str(uuid.uuid4())`` for parity with
+    the historical STT/TTS/annotation-eval shapes; pass
+    ``secrets.token_urlsafe(24)`` for the labelling-job ``view_token``.
+    """
+    if token_factory is None:
+        import uuid as _uuid
+
+        token_factory = lambda: str(_uuid.uuid4())
+
+    existing = (job or {}).get(token_field)
+    if is_public:
+        token_to_persist = existing or token_factory()
+    else:
+        token_to_persist = existing
+    return token_to_persist, (token_to_persist if is_public else None)
 
 
 def enrich_evaluator_runs_with_current_names(

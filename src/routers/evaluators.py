@@ -17,6 +17,7 @@ from auth_utils import get_current_user_id
 from db import (
     DEFAULT_PROMPTS_BY_PURPOSE,
     create_evaluator,
+    name_uniqueness_guard,
     create_evaluator_version,
     delete_evaluator,
     duplicate_evaluator,
@@ -228,15 +229,16 @@ async def create_evaluator_endpoint(
     payload: EvaluatorCreate, user_id: str = Depends(get_current_user_id)
 ):
     _ensure_unique_evaluator_name(payload.name, user_id)
-    evaluator_uuid = create_evaluator(
-        name=payload.name,
-        description=payload.description,
-        evaluator_type=payload.evaluator_type,
-        data_type=payload.data_type,
-        kind=payload.kind,
-        output_type=payload.output_type,
-        owner_user_id=user_id,
-    )
+    with name_uniqueness_guard("Evaluator"):
+        evaluator_uuid = create_evaluator(
+            name=payload.name,
+            description=payload.description,
+            evaluator_type=payload.evaluator_type,
+            data_type=payload.data_type,
+            kind=payload.kind,
+            output_type=payload.output_type,
+            owner_user_id=user_id,
+        )
     version_cfg = (
         payload.version.output_config.model_dump(exclude_none=True)
         if payload.version.output_config
@@ -341,15 +343,16 @@ async def update_evaluator_endpoint(
     if payload.name is not None:
         _ensure_unique_evaluator_name(payload.name, user_id, exclude_uuid=evaluator_uuid)
     try:
-        updated = update_evaluator(
-            evaluator_uuid=evaluator_uuid,
-            name=payload.name,
-            description=payload.description,
-            evaluator_type=payload.evaluator_type,
-            data_type=payload.data_type,
-            kind=payload.kind,
-            output_type=payload.output_type,
-        )
+        with name_uniqueness_guard("Evaluator"):
+            updated = update_evaluator(
+                evaluator_uuid=evaluator_uuid,
+                name=payload.name,
+                description=payload.description,
+                evaluator_type=payload.evaluator_type,
+                data_type=payload.data_type,
+                kind=payload.kind,
+                output_type=payload.output_type,
+            )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not updated:
@@ -376,7 +379,10 @@ async def duplicate_evaluator_endpoint(
 ):
     _visible_or_404(get_evaluator(evaluator_uuid), user_id)
     _ensure_unique_evaluator_name(payload.name, user_id)
-    new_uuid = duplicate_evaluator(evaluator_uuid, new_name=payload.name, owner_user_id=user_id)
+    with name_uniqueness_guard("Evaluator"):
+        new_uuid = duplicate_evaluator(
+            evaluator_uuid, new_name=payload.name, owner_user_id=user_id
+        )
     if not new_uuid:
         raise HTTPException(status_code=404, detail="Evaluator not found")
     new_evaluator = get_evaluator(new_uuid)

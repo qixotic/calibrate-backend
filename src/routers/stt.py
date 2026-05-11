@@ -30,7 +30,10 @@ from utils import (
     TaskCreateResponse,
     TaskStatusResponse,
     build_evaluator_runs_for_eval_job,
+    compute_share_token_toggle,
     enrich_evaluator_runs_with_current_names,
+    load_evaluator_metric_key_map,
+    post_process_provider_results,
     get_s3_client,
     get_s3_output_config,
     can_start_job,
@@ -175,10 +178,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/stt", tags=["stt"])
 
 
-def _collect_intermediate_results(output_dir: Path, providers: list) -> list:
+def _collect_intermediate_results(
+    output_dir: Path, providers: list, expected_total: int
+) -> list:
     """Read whatever intermediate results are available from disk for each provider.
 
     Returns a list of ProviderResult objects preserving any partial results.
+    A provider is only marked ``success=True`` when it has BOTH a complete
+    row count (``>= expected_total``) AND an aggregate ``metrics.json`` on
+    disk — matching the contract used by the in-progress GET reader. Any
+    weaker signal (some rows but no metrics, or fewer rows than expected)
+    means calibrate crashed mid-run for that provider, so we surface the
+    partial rows but mark ``success=False`` to avoid lying to the FE.
     """
     evaluator_id_by_metric_key = read_evaluators_map_from_config(output_dir)
     provider_results = []
@@ -194,10 +205,14 @@ def _collect_intermediate_results(output_dir: Path, providers: list) -> list:
             else []
         )
         if results_data:
+            provider_done = (
+                metrics_data is not None
+                and len(results_data) >= expected_total
+            )
             provider_results.append(
                 ProviderResult(
                     provider=provider,
-                    success=True,
+                    success=True if provider_done else False,
                     metrics=metrics_data,
                     results=results_data,
                     evaluator_runs=runs or None,
@@ -562,7 +577,9 @@ def run_evaluation_task(
                 try:
                     if output_dir.exists():
                         intermediate = _collect_intermediate_results(
-                            output_dir, request.providers
+                            output_dir,
+                            request.providers,
+                            len(request.audio_paths),
                         )
                         if intermediate:
                             error_results["provider_results"] = [
@@ -592,7 +609,9 @@ def run_evaluation_task(
                 try:
                     if output_dir.exists():
                         intermediate = _collect_intermediate_results(
-                            output_dir, request.providers
+                            output_dir,
+                            request.providers,
+                            len(request.audio_paths),
                         )
                         if intermediate:
                             error_results["provider_results"] = [
@@ -733,18 +752,16 @@ async def update_stt_visibility(
 ):
     """Toggle public sharing for an STT evaluation job."""
     job = get_job(task_id, user_id=user_id)
-    if not job:
+    if not job or job.get("type") != "stt-eval":
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if body.is_public:
-        import uuid as _uuid
-
-        share_token = job.get("share_token") or str(_uuid.uuid4())
-    else:
-        share_token = None
-
-    update_job_visibility(task_id, body.is_public, share_token)
-    return VisibilityResponse(is_public=body.is_public, share_token=share_token)
+    token_to_persist, token_to_return = compute_share_token_toggle(
+        job, body.is_public
+    )
+    update_job_visibility(task_id, body.is_public, token_to_persist)
+    return VisibilityResponse(
+        is_public=body.is_public, share_token=token_to_return
+    )
 
 
 @router.get("/evaluate/{task_id}", response_model=TaskStatusResponse)
@@ -794,6 +811,7 @@ async def get_evaluation_status(
                         intermediate = _collect_intermediate_results(
                             output_dir,
                             requested_providers,
+                            len(details.get("audio_paths") or []),
                         )
                         # Merge: keep existing successful results, add new ones from disk
                         merged_results = []
@@ -843,12 +861,18 @@ async def get_evaluation_status(
 
     # Build provider results
     provider_results = results.get("provider_results")
+    # `evaluator_id_by_metric_key` lets the post-processor build
+    # `evaluator_runs[]` mid-flight from a freshly-landed metrics.json.
+    evaluator_id_by_metric_key = load_evaluator_metric_key_map(details)
+    output_dir_str = details.get("output_dir")
+    output_dir_root = Path(output_dir_str) if (
+        output_dir_str and Path(output_dir_str).exists()
+    ) else None
     if provider_results is None and status == TaskStatus.IN_PROGRESS.value:
         # Job is in progress - try to read intermediate results from disk
-        output_dir_str = details.get("output_dir")
         expected_total = len(details.get("audio_paths", []))
-        if output_dir_str:
-            output_dir = Path(output_dir_str)
+        if output_dir_root:
+            output_dir = output_dir_root
             provider_results = []
             for provider in requested_providers:
                 provider_output_dir = _find_provider_output_dir(output_dir, provider)
@@ -903,6 +927,15 @@ async def get_evaluation_status(
 
     enrich_evaluator_runs_with_current_names(
         provider_results, details.get("evaluators") or []
+    )
+
+    # Canonical post-processing: lift per-row outputs into evaluator_outputs[uuid],
+    # type-coerce values, build evaluator_runs from in-progress metrics, surface
+    # per-row judge errors. Idempotent — safe across in-progress / done / failed.
+    post_process_provider_results(
+        provider_results,
+        evaluator_snapshots=details.get("evaluators") or [],
+        evaluator_id_by_metric_key=evaluator_id_by_metric_key,
     )
 
     # Enrich each result row with a presigned audio URL from the dataset.

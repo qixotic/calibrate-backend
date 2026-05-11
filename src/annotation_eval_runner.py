@@ -47,6 +47,7 @@ from llm_judge import (
 from utils import (
     TaskStatus,
     capture_exception_to_sentry,
+    coerce_evaluator_score,
     get_s3_client,
     get_s3_output_config,
     is_job_timed_out,
@@ -452,49 +453,26 @@ def _read_config_evaluators_map(output_dir: Path) -> Dict[str, str]:
     return out
 
 
-def _coerce_score(raw: Any, output_type: str) -> Any:
-    """Coerce a raw value out of CSV/JSON into the right Python type per
-    output_type. Falls back to passthrough on unparseable input.
-
-    Binary handling has to cope with the full range of representations
-    calibrate emits across its three flows: bool, "True"/"False" strings,
-    "1"/"0" strings, "1.0"/"0.0" stringified floats (simulation
-    `evaluation_results.csv` does this), and bare numerics.
-    """
-    if output_type == "binary":
-        if isinstance(raw, bool):
-            return raw
-        if isinstance(raw, (int, float)):
-            return bool(raw)
-        s = str(raw).strip().lower()
-        if s in ("true", "yes", "pass"):
-            return True
-        if s in ("false", "no", "fail"):
-            return False
-        # Numeric strings — covers "1", "0", "1.0", "0.0", "1.00", etc.
-        try:
-            return bool(float(s))
-        except (TypeError, ValueError):
-            return raw
-    if output_type == "rating":
-        try:
-            return int(float(raw))
-        except (TypeError, ValueError):
-            try:
-                return float(raw)
-            except (TypeError, ValueError):
-                return raw
-    return raw
+# `_coerce_score` previously lived here as a private helper. Moved to
+# `utils.coerce_evaluator_score` so the API-facing post-processor can
+# share the same implementation — keeps binary "1.0"/"0.0" handling
+# consistent across persistence and read paths. Local alias retained
+# so the call sites below stay readable.
+_coerce_score = coerce_evaluator_score
 
 
 def _row_evaluator_value(
-    row: Dict[str, Any], evaluator_name: str, output_type: str
+    row: Dict[str, Any], column_name: str, output_type: str
 ) -> Optional[Dict[str, Any]]:
-    """Pick one evaluator's score + reasoning out of a results.csv row."""
-    if evaluator_name not in row:
+    """Pick one evaluator's score + reasoning out of a results.csv row by its
+    calibrate-side column name. The caller is responsible for resolving the
+    column name via the config.json `evaluators_map` so we don't accidentally
+    read a built-in row column (id, gt, pred, wer, …) when an evaluator
+    happens to share its name."""
+    if column_name not in row:
         return None
-    raw_score = row[evaluator_name]
-    reasoning = row.get(f"{evaluator_name}_reasoning")
+    raw_score = row[column_name]
+    reasoning = row.get(f"{column_name}_reasoning")
     if raw_score in (None, ""):
         return None
     out: Dict[str, Any] = {"value": _coerce_score(raw_score, output_type)}
@@ -509,28 +487,56 @@ def _parse_results_stt(
     job_uuid: str,
 ) -> List[Dict[str, Any]]:
     """STT outputs: <output_dir>/results.csv with columns id, gt, pred, wer,
-    <evaluator_name>, <evaluator_name>_reasoning per evaluator.
-    Maps row.id → annotation_item.uuid (we set id = item.uuid on the way out)."""
+    <column_name>, <column_name>_reasoning per evaluator.
+    Maps row.id → annotation_item.uuid (we set id = item.uuid on the way out).
+
+    Iteration is driven by the `evaluators_map` calibrate writes into
+    `config.json` (`{column_name -> evaluator_uuid}`). That map is the only
+    string we *know* identifies an evaluator output column rather than a
+    built-in CSV column — without it, an evaluator named `wer` (or any other
+    reserved column name) would silently lift the built-in WER value into
+    `evaluator_runs.value` and persist it to the DB. Falls back to the
+    snapshot's display name only when the map is missing (legacy pre-map
+    runs); that fallback is collision-prone but preserved for back-compat.
+    """
     rows = _read_results_csv(output_dir) or []
     name_to_uuid_via_config = _read_config_evaluators_map(output_dir)
+    snapshot_by_uuid = {ev["uuid"]: ev for ev in evaluators_resolved}
+
+    if name_to_uuid_via_config:
+        # Authoritative: iterate calibrate's own column→uuid record.
+        lift_pairs: List[Tuple[str, Optional[Dict[str, Any]]]] = [
+            (col, snapshot_by_uuid.get(uid))
+            for col, uid in name_to_uuid_via_config.items()
+        ]
+    else:
+        # Back-compat fallback: legacy data without an evaluators_map.
+        # Vulnerable to reserved-column / duplicate-name collisions.
+        logger.warning(
+            f"[annotation-eval] no evaluators_map in {output_dir}/config.json; "
+            "falling back to display-name lookup (collision-prone)"
+        )
+        lift_pairs = [(ev["name"], ev) for ev in evaluators_resolved]
+
     runs: List[Dict[str, Any]] = []
-    for ev in evaluators_resolved:
-        name = ev["name"]
-        # Trust the config.json's evaluators_map first; fall back to the local
-        # resolved record's uuid if the map isn't present (defensive).
-        evaluator_id = name_to_uuid_via_config.get(name, ev["uuid"])
-        if evaluator_id != ev["uuid"]:
+    for column_name, ev in lift_pairs:
+        if not ev:
+            # Map referenced an evaluator UUID we don't have a snapshot for
+            # — odd, but skip rather than crash; nothing reproducible we can
+            # do here without the snapshot's output_type / version_id.
             logger.warning(
-                f"[annotation-eval] evaluators_map round-trip mismatch for "
-                f"{name!r}: sent {ev['uuid']}, got {evaluator_id}"
+                f"[annotation-eval] evaluators_map column {column_name!r} "
+                "has no matching snapshot; skipping"
             )
+            continue
+        evaluator_id = ev["uuid"]
         version_uuid = ev["_evaluator_version_id"]
         output_type = ev["output_type"]
         for row in rows:
             item_id = row.get("id")
             if not item_id:
                 continue
-            value = _row_evaluator_value(row, name, output_type)
+            value = _row_evaluator_value(row, column_name, output_type)
             runs.append(
                 {
                     "job_id": job_uuid,

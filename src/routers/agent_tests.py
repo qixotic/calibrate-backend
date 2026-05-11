@@ -19,6 +19,7 @@ from db import (
     add_test_to_agent,
     remove_test_from_agent,
     bulk_remove_tests_from_agent,
+    bulk_delete_tests,
     get_tests_for_agent,
     get_agents_for_test,
     get_agent_test_link,
@@ -547,6 +548,79 @@ async def bulk_delete_agent_test_links(payload: AgentTestBulkDelete):
     return {
         "deleted_count": deleted_count,
         "message": f"Successfully unlinked {deleted_count} test(s) from agent",
+    }
+
+
+class AgentTestsBulkDeleteAll(BaseModel):
+    agent_uuid: str
+    # Required: the explicit set of test UUIDs to delete. Matches the
+    # `/bulk-unlink` sibling's contract — the FE always names the targets
+    # explicitly, so there's no implicit "delete every test on this agent"
+    # mode. Removes a class of footgun (a buggy FE blanking out an agent)
+    # and lets the response report exactly which UUIDs were processed
+    # without slicing tricks.
+    test_uuids: List[str]
+
+
+@router.post("/bulk-delete-tests")
+async def bulk_delete_agent_tests(
+    payload: AgentTestsBulkDeleteAll,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Hard-cousin of `/bulk-unlink`: instead of just unlinking, soft-delete
+    the named tests (and the link rows along with them). Only tests OWNED
+    by the calling user are deleted — UUIDs the caller doesn't own (or
+    that aren't linked to this agent) are silently skipped, so this can't
+    nuke a shared test that another user still needs and can't be used as
+    a reconnaissance probe for another user's test UUIDs.
+
+    `agent_uuid` is a sanity scope: every requested UUID must be linked
+    to this agent. Cross-agent deletes have to be sent as separate calls.
+    """
+    if not payload.test_uuids:
+        raise HTTPException(status_code=400, detail="test_uuids must not be empty")
+
+    agent = get_agent(payload.agent_uuid)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.get("user_id") != user_id:
+        # 404 (not 403) to avoid leaking existence — matches conventions in
+        # CLAUDE.md / architecture.md.
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    # Intersect (caller-requested) ∩ (linked to this agent) ∩ (owned by caller).
+    # Any UUID failing any of those is silently dropped — no error — so the
+    # endpoint behaves the same whether the caller named a junk UUID, a
+    # foreign-owned UUID, or a UUID linked to a different agent.
+    requested = set(payload.test_uuids)
+    linked_owned_uuids = [
+        t["uuid"]
+        for t in get_tests_for_agent(payload.agent_uuid)
+        if t.get("user_id") == user_id and t["uuid"] in requested
+    ]
+
+    if not linked_owned_uuids:
+        return {
+            "deleted_count": 0,
+            "deleted_test_uuids": [],
+            "message": "No tests eligible for deletion",
+        }
+
+    # bulk_delete_tests cascades to soft-delete every agent_tests link row
+    # for these test_ids — across every agent, not just this one. Intentional:
+    # the test itself is gone, so no link should survive.
+    deleted_count = bulk_delete_tests(
+        test_uuids=linked_owned_uuids, user_id=user_id
+    )
+    return {
+        "deleted_count": deleted_count,
+        # Eligible set, not a blind first-N slice. With test_uuids required,
+        # the caller knows exactly what they asked for and we report the
+        # exact subset that passed the (linked + owned) gate.
+        "deleted_test_uuids": linked_owned_uuids,
+        "message": (
+            f"Successfully deleted {deleted_count} test(s) associated with agent"
+        ),
     }
 
 

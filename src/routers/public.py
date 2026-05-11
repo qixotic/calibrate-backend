@@ -12,6 +12,10 @@ URL scheme:
   GET /public/test-run/{share_token}
   GET /public/benchmark/{share_token}
   GET /public/simulation-run/{share_token}
+  GET /public/annotation-eval/{share_token}
+  GET /public/annotation-jobs/{public_token}             (annotator: read+write)
+  POST /public/annotation-jobs/{public_token}/annotations (annotator: upsert)
+  GET /public/annotation-jobs/view/{view_token}          (viewer: read-only)
 """
 
 import logging
@@ -29,6 +33,7 @@ from db import (
     get_simulation_job_by_share_token,
     get_simulation_jobs_for_simulation,
     get_annotation_job_by_token,
+    get_annotation_job_by_view_token,
     get_annotation_task,
     get_evaluator_ids_for_job,
     get_evaluators_for_job,
@@ -37,6 +42,8 @@ from db import (
     get_annotations_for_job,
     upsert_annotation,
     update_annotation_job_status,
+    get_evaluator_runs_for_job,
+    get_eval_job_items,
 )
 from utils import (
     TaskStatus,
@@ -44,7 +51,9 @@ from utils import (
     enrich_evaluator_runs_with_current_names,
     generate_presigned_download_url,
     get_s3_output_config,
+    load_evaluator_metric_key_map,
     normalize_metrics,
+    post_process_provider_results,
     presign_audio_path,
 )
 
@@ -58,6 +67,12 @@ from routers.agent_tests import (
     _enrich_test_results_with_evaluators,
     _enrich_model_results_with_evaluators,
 )
+from routers.annotation_tasks import (
+    _enrich_runs_with_live_evaluator,
+    _human_agreement_for_run,
+    _shape_eval_job_for_response,
+)
+from annotation_eval_runner import ANNOTATION_EVAL_JOB_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +134,36 @@ class PublicSimulationRunResponse(BaseModel):
     metrics: Optional[Dict[str, Any]] = None
     simulation_results: Optional[List[Dict[str, Any]]] = None
     evaluators: Optional[List[SimulationEvaluatorRef]] = None
+    error: Optional[str] = None
+
+
+class PublicAnnotationEvalTaskRef(BaseModel):
+    uuid: str
+    name: str
+    type: str
+    description: Optional[str] = None
+
+
+class PublicAnnotationEvalResponse(BaseModel):
+    task_id: str
+    job_uuid: str
+    status: str
+    created_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    task: PublicAnnotationEvalTaskRef
+    # `details` mirrors the authenticated GET shape so a shared FE component
+    # can read `job.details?.evaluators` against either endpoint without
+    # branching. Only the safe-to-share keys are forwarded — operational
+    # fields (pid, pgid, s3_prefix, user_id) are intentionally stripped.
+    details: Optional[Dict[str, Any]] = None
+    # Top-level mirrors retained for the existing public consumers that
+    # were already reading them. Both shapes carry the same data.
+    evaluators: Optional[List[Dict[str, Any]]] = None
+    item_count: Optional[int] = None
+    items: Optional[List[Dict[str, Any]]] = None
+    runs: Optional[List[Dict[str, Any]]] = None
+    human_agreement: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
 
@@ -221,7 +266,10 @@ def _get_simulation_run_name(job: Dict[str, Any]) -> str:
 
 
 def _ensure_valid_public_share_token(share_token: str) -> None:
-    """Allow metadata reads only for callers that already have a valid public share token."""
+    """Allow metadata reads only for callers that already have a valid public share token.
+
+    `get_job_by_share_token` covers stt-eval, tts-eval, and annotation-eval —
+    they all live in the generic `jobs` table."""
     if (
         get_job_by_share_token(share_token)
         or get_agent_test_job_by_share_token(share_token)
@@ -327,6 +375,21 @@ async def get_public_stt(share_token: str):
         provider_results, details.get("evaluators") or []
     )
 
+    # Same canonical post-processing as the authenticated endpoints — public
+    # callers see the same shape (evaluator_outputs[uuid], typed values,
+    # evaluator_runs[].aggregate) instead of the legacy flat-keyed fallback.
+    # `evaluator_id_by_metric_key` (read from on-disk config.json) is what
+    # makes the per-row lift safe against reserved-column collisions —
+    # without it the helper falls back to snapshot display names and an
+    # evaluator named e.g. `wer` would lift the built-in WER value into
+    # `evaluator_outputs[uuid].value`. Authenticated handlers already pass
+    # this; the public mirrors must too or they'll disagree on the same run.
+    post_process_provider_results(
+        provider_results,
+        evaluator_snapshots=details.get("evaluators") or [],
+        evaluator_id_by_metric_key=load_evaluator_metric_key_map(details),
+    )
+
     # Enrich result rows with presigned audio URLs from the dataset
     audio_paths = details.get("audio_paths", [])
     if audio_paths:
@@ -384,6 +447,21 @@ async def get_public_tts(share_token: str):
 
     enrich_evaluator_runs_with_current_names(
         provider_results, details.get("evaluators") or []
+    )
+
+    # Same canonical post-processing as the authenticated endpoints — public
+    # callers see the same shape (evaluator_outputs[uuid], typed values,
+    # evaluator_runs[].aggregate) instead of the legacy flat-keyed fallback.
+    # `evaluator_id_by_metric_key` (read from on-disk config.json) is what
+    # makes the per-row lift safe against reserved-column collisions —
+    # without it the helper falls back to snapshot display names and an
+    # evaluator named e.g. `wer` would lift the built-in WER value into
+    # `evaluator_outputs[uuid].value`. Authenticated handlers already pass
+    # this; the public mirrors must too or they'll disagree on the same run.
+    post_process_provider_results(
+        provider_results,
+        evaluator_snapshots=details.get("evaluators") or [],
+        evaluator_id_by_metric_key=load_evaluator_metric_key_map(details),
     )
 
     # Regenerate presigned audio URLs for completed/failed jobs
@@ -507,6 +585,86 @@ async def get_public_simulation_run(share_token: str):
 
 
 # ---------------------------------------------------------------------------
+# Annotation evaluator-run jobs (public, share_token toggled by owner)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/annotation-eval/{share_token}", response_model=PublicAnnotationEvalResponse
+)
+async def get_public_annotation_eval(share_token: str):
+    """Return a publicly shared annotation evaluator-run job result.
+
+    No authentication required. Returns 404 if the token is unknown or the
+    run has been made private again. Mirrors the authenticated
+    `GET /annotation-tasks/{task_uuid}/evaluator-runs/{job_uuid}` shape so the
+    frontend can render the same view.
+    """
+    job = get_job_by_share_token(share_token, job_type=ANNOTATION_EVAL_JOB_TYPE)
+    if not job:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Defense-in-depth: never expose an in-flight or failed annotation-eval
+    # run via the public link, even if some other code path managed to flip
+    # `is_public` before the job reached `done`. The owner PATCH route at
+    # `/annotation-tasks/{task_uuid}/evaluator-runs/{job_uuid}/visibility`
+    # already enforces this gate, but other generic-jobs visibility routes
+    # (stt/tts) wouldn't catch a wrong-type UUID — so we re-assert here.
+    if job.get("status") != "done":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    shaped = _shape_eval_job_for_response(job)
+    task_uuid = shaped.get("task_id")
+    task = get_annotation_task(task_uuid) if task_uuid else None
+    if not task:
+        # The parent task was deleted out from under the share link.
+        raise HTTPException(status_code=404, detail="Not found")
+
+    raw_runs = get_evaluator_runs_for_job(job["uuid"])
+    details = job.get("details") or {}
+
+    # Forward only the safe-to-share keys from the raw `details` blob. Strip
+    # operational/identifying ones — `pid`, `pgid`, `s3_prefix`, `user_id`,
+    # `output_dir`, etc. — that the auth view exposes but a public viewer
+    # has no business seeing. Whitelist (not blacklist) so any future
+    # addition to the runner's details dict stays private until explicitly
+    # opted in here.
+    public_details_whitelist = {
+        "task_id",
+        "evaluators",
+        "item_count",
+        "item_ids",
+        "metrics",
+        "completed_at",
+    }
+    public_details = {
+        k: v for k, v in details.items() if k in public_details_whitelist
+    }
+
+    return PublicAnnotationEvalResponse(
+        task_id=task_uuid,
+        job_uuid=job["uuid"],
+        status=shaped["status"],
+        created_at=job.get("created_at"),
+        completed_at=shaped.get("completed_at"),
+        updated_at=job.get("updated_at"),
+        task=PublicAnnotationEvalTaskRef(
+            uuid=task["uuid"],
+            name=task["name"],
+            type=task["type"],
+            description=task.get("description"),
+        ),
+        details=public_details,
+        evaluators=details.get("evaluators"),
+        item_count=details.get("item_count"),
+        items=get_eval_job_items(job["uuid"]),
+        runs=_enrich_runs_with_live_evaluator(raw_runs),
+        human_agreement=_human_agreement_for_run(task_uuid, raw_runs),
+        error=shaped.get("error"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Annotation jobs (public, token-only)
 # ---------------------------------------------------------------------------
 
@@ -520,18 +678,14 @@ def _resolve_public_annotation_job(token: str) -> Dict[str, Any]:
     return job
 
 
-@router.get("/annotation-jobs/{token}")
-def get_public_annotation_job(token: str):
-    """Everything an annotator needs to render their job page:
-
-    - Job + status
-    - Annotator's name (so the page can greet them)
-    - Task type + linked evaluators (drives form rendering: binary toggle vs
-      rating scale, plus per-evaluator name/description/output_config)
-    - Items (with their parsed `payload`)
-    - Existing annotations on this job (so the page can resume in-progress work)
-    """
-    job = _resolve_public_annotation_job(token)
+def _build_annotation_job_payload(
+    job: Dict[str, Any], read_only: bool
+) -> Dict[str, Any]:
+    """Shared response shape for both the annotator route (read+write) and
+    the viewer route (read-only). When `read_only=True`, the response carries
+    a `read_only` flag so the FE can disable form inputs. The annotator
+    identity is included in both modes — the viewer is meant to see *whose*
+    labels they're looking at."""
     task = get_annotation_task(job["task_id"])
     if not task:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -542,14 +696,7 @@ def get_public_annotation_job(token: str):
     evaluators = get_evaluators_for_job(job["uuid"])
     # Enrich each evaluator with the live version's rubric, variable specs,
     # and derived scale bounds so the FE has everything it needs to render
-    # the labelling form without a second roundtrip:
-    #   - `output_config` → scale entries (name/description/color/value)
-    #   - `scale_min` / `scale_max` → numeric bounds for rating widgets;
-    #     null for binary
-    #   - `variables` → list of `{name, default?, description?}` placeholder
-    #     specs declared by the prompt. Per-item variable values live on
-    #     `items[].payload.evaluator_variables[<evaluator_uuid>]`; the FE
-    #     pairs them with these specs to display the substituted prompt.
+    # the labelling form without a second roundtrip.
     from llm_judge import _scale_bounds  # local to avoid module-load cycle
 
     for ev in evaluators:
@@ -587,7 +734,40 @@ def get_public_annotation_job(token: str):
         "evaluators": evaluators,
         "items": items,
         "annotations": annotations,
+        "read_only": read_only,
     }
+
+
+@router.get("/annotation-jobs/view/{view_token}")
+def get_public_annotation_job_view(view_token: str):
+    """Read-only public view of one annotator's completed labelling job,
+    served behind a separate `view_token` toggled on by the owner via
+    `PATCH /annotation-tasks/{task_uuid}/jobs/{job_uuid}/visibility`.
+
+    Returns the same shape as the annotator route (`/public/annotation-jobs/
+    {public_token}`) but with `read_only: true`. There is intentionally NO
+    `POST /annotation-jobs/view/{view_token}/annotations` companion — a leaked
+    view_token cannot be coerced into writing labels because the upsert path
+    only accepts the annotator's `public_token`."""
+    job = get_annotation_job_by_view_token(view_token)
+    if not job:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _build_annotation_job_payload(job, read_only=True)
+
+
+@router.get("/annotation-jobs/{token}")
+def get_public_annotation_job(token: str):
+    """Everything an annotator needs to render their job page:
+
+    - Job + status
+    - Annotator's name (so the page can greet them)
+    - Task type + linked evaluators (drives form rendering: binary toggle vs
+      rating scale, plus per-evaluator name/description/output_config)
+    - Items (with their parsed `payload`)
+    - Existing annotations on this job (so the page can resume in-progress work)
+    """
+    job = _resolve_public_annotation_job(token)
+    return _build_annotation_job_payload(job, read_only=False)
 
 
 class PublicAnnotationEntry(BaseModel):

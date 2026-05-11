@@ -31,7 +31,10 @@ from utils import (
     TaskCreateResponse,
     TaskStatusResponse,
     build_evaluator_runs_for_eval_job,
+    compute_share_token_toggle,
     enrich_evaluator_runs_with_current_names,
+    load_evaluator_metric_key_map,
+    post_process_provider_results,
     get_s3_client,
     get_s3_output_config,
     can_start_job,
@@ -93,11 +96,18 @@ def _collect_tts_intermediate_results(
     providers: list,
     task_id: str,
     s3_bucket: str,
+    expected_total: int,
 ) -> list:
     """Read whatever intermediate results are available from disk for each provider.
 
     Uploads audio files to S3 and replaces local paths with S3 keys.
     Returns a list of ProviderResult objects preserving any partial results.
+    A provider is only marked ``success=True`` when it has BOTH a complete
+    row count (``>= expected_total``) AND an aggregate ``metrics.json`` on
+    disk — same contract as the in-progress GET reader. A non-empty but
+    incomplete `results.csv` (e.g. calibrate crashed mid-run) is preserved
+    as ``success=False`` so the FE doesn't show a half-finished provider as
+    successful.
     """
     evaluator_id_by_metric_key = read_evaluators_map_from_config(output_dir)
     s3 = get_s3_client()
@@ -138,10 +148,14 @@ def _collect_tts_intermediate_results(
                 if metrics_data is not None
                 else []
             )
+            provider_done = (
+                metrics_data is not None
+                and len(results_data) >= expected_total
+            )
             provider_results.append(
                 ProviderResult(
                     provider=provider,
-                    success=True,
+                    success=True if provider_done else False,
                     metrics=metrics_data,
                     results=results_data,
                     evaluator_runs=runs or None,
@@ -587,6 +601,7 @@ def run_tts_evaluation_task(
                             request.providers,
                             task_id,
                             s3_bucket,
+                            len(request.texts),
                         )
                         if intermediate:
                             error_results["provider_results"] = [
@@ -620,6 +635,7 @@ def run_tts_evaluation_task(
                             request.providers,
                             task_id,
                             s3_bucket,
+                            len(request.texts),
                         )
                         if intermediate:
                             error_results["provider_results"] = [
@@ -756,18 +772,16 @@ async def update_tts_visibility(
 ):
     """Toggle public sharing for a TTS evaluation job."""
     job = get_job(task_id, user_id=user_id)
-    if not job:
+    if not job or job.get("type") != "tts-eval":
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if body.is_public:
-        import uuid as _uuid
-
-        share_token = job.get("share_token") or str(_uuid.uuid4())
-    else:
-        share_token = None
-
-    update_job_visibility(task_id, body.is_public, share_token)
-    return VisibilityResponse(is_public=body.is_public, share_token=share_token)
+    token_to_persist, token_to_return = compute_share_token_toggle(
+        job, body.is_public
+    )
+    update_job_visibility(task_id, body.is_public, token_to_persist)
+    return VisibilityResponse(
+        is_public=body.is_public, share_token=token_to_return
+    )
 
 
 @router.get("/evaluate/{task_id}", response_model=TaskStatusResponse)
@@ -820,6 +834,7 @@ async def get_tts_evaluation_status(
                             requested_providers,
                             task_id,
                             s3_bucket,
+                            len(details.get("texts") or []),
                         )
                         # Merge: keep existing successful results, add new ones from disk
                         merged_results = []
@@ -869,9 +884,12 @@ async def get_tts_evaluation_status(
 
     # Build provider results
     provider_results = results.get("provider_results")
+    # `evaluator_id_by_metric_key` lets the post-processor build
+    # `evaluator_runs[]` mid-flight from a freshly-landed metrics.json.
+    evaluator_id_by_metric_key = load_evaluator_metric_key_map(details)
+    output_dir_str = details.get("output_dir")
     if provider_results is None and status == TaskStatus.IN_PROGRESS.value:
         # Job is in progress - try to read intermediate results from disk
-        output_dir_str = details.get("output_dir")
         expected_total = len(details.get("texts", []))
         if output_dir_str:
             output_dir = Path(output_dir_str)
@@ -954,6 +972,15 @@ async def get_tts_evaluation_status(
 
     enrich_evaluator_runs_with_current_names(
         provider_results, details.get("evaluators") or []
+    )
+
+    # Canonical post-processing: lift per-row outputs into evaluator_outputs[uuid],
+    # type-coerce values, build evaluator_runs from in-progress metrics, surface
+    # per-row judge errors. Idempotent — safe across in-progress / done / failed.
+    post_process_provider_results(
+        provider_results,
+        evaluator_snapshots=details.get("evaluators") or [],
+        evaluator_id_by_metric_key=evaluator_id_by_metric_key,
     )
 
     # Generate presigned URLs on the fly for completed or failed jobs

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from db import (
     create_simulation,
+    ensure_name_unique,
     get_simulation,
     get_all_simulations,
     update_simulation,
@@ -603,9 +604,10 @@ async def create_simulation_endpoint(
             resolved_evaluator_refs.append(_resolve_simulation_evaluator_ref(ref, user_id))
 
     # Create the simulation
-    simulation_uuid = create_simulation(
-        name=simulation.name, agent_id=simulation.agent_uuid, user_id=user_id
-    )
+    with ensure_name_unique("simulations", simulation.name, user_id, entity="Simulation"):
+        simulation_uuid = create_simulation(
+            name=simulation.name, agent_id=simulation.agent_uuid, user_id=user_id
+        )
 
     # Add personas to simulation
     if simulation.persona_uuids:
@@ -961,19 +963,26 @@ async def update_simulation_endpoint(
 
     # Update simulation name and/or agent if provided
     if simulation.name is not None or simulation.agent_uuid is not None:
-        # Empty string means clear the agent
-        if simulation.agent_uuid == "":
-            update_simulation(
-                simulation_uuid=simulation_uuid,
-                name=simulation.name,
-                clear_agent=True,
-            )
-        else:
-            update_simulation(
-                simulation_uuid=simulation_uuid,
-                name=simulation.name,
-                agent_id=simulation.agent_uuid,
-            )
+        with ensure_name_unique(
+            "simulations",
+            simulation.name,
+            user_id,
+            entity="Simulation",
+            exclude_uuid=simulation_uuid,
+        ):
+            # Empty string means clear the agent
+            if simulation.agent_uuid == "":
+                update_simulation(
+                    simulation_uuid=simulation_uuid,
+                    name=simulation.name,
+                    clear_agent=True,
+                )
+            else:
+                update_simulation(
+                    simulation_uuid=simulation_uuid,
+                    name=simulation.name,
+                    agent_id=simulation.agent_uuid,
+                )
 
     # Update personas if provided (replace existing)
     if simulation.persona_uuids is not None:

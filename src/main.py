@@ -27,13 +27,14 @@ if sentry_dsn:
 
 import secrets
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-from db import init_db
+from db import init_db, NameAlreadyExistsError
 from routers.auth import router as auth_router
 from routers.users import router as users_router
 from routers.agents import router as agents_router
@@ -101,6 +102,21 @@ def _verify_docs_access(
 
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+
+
+@app.exception_handler(NameAlreadyExistsError)
+async def _name_already_exists_handler(_: Request, exc: NameAlreadyExistsError):
+    """Convert DB-layer unique-name violations to a friendly 409.
+
+    Routers wrap their write call with `db.name_uniqueness_guard("Test")`
+    so the rare TOCTOU race past the API-layer `is_name_taken` pre-check
+    still returns the same 409 shape the FE expects, instead of an
+    uncaught IntegrityError surfacing as 500.
+    """
+    return JSONResponse(
+        status_code=409,
+        content={"detail": f"{exc.entity_label} name already exists"},
+    )
 
 
 @app.get("/docs", include_in_schema=False)

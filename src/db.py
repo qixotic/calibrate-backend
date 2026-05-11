@@ -33,6 +33,166 @@ def get_db_connection():
         conn.close()
 
 
+# Whitelist of tables guarded by the per-user unique-name partial indexes
+# (see init_db). Maps table name → ownership column name. Used by the
+# `is_name_taken` helper so routers can produce a friendly 409 BEFORE
+# hitting the IntegrityError that the DB constraint would raise. The two
+# layers are belt-and-braces: API check for the message, DB index for
+# correctness under races / direct writes / forgotten future endpoints.
+_UNIQUE_NAME_TABLES: Dict[str, str] = {
+    "tests": "user_id",
+    "agents": "user_id",
+    "tools": "user_id",
+    "personas": "user_id",
+    "scenarios": "user_id",
+    "simulations": "user_id",
+    "annotation_tasks": "user_id",
+    "annotators": "user_id",
+    "evaluators": "owner_user_id",
+}
+
+
+class NameAlreadyExistsError(Exception):
+    """Raised when an INSERT/UPDATE collides with one of the per-user
+    unique-name partial indexes set up in `init_db`. Carries the entity
+    label so the FastAPI exception handler in `main.py` can render
+    ``{entity_label} name already exists`` as the 409 detail.
+
+    Why a typed exception (not just HTTPException raised here): db.py is
+    an HTTP-unaware layer. Routers wrap their write call with
+    `name_uniqueness_guard("Test")` and let the global handler do the
+    HTTP shaping. Keeps db.py free of FastAPI imports and makes the
+    behaviour testable without spinning up an app.
+    """
+
+    def __init__(self, entity_label: str):
+        super().__init__(f"{entity_label} name already exists")
+        self.entity_label = entity_label
+
+
+@contextmanager
+def ensure_name_unique(
+    table: str,
+    name: Optional[str],
+    user_id: Optional[str],
+    *,
+    entity: str,
+    exclude_uuid: Optional[str] = None,
+):
+    """API pre-check + DB race guard in one helper.
+
+    Wrap each create/update DB call with this. Two layers of protection,
+    one wrapper:
+
+    * Pre-check via `is_name_taken` raises `NameAlreadyExistsError`
+      (-> 409 via the global FastAPI handler) BEFORE the write — the
+      common case, friendliest UX, no wasted DB write.
+    * The DB write inside the `with` block runs under
+      `name_uniqueness_guard`, so a TOCTOU race (two creates of the
+      same name slipping past the pre-check at the same instant) hits
+      the partial unique index and surfaces as the same 409 instead
+      of a generic 500.
+
+    Pass `name=None` (e.g. an update endpoint where the caller didn't
+    touch the name field) to skip the pre-check; the guard still runs
+    in case some other code path mutates `name` before the write.
+
+    `entity` is the human-facing label rendered in the 409 detail
+    (`"<entity> name already exists"`). Use the singular display name —
+    `"Test"`, `"Agent"`, `"Annotation task"`, etc.
+
+    Replaces the older two-step pattern of an inline `is_name_taken`
+    check followed by a separate `name_uniqueness_guard` block, which
+    was duplicated across ~16 endpoints with subtle wording drift.
+    """
+    if name is not None and is_name_taken(
+        table, name, user_id, exclude_uuid=exclude_uuid
+    ):
+        raise NameAlreadyExistsError(entity)
+    with name_uniqueness_guard(entity):
+        yield
+
+
+@contextmanager
+def name_uniqueness_guard(entity_label: str):
+    """Catch a `sqlite3.IntegrityError` raised by a UNIQUE-constraint
+    violation inside the body and re-raise as `NameAlreadyExistsError`.
+    Other IntegrityErrors propagate unchanged so genuine schema bugs
+    still surface as 500s.
+
+    Usage in a router::
+
+        with name_uniqueness_guard("Test"):
+            test_uuid = create_test(...)
+
+    Closes the TOCTOU window between `is_name_taken` and the actual
+    INSERT: the API pre-check produces the friendly message in the
+    common case; this guard catches the rare race where two creates
+    of the same name slip past the pre-check and the second hits the
+    DB-level partial unique index.
+    """
+    try:
+        yield
+    except sqlite3.IntegrityError as e:
+        # SQLite's UNIQUE constraint violation message contains "UNIQUE"
+        # — be generous in matching since the exact wording can vary
+        # across SQLite versions ("UNIQUE constraint failed:" /
+        # "columns ... are not unique").
+        if "UNIQUE" in str(e).upper():
+            raise NameAlreadyExistsError(entity_label) from e
+        raise
+
+
+def is_name_taken(
+    table: str,
+    name: str,
+    user_id: Optional[str],
+    exclude_uuid: Optional[str] = None,
+) -> bool:
+    """True if a non-soft-deleted row in `table` already has this `name`
+    for this user. Pass `exclude_uuid` on update paths so the row being
+    edited doesn't conflict with itself.
+
+    For `evaluators`, `user_id=None` checks the seeded-default namespace
+    (matches the `COALESCE(owner_user_id, '__seed__')` shape used by the
+    DB index).
+
+    Whitelisted to the tables that have the matching DB-level partial
+    unique index; raises ValueError if called on anything else, so we
+    fail loudly in dev rather than silently checking the wrong column.
+    """
+    if table not in _UNIQUE_NAME_TABLES:
+        raise ValueError(
+            f"is_name_taken: '{table}' is not in the unique-name whitelist"
+        )
+    user_col = _UNIQUE_NAME_TABLES[table]
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if user_id is None:
+            # Seeded-default lane on evaluators (or anywhere else that
+            # admits NULL ownership). Plain `IS NULL` matches the index's
+            # `COALESCE(..., '__seed__')` because both collapse the entire
+            # NULL set into one bucket for uniqueness purposes.
+            sql = (
+                f"SELECT 1 FROM {table} "
+                f"WHERE {user_col} IS NULL AND name = ? "
+                f"AND deleted_at IS NULL"
+            )
+            params: tuple = (name,)
+        else:
+            sql = (
+                f"SELECT 1 FROM {table} "
+                f"WHERE {user_col} = ? AND name = ? "
+                f"AND deleted_at IS NULL"
+            )
+            params = (user_id, name)
+        if exclude_uuid:
+            sql += " AND uuid != ?"
+            params = (*params, exclude_uuid)
+        cursor.execute(sql + " LIMIT 1", params)
+        return cursor.fetchone() is not None
+
+
 def init_db():
     """Initialize the database and create tables if they don't exist."""
     # Ensure the data directory exists
@@ -782,6 +942,79 @@ def init_db():
                     f"ALTER TABLE {table} ADD COLUMN share_token TEXT DEFAULT NULL"
                 )
             except sqlite3.OperationalError:
+                pass
+
+        # Read-only public sharing for individual annotation_jobs (labelling
+        # job results). The existing `public_token` is the annotator's
+        # read+write credential and is generated at job creation; `view_token`
+        # is a separate, opt-in read-only credential the owner toggles on
+        # after the job is completed. Two distinct tokens + two distinct
+        # public URLs (`/public/annotation-jobs/{public_token}` vs
+        # `/public/annotation-jobs/view/{view_token}`) keep the security
+        # boundary at the routing layer instead of relying on per-handler
+        # checks.
+        try:
+            cursor.execute(
+                "ALTER TABLE annotation_jobs ADD COLUMN is_public INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute(
+                "ALTER TABLE annotation_jobs ADD COLUMN view_token TEXT DEFAULT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_annotation_jobs_view_token "
+                "ON annotation_jobs(view_token) WHERE view_token IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        # Per-user unique-name partial indexes. The existing `annotators`
+        # index (`idx_annotators_user_name_active`) sets the pattern: one
+        # user can't have two live (non-soft-deleted) rows with the same
+        # name. Soft-deleted rows are exempt — required so a user can
+        # re-create something they previously deleted.
+        #
+        # Belt-and-braces with the API-layer 409 checks: catches TOCTOU
+        # races between two concurrent creates, direct DB inserts (seed
+        # scripts, manual repairs), and any future endpoint that forgets
+        # the check. The DB constraint is the source of truth.
+        for stmt in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tests_user_name_active "
+            "ON tests(user_id, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_user_name_active "
+            "ON agents(user_id, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tools_user_name_active "
+            "ON tools(user_id, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_personas_user_name_active "
+            "ON personas(user_id, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_scenarios_user_name_active "
+            "ON scenarios(user_id, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_simulations_user_name_active "
+            "ON simulations(user_id, name) WHERE deleted_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_annotation_tasks_user_name_active "
+            "ON annotation_tasks(user_id, name) WHERE deleted_at IS NULL",
+            # Evaluators have a dual ownership model: per-user (owner_user_id
+            # set) and seeded defaults (owner_user_id IS NULL, visible to
+            # everyone). SQLite treats multiple NULLs as distinct in unique
+            # indexes, so a plain (owner_user_id, name) index would let two
+            # seeded defaults share a name. COALESCE collapses NULL into a
+            # single virtual namespace so seeded defaults compete among
+            # themselves.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluators_owner_name_active "
+            "ON evaluators(COALESCE(owner_user_id, '__seed__'), name) "
+            "WHERE deleted_at IS NULL",
+        ):
+            try:
+                cursor.execute(stmt)
+            except sqlite3.OperationalError:
+                # Either the index already exists (re-run init) or existing
+                # data violates uniqueness. Latter case shouldn't occur per
+                # owner's confirmation; keep the guard for re-init safety.
                 pass
 
         conn.commit()
@@ -2560,25 +2793,54 @@ def bulk_delete_tests(test_uuids: List[str], user_id: str) -> int:
     """Soft delete multiple tests owned by user_id.
     Also soft deletes related agent_tests entries.
     Returns the number of tests actually deleted.
+
+    Security note: the agent_tests cleanup is scoped to UUIDs the caller
+    actually owns — NOT the raw input list. Without this, a caller could
+    pass another user's test UUID alongside one of their own and have
+    every link to that other user's test soft-deleted across all agents
+    (the test row stays alive thanks to the ownership filter, but the
+    links are gone). The fix is to resolve the owned UUIDs first and
+    constrain both updates to that set.
     """
     if not test_uuids:
         return 0
 
-    placeholders = ",".join("?" for _ in test_uuids)
     with get_db_connection() as conn:
         cursor = conn.cursor()
+
+        # Step 1: resolve which of the requested UUIDs the caller actually
+        # owns and which are still alive. Both UPDATEs below are constrained
+        # to this set so unowned UUIDs can never trigger any side effect.
+        in_placeholders = ",".join("?" for _ in test_uuids)
+        cursor.execute(
+            f"SELECT uuid FROM tests "
+            f"WHERE uuid IN ({in_placeholders}) "
+            f"AND user_id = ? AND deleted_at IS NULL",
+            (*test_uuids, user_id),
+        )
+        owned_uuids = [row["uuid"] for row in cursor.fetchall()]
+        if not owned_uuids:
+            return 0
+
+        owned_placeholders = ",".join("?" for _ in owned_uuids)
+
+        # Step 2: soft-delete only the owned tests.
         cursor.execute(
             f"UPDATE tests SET deleted_at = CURRENT_TIMESTAMP "
-            f"WHERE uuid IN ({placeholders}) AND user_id = ? AND deleted_at IS NULL",
-            (*test_uuids, user_id),
+            f"WHERE uuid IN ({owned_placeholders}) AND deleted_at IS NULL",
+            owned_uuids,
         )
         deleted_count = cursor.rowcount
 
+        # Step 3: cascade to agent_tests using the SAME owned-UUID set.
+        # Skipped if step 2 deleted nothing (race: another writer already
+        # got there) — preserves prior behaviour of "no orphan link cleanup
+        # on a no-op delete".
         if deleted_count > 0:
             cursor.execute(
                 f"UPDATE agent_tests SET deleted_at = CURRENT_TIMESTAMP "
-                f"WHERE test_id IN ({placeholders}) AND deleted_at IS NULL",
-                test_uuids,
+                f"WHERE test_id IN ({owned_placeholders}) AND deleted_at IS NULL",
+                owned_uuids,
             )
             logger.info(f"Bulk soft deleted {deleted_count} tests for user {user_id}")
 
@@ -4321,19 +4583,26 @@ def get_job_by_share_token(
 ) -> Optional[Dict[str, Any]]:
     """Get a job by its share_token, optionally restricted to a specific job type.
 
-    Always filters to is_public = 1. Pass job_type (e.g. 'stt-eval', 'tts-eval')
-    to prevent tokens from one resource kind being accepted by a different endpoint.
+    Always filters to is_public = 1 AND deleted_at IS NULL. Pass job_type
+    (e.g. 'stt-eval', 'tts-eval', 'annotation-eval') to prevent tokens from
+    one resource kind being accepted by a different endpoint. The
+    soft-delete filter is required because deleting a job (`soft_delete_job`)
+    only sets `deleted_at` and does not clear `is_public` / `share_token`,
+    so without this clause a deleted run would still be reachable through
+    the public share endpoint even after authenticated views hide it.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_type:
             cursor.execute(
-                "SELECT * FROM jobs WHERE share_token = ? AND is_public = 1 AND type = ?",
+                "SELECT * FROM jobs WHERE share_token = ? AND is_public = 1 "
+                "AND type = ? AND deleted_at IS NULL",
                 (share_token, job_type),
             )
         else:
             cursor.execute(
-                "SELECT * FROM jobs WHERE share_token = ? AND is_public = 1",
+                "SELECT * FROM jobs WHERE share_token = ? AND is_public = 1 "
+                "AND deleted_at IS NULL",
                 (share_token,),
             )
         row = cursor.fetchone()
@@ -5540,17 +5809,19 @@ def create_annotator(name: str, user_id: str) -> str:
             return existing["uuid"]
 
         annotator_uuid = str(uuid.uuid4())
-        try:
-            cursor.execute(
-                """
-                INSERT INTO annotators (uuid, user_id, name)
-                VALUES (?, ?, ?)
-                """,
-                (annotator_uuid, user_id, name),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError as e:
-            raise ValueError(f"Annotator with name '{name}' already exists") from e
+        # IntegrityError on the partial unique index propagates upward —
+        # callers wrap with `name_uniqueness_guard("Annotator")` so a
+        # duplicate-name collision becomes a 409 via the global FastAPI
+        # handler. The previous catch-and-rewrap-as-ValueError lost the
+        # original SQLite error type, defeating the guard.
+        cursor.execute(
+            """
+            INSERT INTO annotators (uuid, user_id, name)
+            VALUES (?, ?, ?)
+            """,
+            (annotator_uuid, user_id, name),
+        )
+        conn.commit()
         logger.info(f"Created annotator with UUID: {annotator_uuid}")
         return annotator_uuid
 
@@ -5610,18 +5881,19 @@ def update_annotator(annotator_uuid: str, name: Optional[str] = None) -> bool:
         raise ValueError("annotator name must not be empty")
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        try:
-            cursor.execute(
-                """
-                UPDATE annotators
-                   SET name = ?, updated_at = CURRENT_TIMESTAMP
-                 WHERE uuid = ? AND deleted_at IS NULL
-                """,
-                (name, annotator_uuid),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError as e:
-            raise ValueError(f"Annotator with name '{name}' already exists") from e
+        # IntegrityError on the partial unique index propagates upward —
+        # callers wrap with `name_uniqueness_guard("Annotator")` so a
+        # duplicate-name collision becomes a 409 via the global FastAPI
+        # handler.
+        cursor.execute(
+            """
+            UPDATE annotators
+               SET name = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE uuid = ? AND deleted_at IS NULL
+            """,
+            (name, annotator_uuid),
+        )
+        conn.commit()
         return cursor.rowcount > 0
 
 
@@ -5975,6 +6247,42 @@ def get_annotation_job_by_token(token: str) -> Optional[Dict[str, Any]]:
         cursor.execute(
             "SELECT * FROM annotation_jobs WHERE public_token = ? AND deleted_at IS NULL",
             (token,),
+        )
+        row = cursor.fetchone()
+        return _parse_annotation_job_row(row) if row else None
+
+
+def update_annotation_job_visibility(
+    job_uuid: str, is_public: bool, view_token: Optional[str]
+) -> bool:
+    """Toggle read-only public sharing on an annotation_jobs row. Returns
+    True if the job was found. The annotator's `public_token` is unaffected
+    — only the separate `view_token` is touched here."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE annotation_jobs SET is_public = ?, view_token = ? "
+            "WHERE uuid = ? AND deleted_at IS NULL",
+            (1 if is_public else 0, view_token, job_uuid),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_annotation_job_by_view_token(
+    view_token: str,
+) -> Optional[Dict[str, Any]]:
+    """Resolve an annotation_jobs row from its read-only view_token. Always
+    filters to `is_public = 1` so the link goes dead the moment the owner
+    flips sharing back off."""
+    if not view_token:
+        return None
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM annotation_jobs "
+            "WHERE view_token = ? AND is_public = 1 AND deleted_at IS NULL",
+            (view_token,),
         )
         row = cursor.fetchone()
         return _parse_annotation_job_row(row) if row else None
