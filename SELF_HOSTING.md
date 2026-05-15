@@ -1,58 +1,193 @@
 # Self-Hosting Guide
 
-This guide walks you through deploying Calibrate Backend for a new tenant, end to end. Pick your target cloud and follow that section — each is fully self-contained.
+This guide walks you through self-hosting Calibrate's Backend on your infra. The self-hosting guide for the frontend can be found [here](https://github.com/ARTPARK-SAHAI-ORG/calibrate-frontend/blob/main/SELF_HOSTING.md).
+
+Pick your target cloud (AWS/GCP) and follow that section. Before you start, make sure to `fork` this repo to your team's Github account.
 
 ## Contents
 
 1. [Architecture decisions](#architecture-decisions)
 2. [Per-tenant isolation checklist](#per-tenant-isolation-checklist)
-3. [Deploy on GCP](#deploy-on-gcp)
-4. [Deploy on AWS](#deploy-on-aws)
+3. [Deploy on AWS](#deploy-on-aws)
+4. [Deploy on GCP](#deploy-on-gcp)
 
----
+# Deploy on AWS
 
-## Architecture decisions
+End-to-end walkthrough on AWS (EC2 + S3). Substitute `<region>` with your AWS region (e.g. `ap-south-1`, `us-east-1`).
 
-### Why a VM, not Cloud Run / ECS Fargate / Lambda
+> The existing AWS production deploy is fully automated by [.github/workflows/deploy.yml](.github/workflows/deploy.yml). For a brand-new tenant on AWS, you provision the infra once (steps 1–7 below), then add a GitHub Actions environment with your secrets and trigger that workflow for subsequent deploys. The first-time provisioning is the part this section walks through.
 
-Three properties of this app rule out serverless containers:
+## 1. Create the S3 bucket
 
-1. **SQLite on a local volume.** Single-writer, file-system-bound. Multi-instance containers would corrupt it. (See `${APP_FOLDER_PATH}:/appdata` in `docker-compose.yml`.)
-2. **Long-running `calibrate` subprocesses with process groups** — `os.killpg`, `start_new_session=True`, 5-minute timeout checks, abort signals. Needs a real OS, not a request-scoped sandbox.
-3. **Temp-file-based intermediate results** that must persist for the lifetime of a job (CLAUDE.md: "STT/TTS intermediate results are disk-only").
+An S3 bucket is used to store the results of all your evals and media files. Create one and name it `calibrate-backend-artifacts`. Ensure to block all public access for the S3 bucket as the app uses presigned URLs for client access.
 
-So the recommended deployment is a **single VM running Docker Compose** — EC2 on AWS, GCE on GCP. Identical container, identical compose file, different host.
+Update the CORS permissions for your bucket:
 
-### What goes on the persistent disk
+```
+[
+    {
+        "AllowedHeaders": [
+            "*"
+        ],
+        "AllowedMethods": [
+            "GET",
+            "PUT",
+            "POST"
+        ],
+        "AllowedOrigins": [
+            "*"
+        ],
+        "ExposeHeaders": []
+    }
+]
+```
 
-Only the SQLite file (`pense.db` under `DB_ROOT_DIR`, mounted at `/appdata` inside the container).
+Keep it stricter is you need to.
 
-Everything else is ephemeral:
+## 2. Create an IAM role for the EC2 instance
 
-- **Audio uploads** never touch the server's disk. Clients `PUT` directly to object storage via presigned URLs from `POST /presigned-url`. The DB stores only the resulting `s3://bucket/key` reference.
-- **Intermediate job artifacts** (calibrate CLI outputs, configs, generated audio, conversation `.wav`s) are written into `tempfile.TemporaryDirectory()` blocks. The backend uploads them to object storage from there; the temp dir is GC'd on context exit.
-- **Subprocess stdout/stderr logs** also use `NamedTemporaryFile`.
+Go to **IAM → Roles → Create role**.
 
-So: **persistent disk = SQLite. Object storage = everything else.** A 20–50 GB persistent disk is plenty.
+1. **Trusted entity**: AWS service → **EC2**.
+2. **Permissions**: skip attaching managed policies for now, click Next, name it `calibrate-backend-ec2`, create.
+3. Open the role → **Add permissions → Create inline policy** → JSON tab. Paste an S3 policy scoped to `calibrate-backend-artifacts` (Get/Put/Delete/ListBucket on the bucket and `/*`). Name it `calibrate-bucket-access`.
 
----
+## 3. Create the security group
 
-## Per-tenant isolation checklist
+Go to **VPC → Security groups → Create security group** (or do it inline during EC2 launch).
 
-A new tenant gets its **own** copy of *all* of these. Never share with an existing tenant:
+1. **Name**: `calibrate-backend-sg`. **VPC**: your default VPC.
+2. **Inbound rules** → Add rule:
+   - HTTP (80), Source `0.0.0.0/0`
+   - HTTPS (443), Source `0.0.0.0/0`
+3. Leave outbound as default (all traffic).
 
-- VM + persistent disk (own SQLite DB at `APP_FOLDER_PATH`)
-- Object storage bucket (`S3_OUTPUT_BUCKET`)
-- `JWT_SECRET_KEY` (fresh `openssl rand -base64 32`)
-- Google OAuth client ID (`GOOGLE_CLIENT_ID`) — its allowed origins point at the new domain
-- `SUPERADMIN_EMAIL`, `DOCS_USERNAME` / `DOCS_PASSWORD`
-- DNS name + TLS cert
-- Sentry / Langfuse projects (or environment tag)
-- `DEFAULT_USER_*` (the seeded admin)
+## 4. Create an EBS volume
 
-API keys for upstream providers (OpenAI, Deepgram, OpenRouter, etc.) **may** be shared, but most teams want per-tenant keys for billing and quota separation.
+This will be attached to the instance and the SQLite DB file will be stored on it. 100 GB is generous to begin with. Increase later as needed.
 
----
+## 5. Launch the EC2 instance
+
+Attach the `calibrate-backend-ec2` role, the security group and the EBS volume created in the previous steps to the instance. Allocate and associate an Elastic IP with the instance too which will be the stable public address for your instance.
+
+## 6. SSH into your instance
+
+## 7. Install Docker
+
+## 8. Clone the repo and build the image
+
+```bash
+sudo apt-get update && sudo apt-get install -y git    # or: sudo dnf install -y git
+git clone https://github.com/<your-org>/calibrate-backend.git
+cd calibrate-backend
+docker build -t calibrate-backend:local .
+```
+
+Takes 5–15 minutes the first time.
+
+## 9. Create the `.env` file
+
+```bash
+cd ~/calibrate-backend
+cat > .env <<'EOF'
+# Image
+IMAGE_NAME=calibrate-backend
+IMAGE_TAG=local
+CONTAINER_NAME=calibrate-backend
+PORT=80
+
+# Persistence
+APP_FOLDER_PATH=/appdata
+DB_ROOT_DIR=/appdata
+
+# Auth — generate fresh, do NOT reuse from any other tenant
+JWT_SECRET_KEY=PASTE_OUTPUT_OF_openssl_rand_-base64_32
+JWT_EXPIRATION_HOURS=168
+
+# Object storage (AWS S3 — IAM instance role provides creds)
+S3_ENDPOINT_URL=
+S3_OUTPUT_BUCKET=calibrate-backend-artifacts
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_REGION=<region>
+
+# Admin / default seeded user
+SUPERADMIN_EMAIL=you@example.com
+DEFAULT_USER_EMAIL=you@example.com
+DEFAULT_USER_FIRST_NAME=You
+DEFAULT_USER_LAST_NAME=Admin
+
+# Docs HTTP basic auth
+DOCS_USERNAME=admin
+DOCS_PASSWORD=CHANGE_ME
+
+# CORS — restrict to your frontend origin in production
+CORS_ALLOWED_ORIGINS=*
+
+# Concurrency
+MAX_CONCURRENT_JOBS=1
+MAX_CONCURRENT_JOBS_PER_USER=1
+DEFAULT_MAX_ROWS_PER_EVAL=20
+
+# Provider keys
+OPENROUTER_API_KEY=
+OPENAI_API_KEY=
+DEEPGRAM_API_KEY=
+CARTESIA_API_KEY=
+SMALLEST_API_KEY=
+GROQ_API_KEY=
+SARVAM_API_KEY=
+ELEVENLABS_API_KEY=
+GOOGLE_API_KEY=
+GOOGLE_CLIENT_ID=
+GOOGLE_APPLICATION_CREDENTIALS=
+GOOGLE_CLOUD_PROJECT_ID=
+
+# Tracing
+SENTRY_DSN=
+SENTRY_ENVIRONMENT=production
+SENTRY_TRACES_SAMPLE_RATE=1.0
+SENTRY_PROFILES_SAMPLE_RATE=1.0
+ENVIRONMENT=production
+ENABLE_TRACING=false
+OTEL_EXPORTER_OTLP_ENDPOINT=
+OTEL_EXPORTER_OTLP_HEADERS=
+LANGFUSE_TRACING_ENVIRONMENT=
+LANGFUSE_HOST=
+LANGFUSE_BASE_URL=
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_SECRET_KEY=
+EOF
+chmod 600 .env
+
+# Generate JWT secret and paste into .env
+openssl rand -base64 32
+```
+
+Update the default values given above as needed. For example, You might want to set the `SUPERADMIN_EMAIL` to an email address you own. Set the API keys for different providers (e.g. OpenRouter, OpenAI, etc.). Set the `GOOGLE_CLIENT_ID` to the same value as the one used for self-hosting the frontend.
+
+## 10. Start the app
+
+```bash
+docker compose up -d
+docker compose logs -f
+```
+
+Watch for `Uvicorn running on http://0.0.0.0:8000`. Ctrl-C the log tail.
+
+## 11. Verify it works
+
+Open `http://<INSTANCE_ELASTIC_IP>:8000/docs` on your browser. It should load the FastAPI docs for the server.
+
+## 12. Moving from HTTP to HTTPS
+
+Use nginx to route your custom domain (e.g. calibrate-backend.<yourdomain.com>) to the server. Use certbot to make the connection secure using HTTPs. 
+
+## 13. Verify everything works
+
+Open `https://<YOUR_DOMAIN>/docs` on your browser. It should load the FastAPI docs for the server.
+
+If you frontend is set up, [create a new speech-to-text dataset](https://calibrate.artpark.ai/docs/core-concepts/speech-to-text#create-a-dataset) and upload one audio. If it uploads successfully, your S3 connection works.
 
 # Deploy on GCP
 
@@ -781,950 +916,3 @@ gcloud compute instances start calibrate-backend
 The `--device-name=appdata` is critical — it's what makes `/dev/disk/by-id/google-appdata` resolve, which `/etc/fstab` references. Without it the VM boots but `/appdata` stays unmounted.
 
 After confirming the restore is good, delete the old disk: `gcloud compute disks delete calibrate-appdata --zone=us-central1-a`.
-
-## GCP / Environment variable reference
-
-See [src/.env.example](src/.env.example) for the canonical list. GCP-specific guidance:
-
-| Var | Required? | GCP value |
-|---|---|---|
-| `IMAGE_NAME`, `IMAGE_TAG`, `CONTAINER_NAME`, `PORT` | **yes** | Compose interpolation |
-| `APP_FOLDER_PATH` | **yes** | `/appdata` (your mount point) |
-| `DB_ROOT_DIR` | **yes** | `/appdata` (in-container path) |
-| `JWT_SECRET_KEY` | **yes** | `openssl rand -base64 32` per tenant |
-| `S3_OUTPUT_BUCKET` | **yes** | Your GCS bucket name |
-| `S3_ENDPOINT_URL` | **yes** | `https://storage.googleapis.com` |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | **yes** | HMAC keys from step 7e |
-| `AWS_REGION` | **yes** | `auto` (GCS ignores it; boto3 needs *something*) |
-| `SUPERADMIN_EMAIL` | **yes** | For mutating user-limit endpoints |
-| `DEFAULT_USER_EMAIL` / `..._FIRST_NAME` / `..._LAST_NAME` | **yes** | Seeded user |
-| `GOOGLE_CLIENT_ID` | yes for OAuth | OAuth client ID for sign-in |
-| `OPENROUTER_API_KEY` | yes for evaluators | Used by `POST /evaluators/{uuid}/invoke` |
-| `OPENAI_API_KEY` and other provider keys | depends | Only what the tenant uses |
-| `CORS_ALLOWED_ORIGINS` | recommended | **Frontend origin(s)**, comma-separated (e.g. `https://app.tenant.example.com`). NOT the backend URL — CORS gates browser-tab origins, not the API itself |
-| `DOCS_USERNAME` / `DOCS_PASSWORD` | recommended | HTTP Basic auth on `/docs` |
-| `MAX_CONCURRENT_JOBS` etc. | optional | Tune for VM size |
-| `SENTRY_DSN` | recommended | Background-thread failures route through this |
-
-> **When adding/changing/removing env vars:** update [src/.env.example](src/.env.example), [docker-compose.yml](docker-compose.yml), and the deploy workflows together. See `.cursor/rules/env-var.md`.
-
----
-
-# Deploy on AWS
-
-End-to-end walkthrough on AWS (EC2 + S3). Substitute `<region>` with your AWS region (e.g. `ap-south-1`, `us-east-1`).
-
-> The existing AWS production deploy is fully automated by [.github/workflows/deploy.yml](.github/workflows/deploy.yml). For a brand-new tenant on AWS, you provision the infra once (steps 1–7 below), then add a GitHub Actions environment with the tenant's secrets and trigger that workflow for subsequent deploys. The first-time provisioning is the part this section walks through.
-
-## AWS / 0. Set CLI defaults
-
-```bash
-aws configure              # if not already set up
-export AWS_REGION=<region>
-export AWS_DEFAULT_REGION=<region>
-```
-
-## AWS / 1. Create the S3 bucket
-
-`us-east-1` is S3's legacy default region — it rejects `--create-bucket-configuration` while every other region requires it. The conditional below picks the right form automatically:
-
-```bash
-if [ "$AWS_REGION" = "us-east-1" ]; then
-  aws s3api create-bucket \
-    --bucket calibrate-backend-artifacts \
-    --region us-east-1
-else
-  aws s3api create-bucket \
-    --bucket calibrate-backend-artifacts \
-    --region $AWS_REGION \
-    --create-bucket-configuration LocationConstraint=$AWS_REGION
-fi
-
-# Block all public access — the app uses presigned URLs for client access
-aws s3api put-public-access-block \
-  --bucket calibrate-backend-artifacts \
-  --public-access-block-configuration \
-  "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-
-# Enable versioning (recoverable from accidental overwrites/deletes)
-aws s3api put-bucket-versioning \
-  --bucket calibrate-backend-artifacts \
-  --versioning-configuration Status=Enabled
-```
-
-Optionally add a lifecycle rule to expire non-current versions after 30 days so versioning doesn't balloon costs:
-
-```bash
-aws s3api put-bucket-lifecycle-configuration \
-  --bucket calibrate-backend-artifacts \
-  --lifecycle-configuration '{
-    "Rules": [{
-      "ID": "expire-old-versions",
-      "Status": "Enabled",
-      "Filter": {"Prefix": ""},
-      "NoncurrentVersionExpiration": {"NoncurrentDays": 30}
-    }]
-  }'
-```
-
-### Configure bucket CORS (required if browser uploads from a different origin)
-
-The `/presigned-url` flow returns a URL the **browser** uploads to directly with `PUT`. That request lands on `s3.<region>.amazonaws.com`, not your backend — so the backend's `CORS_ALLOWED_ORIGINS` doesn't apply. You need a CORS rule **on the bucket**.
-
-Skip this if uploads only happen server-side (backend-to-S3). It only matters when a browser on a different origin (e.g. `https://app.tenant.example.com`) needs to PUT to S3 directly.
-
-```bash
-aws s3api put-bucket-cors \
-  --bucket calibrate-backend-artifacts \
-  --cors-configuration '{
-    "CORSRules": [{
-      "AllowedOrigins": [
-        "https://app.tenant.example.com"
-      ],
-      "AllowedMethods": ["GET", "PUT"],
-      "AllowedHeaders": ["*"],
-      "ExposeHeaders": ["ETag"],
-      "MaxAgeSeconds": 3600
-    }]
-  }'
-```
-
-For multiple origins (prod + staging + local dev), add them all to `AllowedOrigins`.
-
-Verify:
-
-```bash
-aws s3api get-bucket-cors --bucket calibrate-backend-artifacts
-```
-
-To clear CORS:
-
-```bash
-aws s3api delete-bucket-cors --bucket calibrate-backend-artifacts
-```
-
-## AWS / 2. Create an IAM role for the EC2 instance
-
-This avoids putting AWS keys in `.env` — boto3 picks up creds from the EC2 metadata service automatically.
-
-```bash
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-
-# Trust policy: allow EC2 to assume this role
-cat > /tmp/trust-policy.json <<'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {"Service": "ec2.amazonaws.com"},
-    "Action": "sts:AssumeRole"
-  }]
-}
-EOF
-
-aws iam create-role \
-  --role-name calibrate-backend-ec2 \
-  --assume-role-policy-document file:///tmp/trust-policy.json
-
-# Permissions: scoped to just this tenant's bucket
-cat > /tmp/bucket-policy.json <<'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": [
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:DeleteObject",
-      "s3:ListBucket"
-    ],
-    "Resource": [
-      "arn:aws:s3:::calibrate-backend-artifacts",
-      "arn:aws:s3:::calibrate-backend-artifacts/*"
-    ]
-  }]
-}
-EOF
-
-aws iam put-role-policy \
-  --role-name calibrate-backend-ec2 \
-  --policy-name calibrate-bucket-access \
-  --policy-document file:///tmp/bucket-policy.json
-
-# Also attach SSM-managed-instance policy so SSM Session Manager works
-aws iam attach-role-policy \
-  --role-name calibrate-backend-ec2 \
-  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-
-# Wrap in an instance profile (EC2 attaches via this, not the role directly)
-aws iam create-instance-profile --instance-profile-name calibrate-backend-ec2
-aws iam add-role-to-instance-profile \
-  --instance-profile-name calibrate-backend-ec2 \
-  --role-name calibrate-backend-ec2
-```
-
-## AWS / 3. Create the security group
-
-```bash
-VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
-
-SG_ID=$(aws ec2 create-security-group \
-  --group-name calibrate-backend-sg \
-  --description "Calibrate backend ingress" \
-  --vpc-id $VPC_ID \
-  --query GroupId --output text)
-
-# HTTP and HTTPS open to the world
-aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80  --cidr 0.0.0.0/0
-aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0
-
-# Note: NOT opening port 22. We'll use SSM Session Manager instead.
-echo "Security group: $SG_ID"
-```
-
-> **Why no SSH (port 22)?** SSM Session Manager (set up via the IAM policy in step 2) gives you shell access without exposing port 22 to the internet. Eliminates the bot-bruteforce attack surface entirely. If you'd rather have SSH, add `--protocol tcp --port 22 --cidr <your-ip>/32` (your IP only — not `0.0.0.0/0`).
-
-## AWS / 4. Create the EBS volume for `/appdata`
-
-```bash
-# Pick the same AZ where the EC2 instance will live
-AZ=${AWS_REGION}a
-
-VOLUME_ID=$(aws ec2 create-volume \
-  --availability-zone $AZ \
-  --size 100 \
-  --volume-type gp3 \
-  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=calibrate-appdata}]' \
-  --query VolumeId --output text)
-
-# Wait for it to be available
-aws ec2 wait volume-available --volume-ids $VOLUME_ID
-echo "Volume: $VOLUME_ID"
-```
-
-> 100 GB is generous; the SQLite file alone is small. The headroom is operational room for future growth — resize down later if you don't need it.
-
-## AWS / 5. Launch the EC2 instance
-
-```bash
-# Find the latest Ubuntu 22.04 AMI (or use Amazon Linux 2023 — both work)
-AMI_ID=$(aws ec2 describe-images \
-  --owners 099720109477 \
-  --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
-  --query 'sort_by(Images,&CreationDate)[-1].ImageId' \
-  --output text)
-
-# Launch
-INSTANCE_ID=$(aws ec2 run-instances \
-  --image-id $AMI_ID \
-  --instance-type t3.large \
-  --security-group-ids $SG_ID \
-  --iam-instance-profile Name=calibrate-backend-ec2 \
-  --placement AvailabilityZone=$AZ \
-  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=30,VolumeType=gp3}' \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=calibrate-backend}]' \
-  --query 'Instances[0].InstanceId' --output text)
-
-aws ec2 wait instance-running --instance-ids $INSTANCE_ID
-
-# Attach the EBS volume — pick a device name; /dev/sdf is conventional for first extra volume
-aws ec2 attach-volume \
-  --volume-id $VOLUME_ID \
-  --instance-id $INSTANCE_ID \
-  --device /dev/sdf
-
-echo "Instance: $INSTANCE_ID"
-```
-
-> **Instance type:** `t3.large` (2 vCPU, 8 GB) is a reasonable starting size. `t3.xlarge` or `c6i.xlarge` if benchmarks saturate it. Use Graviton (`t4g.large`) for cost savings — Docker images need to be built for ARM64 in that case.
-
-## AWS / 6. Allocate and associate an Elastic IP
-
-```bash
-EIP_ALLOC=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
-aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $EIP_ALLOC
-
-EIP=$(aws ec2 describe-addresses --allocation-ids $EIP_ALLOC --query 'Addresses[0].PublicIp' --output text)
-echo "Elastic IP: $EIP"
-```
-
-> Elastic IPs are free while attached to a running instance and chargeable when unattached.
-
-## AWS / 7. Connect via SSM Session Manager
-
-```bash
-aws ssm start-session --target $INSTANCE_ID
-```
-
-> If this errors with "instance not registered with SSM," wait 1–2 minutes after launch — the SSM agent takes time to come up. Confirm the IAM instance profile is attached and includes `AmazonSSMManagedInstanceCore`.
-
-Once in the shell, become the default user:
-
-```bash
-sudo su - ubuntu       # for Ubuntu AMI
-# or
-sudo su - ec2-user     # for Amazon Linux
-```
-
-## AWS / 8. Prepare the EBS volume
-
-Inside the instance:
-
-```bash
-# Find the device. AWS may name it /dev/xvdf, /dev/nvme1n1, or similar regardless of what you requested.
-lsblk
-# Look for an unmounted ~100GB device
-
-# Substitute the actual device name in the commands below — for the example, assume /dev/nvme1n1
-DEV=/dev/nvme1n1
-
-# Check whether already formatted
-sudo file -sL $DEV
-# "data" → blank, run mkfs. "ext4 filesystem" → skip mkfs.
-
-# Format if blank (DESTRUCTIVE — only the first time)
-sudo mkfs.ext4 -F $DEV
-
-# Mount and persist
-sudo mkdir -p /appdata
-echo "$DEV /appdata ext4 discard,defaults,nofail 0 2" | sudo tee -a /etc/fstab
-sudo mount /appdata
-sudo chown -R $USER /appdata
-df -h /appdata
-```
-
-> **Why `nofail` on AWS but not GCP?** EBS device naming on Nitro instances is non-deterministic across reboots. `nofail` prevents the system from refusing to boot if the device temporarily isn't visible. For maximum stability, use the EBS volume's UUID instead of the device path:
-> ```bash
-> UUID=$(sudo blkid -s UUID -o value $DEV)
-> echo "UUID=$UUID /appdata ext4 discard,defaults,nofail 0 2" | sudo tee -a /etc/fstab
-> ```
-
-## AWS / 9. Install Docker
-
-```bash
-# Ubuntu
-curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker $USER && newgrp docker
-docker run --rm hello-world
-```
-
-For Amazon Linux 2023, replace the `get.docker.com` line with:
-
-```bash
-sudo dnf install -y docker
-sudo systemctl enable --now docker
-sudo usermod -aG docker $USER && newgrp docker
-# Compose plugin
-sudo mkdir -p /usr/local/lib/docker/cli-plugins
-sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
-  -o /usr/local/lib/docker/cli-plugins/docker-compose
-sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-```
-
-## AWS / 10. Clone the repo and build the image
-
-```bash
-sudo apt-get update && sudo apt-get install -y git    # or: sudo dnf install -y git
-git clone https://github.com/<your-org>/calibrate-backend.git
-cd calibrate-backend
-docker build -t calibrate-backend:local .
-```
-
-Takes 5–15 minutes the first time.
-
-## AWS / 11. Create the `.env` file
-
-```bash
-cd ~/calibrate-backend
-cat > .env <<'EOF'
-# Image
-IMAGE_NAME=calibrate-backend
-IMAGE_TAG=local
-CONTAINER_NAME=calibrate-backend
-PORT=80
-
-# Persistence
-APP_FOLDER_PATH=/appdata
-DB_ROOT_DIR=/appdata
-
-# Auth — generate fresh, do NOT reuse from any other tenant
-JWT_SECRET_KEY=PASTE_OUTPUT_OF_openssl_rand_-base64_32
-JWT_EXPIRATION_HOURS=168
-
-# Object storage (AWS S3 — IAM instance role provides creds)
-S3_ENDPOINT_URL=
-S3_OUTPUT_BUCKET=calibrate-backend-artifacts
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
-AWS_REGION=<region>
-
-# Admin / default seeded user
-SUPERADMIN_EMAIL=you@example.com
-DEFAULT_USER_EMAIL=you@example.com
-DEFAULT_USER_FIRST_NAME=You
-DEFAULT_USER_LAST_NAME=Admin
-
-# Docs HTTP basic auth
-DOCS_USERNAME=admin
-DOCS_PASSWORD=CHANGE_ME
-
-# CORS — restrict to your frontend origin in production
-CORS_ALLOWED_ORIGINS=*
-
-# Concurrency
-MAX_CONCURRENT_JOBS=1
-MAX_CONCURRENT_JOBS_PER_USER=1
-DEFAULT_MAX_ROWS_PER_EVAL=20
-
-# Provider keys
-OPENROUTER_API_KEY=
-OPENAI_API_KEY=
-DEEPGRAM_API_KEY=
-CARTESIA_API_KEY=
-SMALLEST_API_KEY=
-GROQ_API_KEY=
-SARVAM_API_KEY=
-ELEVENLABS_API_KEY=
-GOOGLE_API_KEY=
-GOOGLE_CLIENT_ID=
-GOOGLE_APPLICATION_CREDENTIALS=
-GOOGLE_CLOUD_PROJECT_ID=
-
-# Tracing
-SENTRY_DSN=
-SENTRY_ENVIRONMENT=production
-SENTRY_TRACES_SAMPLE_RATE=1.0
-SENTRY_PROFILES_SAMPLE_RATE=1.0
-ENVIRONMENT=production
-ENABLE_TRACING=false
-OTEL_EXPORTER_OTLP_ENDPOINT=
-OTEL_EXPORTER_OTLP_HEADERS=
-LANGFUSE_TRACING_ENVIRONMENT=
-LANGFUSE_HOST=
-LANGFUSE_BASE_URL=
-LANGFUSE_PUBLIC_KEY=
-LANGFUSE_SECRET_KEY=
-EOF
-chmod 600 .env
-
-# Generate JWT secret and paste into .env
-openssl rand -base64 32
-```
-
-> **Critical for AWS:** leave `S3_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` **empty**. With those empty and the IAM instance profile attached, boto3 picks up temporary credentials from the EC2 metadata service automatically. This is more secure than long-lived static keys.
->
-> Set `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` only if you'd rather use a dedicated IAM user instead of the instance role.
-
-## AWS / 12. Start the app
-
-```bash
-docker compose up -d
-docker compose logs -f
-```
-
-Watch for `Uvicorn running on http://0.0.0.0:8000`. Ctrl-C the log tail.
-
-## AWS / 13. Verify from the internet
-
-From your laptop:
-
-```bash
-curl http://$EIP/openapi.json | head -c 200
-```
-
-If you get JSON back, the API is live.
-
-## AWS / 14. Verify S3 uploads work
-
-Inside the container:
-
-```bash
-docker exec -it calibrate-backend uv run python -c "
-from utils import get_s3_client
-c = get_s3_client()
-print('endpoint:', c.meta.endpoint_url)
-print('region:', c.meta.region_name)
-"
-# Expect endpoint: https://s3.<region>.amazonaws.com
-```
-
-After running any job:
-
-```bash
-aws s3 ls s3://calibrate-backend-artifacts/ --recursive | head
-```
-
-You should see object keys appearing.
-
-## AWS / Object storage (AWS S3)
-
-The codebase uses boto3 with default behavior:
-
-- `S3_ENDPOINT_URL` empty → defaults to AWS S3
-- Credentials picked up from EC2 instance role automatically (or static keys if set in `.env`)
-- `AWS_REGION` selects the regional S3 endpoint
-- `S3_OUTPUT_BUCKET` is the bucket name
-
-The DB stores blob URIs as `s3://bucket/key` — same format the app uses everywhere.
-
-## AWS / Authentication and first login
-
-### The seeded default user has no password
-
-`init_db()` creates a row in the `users` table from `DEFAULT_USER_EMAIL`, but **does not set `password_hash`** ([src/db.py:803](src/db.py:803)). Pick one:
-
-**Path A — Google OAuth (recommended for human users)**
-
-1. Google Cloud Console → APIs & Services → Credentials → Create OAuth client ID. (Yes — you can use a Google OAuth client even when deploying to AWS; it's just an identity provider.)
-2. Application type: **Web application**.
-3. Authorized JavaScript origins: your frontend's URL.
-4. Copy the client ID into `GOOGLE_CLIENT_ID` in `.env`. Restart the container.
-5. The Google email logging in must match `DEFAULT_USER_EMAIL`.
-
-**Path B — email/password signup**
-
-Hit the password signup endpoint (typically `POST /auth/signup` — confirm in [src/routers/auth.py](src/routers/auth.py)).
-
-**Path C — API key**
-
-API keys (`/api-keys`) authenticate via `X-API-Key` or `Authorization: Bearer calib_...`. Created by an authenticated user.
-
-## AWS / Moving from HTTP to HTTPS (nginx + certbot)
-
-**Don't put real users on plain HTTP.** Once verified on `http://<eip>` and DNS is pointing at the Elastic IP, immediately put it behind TLS.
-
-This section assumes you already have the app running on `PORT=80` and the domain resolves to the Elastic IP.
-
-The standard AWS-shop-friendly approach: nginx as a reverse proxy + certbot to issue and renew Let's Encrypt certs. nginx is what most ops engineers know, and certbot's `--nginx` plugin auto-edits the nginx config to add TLS — minimal hand-rolling.
-
-### Order matters
-
-The container currently holds port 80. nginx will need to take it over. Sequence:
-
-1. Move the container off port 80 (`PORT=80` → `PORT=8000`).
-2. Install nginx, configure as a plain HTTP reverse proxy on port 80.
-3. Install certbot, run it against your domain — it issues a cert and rewrites the nginx config to terminate TLS on 443 and redirect 80→443.
-4. Verify HTTPS works.
-
-### Step 1 — Move the container off port 80
-
-```bash
-cd ~/calibrate-backend
-sed -i 's/^PORT=80$/PORT=8000/' .env
-docker compose up -d
-
-# Verify
-docker compose ps                                # should show 0.0.0.0:8000->8000/tcp
-curl http://localhost:8000/openapi.json | head -c 100
-```
-
-Port 80 is now free for nginx.
-
-### Step 2 — Install nginx
-
-```bash
-# Ubuntu
-sudo apt-get update && sudo apt-get install -y nginx
-
-# Amazon Linux 2023
-# sudo dnf install -y nginx && sudo systemctl enable --now nginx
-```
-
-Confirm it's running and serving the default page:
-
-```bash
-curl http://localhost/   # should return nginx's default welcome page
-```
-
-### Step 3 — Configure nginx as a reverse proxy
-
-Replace the default site with one that proxies to your container:
-
-```bash
-sudo tee /etc/nginx/sites-available/calibrate-backend <<'EOF'
-server {
-    listen 80;
-    server_name api.tenant.example.com;
-
-    # Increase upload size — TTS/STT audio uploads can be larger than the 1 MB default
-    client_max_body_size 100M;
-
-    location / {
-        proxy_pass http://localhost:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Long-running requests (job status polls, CLI handoffs)
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }
-}
-EOF
-
-# Enable the site, disable the default
-sudo ln -sf /etc/nginx/sites-available/calibrate-backend /etc/nginx/sites-enabled/
-sudo rm -f /etc/nginx/sites-enabled/default
-
-# Validate config and reload
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-(On Amazon Linux there's no `sites-available` / `sites-enabled` convention — drop the file in `/etc/nginx/conf.d/calibrate-backend.conf` instead and skip the `ln`/`rm` steps.)
-
-Verify HTTP through nginx works:
-
-```bash
-curl http://api.tenant.example.com/openapi.json | head -c 100
-```
-
-### Step 4 — Install certbot
-
-The Let's Encrypt-recommended path on Ubuntu/Debian is via snap; on Amazon Linux it's via EPEL. Both work the same once installed.
-
-**Ubuntu:**
-
-```bash
-sudo snap install --classic certbot
-sudo ln -sf /snap/bin/certbot /usr/bin/certbot
-```
-
-**Amazon Linux 2023:**
-
-```bash
-sudo dnf install -y python3-certbot-nginx
-```
-
-### Step 5 — Issue the cert
-
-```bash
-sudo certbot --nginx -d api.tenant.example.com
-```
-
-certbot will:
-
-1. Ask for an email (used for expiry warnings — give it one you actually read).
-2. Ask whether to redirect HTTP to HTTPS — **answer yes**. It rewrites your nginx config to add a 301 from port 80 to 443.
-3. Use the HTTP-01 challenge against `http://api.tenant.example.com/.well-known/acme-challenge/...` to prove domain control.
-4. Install the cert at `/etc/letsencrypt/live/api.tenant.example.com/`.
-5. Reload nginx.
-
-If it errors with "Failed authorization procedure," DNS hasn't propagated yet or port 80 isn't reachable. Wait 5 minutes and retry. Confirm port 80 is open in the security group from `0.0.0.0/0`.
-
-### Step 6 — Verify
-
-From your laptop:
-
-```bash
-curl -I https://api.tenant.example.com/openapi.json
-```
-
-Expect `HTTP/2 200`. Browser: `https://api.tenant.example.com/docs`.
-
-### Step 7 — Confirm auto-renewal
-
-certbot installs a systemd timer (or cron job on older systems) that renews ~30 days before expiry. Test it:
-
-```bash
-sudo certbot renew --dry-run
-```
-
-This should report success without actually renewing. Then:
-
-```bash
-systemctl list-timers | grep certbot
-```
-
-You should see `snap.certbot.renew.timer` (snap install) or `certbot.timer` (apt/dnf install) scheduled.
-
-### Step 8 — Update CORS and OAuth
-
-Set `CORS_ALLOWED_ORIGINS` to your **frontend's** origin (NOT the backend URL — see note below):
-
-```bash
-sed -i 's|^CORS_ALLOWED_ORIGINS=.*|CORS_ALLOWED_ORIGINS=https://app.tenant.example.com|' .env
-docker compose up -d
-```
-
-Multiple origins are comma-separated:
-
-```
-CORS_ALLOWED_ORIGINS=https://app.tenant.example.com,https://staging.tenant.example.com,http://localhost:3000
-```
-
-If using Google OAuth, add `https://api.tenant.example.com` to your OAuth client's **Authorized JavaScript origins** in Google Cloud Console → APIs & Services → Credentials.
-
-> **What CORS does:** controls which *browser-tab origins* can call your backend. The backend's own URL never appears as an `Origin` header on requests to itself, so listing it here is a no-op. Same-origin tooling like Swagger UI on `/docs` doesn't need a CORS entry either. `curl` and Postman never trigger CORS at all.
-
-### Gotchas
-
-- **Port 80 must stay open** in the security group, even after HTTPS works. certbot uses HTTP-01 for renewal. Closing port 80 silently breaks renewal and the cert eventually expires.
-- **Port 443 must also be open** — confirm with: `aws ec2 describe-security-groups --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions'`. If 443 isn't listed: `aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0`.
-- **`client_max_body_size`** — default is 1 MB. Audio uploads will fail with `413 Request Entity Too Large` if not increased. The config above sets 100 MB.
-- **Long-running endpoints** — nginx's default proxy timeout is 60s. Job-status polls and a few internal handoffs can exceed that. The config sets 300s.
-- **`X-Forwarded-For` / `X-Forwarded-Proto`** are set so the FastAPI app behind nginx sees the real client IP and knows the original request was HTTPS (matters for any redirect logic and for accurate logging).
-- **Cert files location**: `/etc/letsencrypt/live/<domain>/fullchain.pem` and `privkey.pem`. Don't move them — certbot's renewal hook expects them there.
-
-### Alternative: AWS Application Load Balancer + ACM
-
-Heavier setup but offloads TLS to a managed service, integrates with ACM for free public certs (auto-renewed by AWS), gives you health checks, and lets you front multiple backends. Worth it if you want WAF (AWS WAF), multi-AZ, or a single ingress for backend + frontend. The tradeoff: ALB costs ~$22/month minimum (LCUs) vs nginx-on-EC2 being free. Not required for a single-VM tenant.
-
-## AWS / Operational concerns
-
-### Docker log rotation
-
-Already configured in `docker-compose.yml`:
-
-```yaml
-logging:
-  driver: json-file
-  options:
-    max-size: "10m"
-    max-file: "5"
-```
-
-**Recreate the container after pulling the change**: `docker compose up -d`. A `restart` is not enough.
-
-### EBS snapshots (AWS Backup)
-
-```bash
-# Create a backup vault if you don't have one
-aws backup create-backup-vault --backup-vault-name calibrate-backend-vault
-
-# Create a backup plan: daily at 03:00 UTC, retain 14 days
-cat > /tmp/backup-plan.json <<'EOF'
-{
-  "BackupPlanName": "calibrate-appdata-daily",
-  "Rules": [{
-    "RuleName": "DailyBackup",
-    "TargetBackupVaultName": "calibrate-backend-vault",
-    "ScheduleExpression": "cron(0 3 ? * * *)",
-    "Lifecycle": {"DeleteAfterDays": 14}
-  }]
-}
-EOF
-
-PLAN_ID=$(aws backup create-backup-plan \
-  --backup-plan file:///tmp/backup-plan.json \
-  --query BackupPlanId --output text)
-
-# Tag the volume so the plan picks it up
-aws ec2 create-tags --resources $VOLUME_ID --tags Key=Backup,Value=Daily
-
-# Selection: target volumes with that tag
-cat > /tmp/selection.json <<EOF
-{
-  "SelectionName": "DailyAppdataSelection",
-  "IamRoleArn": "arn:aws:iam::${ACCOUNT}:role/service-role/AWSBackupDefaultServiceRole",
-  "ListOfTags": [{
-    "ConditionType": "STRINGEQUALS",
-    "ConditionKey": "Backup",
-    "ConditionValue": "Daily"
-  }]
-}
-EOF
-
-aws backup create-backup-selection \
-  --backup-plan-id $PLAN_ID \
-  --backup-selection file:///tmp/selection.json
-```
-
-> If `AWSBackupDefaultServiceRole` doesn't exist in your account, AWS Backup auto-creates it the first time you use the console. Run the console flow once, then the CLI commands above will work.
-
-Cheaper alternative (and equally fine for SQLite): **Data Lifecycle Manager** with an EBS snapshot policy. Same daily-retention semantics, simpler IAM.
-
-### Error monitoring (Sentry)
-
-The architecture explicitly relies on `capture_exception_to_sentry()` for background-thread failures. Without `SENTRY_DSN`, those failures go to container stdout and nowhere else. Create a Sentry project and set `SENTRY_DSN`, `SENTRY_ENVIRONMENT=production`.
-
-### Restart on instance reboot
-
-`restart: unless-stopped` in compose + Docker enabled at boot via systemd handles this. Test it:
-
-```bash
-sudo reboot
-# Wait 60s, then from your laptop:
-curl http://$EIP/openapi.json
-```
-
-### Lock down access (already done if you followed steps 2 + 3)
-
-- No SSH port open → no bot bruteforce surface.
-- SSM Session Manager via the IAM role for shell access.
-- Bucket has public-access-block on; client access is via presigned URLs only.
-
-### AWS Secrets Manager (when ready)
-
-`.env` on disk is fine for a single-admin deploy. For tenant-grade:
-
-```bash
-# Create a secret
-aws secretsmanager create-secret \
-  --name calibrate/jwt-secret \
-  --secret-string "<value>"
-
-# Grant the EC2 instance role read access
-aws iam put-role-policy \
-  --role-name calibrate-backend-ec2 \
-  --policy-name secrets-access \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": "secretsmanager:GetSecretValue",
-      "Resource": "arn:aws:secretsmanager:'"$AWS_REGION"':'"$ACCOUNT"':secret:calibrate/*"
-    }]
-  }'
-
-# At deploy time
-aws secretsmanager get-secret-value \
-  --secret-id calibrate/jwt-secret \
-  --query SecretString --output text
-```
-
-Bootstrap `.env` from secrets, run, delete the temp `.env` if you're being strict.
-
-## AWS / CI/CD: the existing GitHub Actions workflow
-
-Unlike the GCP path (which builds on the VM), AWS production already has a fully-automated workflow: [.github/workflows/deploy.yml](.github/workflows/deploy.yml). It builds the image in Actions, pushes to Docker Hub, then SSHes onto the EC2 instance and runs `docker compose pull && up -d`.
-
-To onboard a new AWS tenant:
-
-1. Create a new GitHub Actions environment (e.g. `Tenant-X-Production`).
-2. Populate every `secrets.*` and `vars.*` referenced in [.github/workflows/deploy.yml](.github/workflows/deploy.yml) — `EC2_HOST` (the Elastic IP), `EC2_USER` (`ubuntu`/`ec2-user`), `EC2_SSH_KEY` (or use SSM and rewrite the SSH step), all the env vars from the `.env`, `IMAGE_NAME`, `CONTAINER_NAME`, `DOCKERHUB_*`, etc.
-3. Copy `deploy.yml` to `deploy-<tenant>.yml`, change the `environment:` line to point at your new environment.
-4. Trigger via "Run workflow" → workflow_dispatch.
-
-Subsequent deploys are automatic — Actions handles build, push, SSH, pull, up. Steps 10–12 of this guide (build + start manually) are only the **first-time** manual bootstrap.
-
-## AWS / Troubleshooting
-
-### `lsblk` shows the EBS volume but `mkfs` errors
-
-You may be looking at the wrong device. Nitro instances enumerate volumes as `/dev/nvme*n1` regardless of the `/dev/sdf` you specified at attach time. Run `lsblk` and pick the one with the right size and no mountpoint.
-
-### `df -h /appdata` shows `/dev/root` instead of the EBS volume
-
-Same as the GCP version: you ran `mkdir` and the `tee >> /etc/fstab` but skipped `sudo mount /appdata`. Also check `sudo file -sL <device>` — if it says `data`, the volume needs `mkfs.ext4` first.
-
-**Important:** anything written to `/appdata` while it was unmounted is on the boot volume. Once the EBS volume mounts over the path, those files are shadowed (not deleted). Recover with `sudo umount /appdata && ls /appdata`.
-
-### EBS volume not visible after instance reboot
-
-If `/etc/fstab` references a device path like `/dev/nvme1n1` and AWS re-enumerates it as `/dev/nvme2n1` on reboot, the mount fails. Use the volume's UUID instead:
-
-```bash
-UUID=$(sudo blkid -s UUID -o value /dev/nvme1n1)
-sudo sed -i "s|^/dev/nvme1n1.*|UUID=$UUID /appdata ext4 discard,defaults,nofail 0 2|" /etc/fstab
-```
-
-The `nofail` option keeps the system bootable even if the volume isn't visible at boot time.
-
-### `aws ssm start-session` says "instance not registered"
-
-1. Wait 1–2 minutes after launch — the SSM agent takes time.
-2. Confirm IAM instance profile is attached: `aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].IamInstanceProfile'`
-3. Confirm the role has `AmazonSSMManagedInstanceCore` attached.
-4. Confirm the instance has internet access — without NAT/IGW, the SSM agent can't reach the SSM endpoint. Either give it a public IP (Elastic IP, step 6) or set up VPC endpoints for SSM.
-
-### Container exits immediately after `docker compose up -d`
-
-Almost always a missing required env var. Check:
-
-```bash
-docker compose logs --tail=50
-```
-
-Look for "ValueError: S3_OUTPUT_BUCKET environment variable is required" or `KeyError: 'JWT_SECRET_KEY'`.
-
-### `curl http://<eip>/...` times out
-
-1. `docker compose ps` — STATUS should say `Up`.
-2. Confirm port mapping.
-3. Confirm security group has tcp:80 (and 443 once nginx is in front) open from `0.0.0.0/0`.
-4. Confirm the Elastic IP is associated: `aws ec2 describe-addresses --allocation-ids $EIP_ALLOC --query 'Addresses[0].InstanceId'` should return the instance ID.
-
-### S3 operations fail with `NoCredentialsError`
-
-The IAM instance role isn't attached or doesn't have the right permissions. Check:
-
-```bash
-# From inside the EC2 instance:
-curl http://169.254.169.254/latest/meta-data/iam/security-credentials/
-# Should print the role name (e.g. "calibrate-backend-ec2")
-
-aws sts get-caller-identity
-# Should show an assumed-role ARN containing "calibrate-backend-ec2"
-```
-
-If those work but bucket operations fail, check the role's bucket policy (step 2).
-
-### `docker run hello-world` says "permission denied" after install
-
-`newgrp docker` didn't apply. Log out and back in.
-
-## AWS / Restore from EBS snapshot
-
-```bash
-# 1. List recent snapshots
-aws ec2 describe-snapshots --owner-ids self \
-  --filters "Name=volume-id,Values=$VOLUME_ID" \
-  --query 'sort_by(Snapshots,&StartTime)[-5:].[SnapshotId,StartTime,Description]' \
-  --output table
-
-# 2. Create a new volume from the snapshot
-NEW_VOLUME_ID=$(aws ec2 create-volume \
-  --snapshot-id <snap-id> \
-  --availability-zone $AZ \
-  --volume-type gp3 \
-  --query VolumeId --output text)
-aws ec2 wait volume-available --volume-ids $NEW_VOLUME_ID
-
-# 3. Stop the instance, swap, restart
-aws ec2 stop-instances --instance-ids $INSTANCE_ID
-aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID
-aws ec2 detach-volume --volume-id $VOLUME_ID
-aws ec2 wait volume-available --volume-ids $VOLUME_ID
-aws ec2 attach-volume --volume-id $NEW_VOLUME_ID --instance-id $INSTANCE_ID --device /dev/sdf
-aws ec2 start-instances --instance-ids $INSTANCE_ID
-```
-
-If you used a UUID-based `/etc/fstab` entry, the new volume will have a different UUID and won't auto-mount. Either:
-
-- Update `/etc/fstab` to the new UUID (`sudo blkid` to find it), or
-- Use device-path-based fstab entries (less stable but matches across volume swaps).
-
-After confirming the restore is good, delete the old volume:
-
-```bash
-aws ec2 delete-volume --volume-id $VOLUME_ID
-```
-
-## AWS / Environment variable reference
-
-See [src/.env.example](src/.env.example) for the canonical list. AWS-specific guidance:
-
-| Var | Required? | AWS value |
-|---|---|---|
-| `IMAGE_NAME`, `IMAGE_TAG`, `CONTAINER_NAME`, `PORT` | **yes** | Compose interpolation |
-| `APP_FOLDER_PATH` | **yes** | `/appdata` |
-| `DB_ROOT_DIR` | **yes** | `/appdata` |
-| `JWT_SECRET_KEY` | **yes** | `openssl rand -base64 32` per tenant |
-| `S3_OUTPUT_BUCKET` | **yes** | Your S3 bucket name |
-| `S3_ENDPOINT_URL` | **leave empty** | AWS S3 default |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | **leave empty** | Use the EC2 instance role |
-| `AWS_REGION` | **yes** | Real region (e.g. `ap-south-1`, `us-east-1`) |
-| `SUPERADMIN_EMAIL` | **yes** | For mutating user-limit endpoints |
-| `DEFAULT_USER_EMAIL` / `..._FIRST_NAME` / `..._LAST_NAME` | **yes** | Seeded user |
-| `GOOGLE_CLIENT_ID` | yes for OAuth | OAuth client ID for sign-in |
-| `OPENROUTER_API_KEY` | yes for evaluators | Used by `POST /evaluators/{uuid}/invoke` |
-| `OPENAI_API_KEY` and other provider keys | depends | Only what the tenant uses |
-| `CORS_ALLOWED_ORIGINS` | recommended | **Frontend origin(s)**, comma-separated (e.g. `https://app.tenant.example.com`). NOT the backend URL — CORS gates browser-tab origins, not the API itself |
-| `DOCS_USERNAME` / `DOCS_PASSWORD` | recommended | HTTP Basic auth on `/docs` |
-| `MAX_CONCURRENT_JOBS` etc. | optional | Tune for instance size |
-| `SENTRY_DSN` | recommended | Background-thread failures route through this |
-
-> **When adding/changing/removing env vars:** update [src/.env.example](src/.env.example), [docker-compose.yml](docker-compose.yml), and the deploy workflows together. See `.cursor/rules/env-var.md`.
