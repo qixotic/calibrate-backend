@@ -1,8 +1,8 @@
 # Environment variables
 
-This document describes configuration supplied via the process environment (typically a `.env` file beside `src/main.py`). The app calls `load_dotenv()` on startup ([`src/main.py`](src/main.py)), so run Uvicorn with working directory `src/` as documented in [`CLAUDE.md`](CLAUDE.md).
+This document describes the environment variables used for running the app.
 
-Canonical placeholders live in [`src/.env.example`](src/.env.example). When you add, rename, or remove variables, update that file plus [`docker-compose.yml`](docker-compose.yml) (and CI/deploy workflows when applicable); see [`.cursor/rules/env-var.md`](.cursor/rules/env-var.md).
+Canonical placeholders live in [`src/.env.example`](src/.env.example). When you add, rename, or remove variables, update that file plus [`docker-compose.yml`](docker-compose.yml),  [`./github/workflows/deploy.yml`](deploy.yml) and  [`./github/workflows/deploy.yml`](deploy-staging.yml).
 
 ---
 
