@@ -11,6 +11,7 @@ freshly minted name/uuid so tests are order-independent.
 
 from __future__ import annotations
 
+import time
 import uuid as _uuid
 
 import pytest
@@ -804,6 +805,26 @@ def test_annotation_pipeline(user):
     # restore
     eid2 = db.add_evaluator_to_annotation_task(task_uuid, seeded["uuid"])
     assert eid2 == eid
+
+    # Re-linking refreshes created_at so the evaluator moves to the end of
+    # the task's evaluator ordering (which feeds the labelling-form column
+    # order). Link a second evaluator AFTER the restore, then unlink and
+    # re-link the first — it should now sort last.
+    other = db.get_evaluator_by_slug("default-helpfulness")
+    db.add_evaluator_to_annotation_task(task_uuid, other["uuid"])
+    ordered_before = [
+        e["uuid"] for e in db.get_evaluators_for_annotation_task(task_uuid)
+    ]
+    assert ordered_before == [seeded["uuid"], other["uuid"]]
+    assert db.remove_evaluator_from_annotation_task(task_uuid, seeded["uuid"]) is True
+    # Ensure a measurable timestamp delta — SQLite CURRENT_TIMESTAMP has
+    # 1-second resolution.
+    time.sleep(1.1)
+    db.add_evaluator_to_annotation_task(task_uuid, seeded["uuid"])
+    ordered_after = [
+        e["uuid"] for e in db.get_evaluators_for_annotation_task(task_uuid)
+    ]
+    assert ordered_after == [other["uuid"], seeded["uuid"]]
 
     # annotator
     ann_uuid = db.create_annotator(name=_u("ann"), user_id=user["uuid"])

@@ -5751,7 +5751,9 @@ def add_evaluator_to_annotation_task(task_id: str, evaluator_id: str) -> int:
         existing = cursor.fetchone()
         if existing:
             cursor.execute(
-                "UPDATE annotation_task_evaluators SET deleted_at = NULL WHERE id = ?",
+                "UPDATE annotation_task_evaluators "
+                "SET deleted_at = NULL, created_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
                 (existing["id"],),
             )
             conn.commit()
@@ -6002,6 +6004,31 @@ def soft_delete_annotation_items(task_id: str, item_uuids: List[str]) -> int:
                AND uuid IN ({placeholders})
             """,
             [task_id, *item_uuids],
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def bulk_soft_delete_annotation_jobs(task_id: str, job_uuids: List[str]) -> int:
+    """Soft-delete annotation jobs belonging to `task_id`. UUIDs not in this
+    task, or already deleted, are silently skipped — mirrors
+    `soft_delete_annotation_items`. Returns rows transitioned. The downstream
+    cascade is identical to `soft_delete_annotation_job`: each affected job's
+    annotations stop appearing in every read path that joins
+    `annotation_jobs` with `j.deleted_at IS NULL`."""
+    if not job_uuids:
+        return 0
+    placeholders = ",".join("?" for _ in job_uuids)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE annotation_jobs
+               SET deleted_at = CURRENT_TIMESTAMP
+             WHERE task_id = ? AND deleted_at IS NULL
+               AND uuid IN ({placeholders})
+            """,
+            [task_id, *job_uuids],
         )
         conn.commit()
         return cursor.rowcount
