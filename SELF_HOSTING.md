@@ -498,7 +498,7 @@ GCE defaults to OS Login (Google-identity-based SSH). GitHub Actions can't use t
 
 ```bash
 # On your laptop — generate a dedicated key (don't reuse your personal one)
-ssh-keygen -t ed25519 -f ~/.ssh/calibrate-deploy -C "calibrate-deploy" -N ""
+ssh-keygen -t ed25519 -f ~/.ssh/calibrate_key_name.pub -C "calibrate_key_name" -N ""
 
 # Disable OS Login on the VM (uses metadata-based SSH keys instead)
 gcloud compute instances add-metadata calibrate-backend-prod \
@@ -507,7 +507,7 @@ gcloud compute instances add-metadata calibrate-backend-prod \
 # Add the public key to the instance
 gcloud compute instances add-metadata calibrate-backend-prod \
   --zone=<zone> \
-  --metadata="ssh-keys=ubuntu:$(cat ~/.ssh/calibrate-deploy.pub)"
+  --metadata="ssh-keys=<username_on_instance>:$(cat ~/.ssh/calibrate_key_name.pub)"
 ```
 
 Test from your laptop: `ssh -i ~/.ssh/calibrate-deploy ubuntu@<STATIC_IP>` should log you in.
