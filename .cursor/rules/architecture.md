@@ -250,7 +250,7 @@ The JWT token contains the user's UUID and is validated on every protected endpo
 - `/api-keys` - Create (returns raw key once), list metadata, soft-delete keys (JWT only). Keys authenticate the evaluator invoke endpoint.
 - `/simulations` - Simulation configurations (CRUD + run/status)
 - `/datasets` - Dataset CRUD, item management (add/update/delete items), `eval_count` per dataset (number of linked STT/TTS eval jobs via `json_extract` on jobs `details`)
-- `/users` - User management (read-only)
+- `/users` - **Removed.** There is no users router; user identity comes from the JWT (`get_current_user_id` / `OrgContext`). `db.get_user` / `db.get_all_users` remain as internal DB helpers.
 - `/user-limits` - Per-user limits CRUD + `/me/max-rows-per-eval` query endpoint. Mutating endpoints (`POST`, `PUT`, `DELETE`) require superadmin (`require_superadmin` dependency composes `get_current_user_id` for token validation, then checks JWT email against `SUPERADMIN_EMAIL` env var); read endpoints (`GET`) require only standard JWT auth
 - `/annotators` - Annotator CRUD (human labelers; unique active name per user)
 - `/annotation-tasks` - Annotation task CRUD, items, evaluator links, jobs, public labelling tokens, evaluator-run jobs (`annotation_eval_runner.py`). Evaluator link order on a task follows **`get_evaluators_for_annotation_task()`** (see **Annotation task evaluator ordering** under Database Schema).
@@ -281,11 +281,11 @@ All dataset endpoints require JWT auth. Every DB operation is scoped to the auth
 - `GET /stt/evaluate/{task_id}` - Get STT evaluation status (includes timeout detection)
 - `POST /tts/evaluate` - Start TTS evaluation task
 - `GET /tts/evaluate/{task_id}` - Get TTS evaluation status (includes timeout detection)
-- `POST /agent-tests/agent/{uuid}/run` - Run agent unit tests (optional `test_uuids` in body; if omitted, runs all linked tests)
-- `POST /agent-tests/agent/{uuid}/benchmark` - Run multi-model benchmark (always runs all linked tests; body only requires `models` list)
+- `POST /agent-tests/agent/{uuid}/run` - Run agent unit tests (optional `test_uuids` in body; if omitted, runs all linked tests). **JWT + org-scoped** (`get_current_org`): the agent must belong to the caller's org or it's 404.
+- `POST /agent-tests/agent/{uuid}/benchmark` - Run multi-model benchmark (always runs all linked tests; body only requires `models` list). **JWT + org-scoped**, same 404 rule as run.
 - `GET /agent-tests/agent/{uuid}/runs` - List all test runs for an agent
-- `GET /agent-tests/run/{task_id}` - Get test run status (includes timeout detection)
-- `GET /agent-tests/benchmark/{task_id}` - Get benchmark status (includes timeout detection)
+- `GET /agent-tests/run/{task_id}` - Get test run status (includes timeout detection). **JWT + org-scoped** (run's agent must be in caller's org, else 404). Unauthenticated read of a *completed* run is only via the share token at `GET /public/test-run/{share_token}` after it's made public.
+- `GET /agent-tests/benchmark/{task_id}` - Get benchmark status (includes timeout detection). **JWT + org-scoped**, same rule; public read via `GET /public/benchmark/{share_token}`.
 - `DELETE /agent-tests/job/{job_uuid}` - Delete an agent test job (triggers next queued job)
 
 #### Simulations
@@ -324,7 +324,7 @@ FastAPI's default docs routes are disabled (`docs_url=None`, `redoc_url=None`, `
 #### Utilities
 
 - `GET /` or `HEAD /` - Health check (HEAD supported for uptime monitors)
-- `POST /presigned-url` - Generate S3 presigned URL for uploads
+- `POST /presigned-url` - Generate S3 presigned URL for uploads (**JWT required** — `get_current_user_id`)
 - `GET` or `HEAD /provider-status` - Return the latest cached status for all configured providers. `src/provider_status.py` owns the monitor, cache, `calibrate status` subprocess, and parser for both final-object JSON and newline-delimited progress/result events. A lifespan background task runs the monitor every `PROVIDER_STATUS_REFRESH_INTERVAL_SECONDS` seconds (default 300), with a per-check timeout from `PROVIDER_STATUS_CHECK_TIMEOUT_SECONDS` (default 120). The endpoint itself never runs the CLI; it returns immediately with 200 if cached providers all pass, 503 with failed provider details if one or more providers failed, and 503 if the cache is missing/stale (`PROVIDER_STATUS_CACHE_MAX_AGE_SECONDS`, default 900). This keeps uptime monitors from hitting nginx/proxy request timeouts while still allowing provider failures to trip the monitor.
 
 ---

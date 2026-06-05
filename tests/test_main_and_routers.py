@@ -90,7 +90,17 @@ def test_docs_endpoints_require_basic_auth(client):
 # ---------------------------------------------------------------------------
 
 
+def test_presigned_url_requires_auth(client):
+    # No Authorization header → 403 (HTTPBearer rejects the missing header).
+    resp = client.post(
+        "/presigned-url",
+        json={"task_type": "stt", "content_type": "audio/wav", "extension": "wav"},
+    )
+    assert resp.status_code == 403
+
+
 def test_presigned_url_happy_path(client, monkeypatch):
+    h = _auth(client)["headers"]
     monkeypatch.setenv("S3_OUTPUT_BUCKET", "my-bucket")
     with patch(
         "main.generate_presigned_upload_url",
@@ -99,6 +109,7 @@ def test_presigned_url_happy_path(client, monkeypatch):
         resp = client.post(
             "/presigned-url",
             json={"task_type": "stt", "content_type": "audio/wav", "extension": "wav"},
+            headers=h,
         )
     assert resp.status_code == 200
     body = resp.json()
@@ -107,15 +118,18 @@ def test_presigned_url_happy_path(client, monkeypatch):
 
 
 def test_presigned_url_validation(client, monkeypatch):
+    h = _auth(client)["headers"]
     monkeypatch.setenv("S3_OUTPUT_BUCKET", "my-bucket")
     resp = client.post(
         "/presigned-url",
         json={"task_type": "stt", "content_type": "audio/wav", "extension": ""},
+        headers=h,
     )
     assert resp.status_code == 400
     resp = client.post(
         "/presigned-url",
         json={"task_type": "bogus", "content_type": "x", "extension": "wav"},
+        headers=h,
     )
     # Literal validation fails at the Pydantic layer
     assert resp.status_code == 422
@@ -125,16 +139,19 @@ def test_presigned_url_validation(client, monkeypatch):
     resp = client.post(
         "/presigned-url",
         json={"task_type": "tts", "content_type": "audio/wav", "extension": "wav"},
+        headers=h,
     )
     assert resp.status_code == 500
 
 
 def test_presigned_url_failure(client, monkeypatch):
+    h = _auth(client)["headers"]
     monkeypatch.setenv("S3_OUTPUT_BUCKET", "my-bucket")
     with patch("main.generate_presigned_upload_url", return_value=None):
         resp = client.post(
             "/presigned-url",
             json={"task_type": "stt", "content_type": "audio/wav", "extension": "wav"},
+            headers=h,
         )
     assert resp.status_code == 500
 
@@ -217,13 +234,12 @@ def test_auth_signup_login_and_dup(client):
 # ---------------------------------------------------------------------------
 
 
-def test_users_list_and_get(client):
+def test_users_router_removed(client):
+    # The users router was removed entirely — no list and no per-user lookup.
     auth = _auth(client)
-    assert client.get("/users").status_code == 200
-    me = client.get(f"/users/{auth['user_uuid']}")
-    assert me.status_code == 200
-    missing = client.get("/users/non-existent-uuid")
-    assert missing.status_code == 404
+    h = auth["headers"]
+    assert client.get("/users", headers=h).status_code == 404
+    assert client.get(f"/users/{auth['user_uuid']}", headers=h).status_code == 404
 
 
 # ---------------------------------------------------------------------------

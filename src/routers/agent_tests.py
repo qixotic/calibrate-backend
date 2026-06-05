@@ -1804,7 +1804,11 @@ def run_llm_test_task(
 
 
 @router.post("/agent/{agent_uuid}/run", response_model=TaskCreateResponse)
-async def run_agent_test(agent_uuid: str, request: RunTestRequest):
+async def run_agent_test(
+    agent_uuid: str,
+    request: RunTestRequest,
+    ctx: OrgContext = Depends(get_current_org),
+):
     """
     Run one or more tests for an agent.
 
@@ -1813,9 +1817,9 @@ async def run_agent_test(agent_uuid: str, request: RunTestRequest):
 
     Returns a task ID that can be used to poll for status and results.
     """
-    # Verify agent exists
+    # Verify agent exists and belongs to the caller's org.
     agent = get_agent(agent_uuid)
-    if not agent:
+    if not agent or agent.get("org_uuid") != ctx.org_uuid:
         raise HTTPException(status_code=404, detail="Agent not found")
 
     # Guard: agent connection must be verified before running tests. Every test
@@ -1906,6 +1910,29 @@ async def run_agent_test(agent_uuid: str, request: RunTestRequest):
     return TaskCreateResponse(task_id=job_id, status=initial_status)
 
 
+def _load_owned_agent_test_job(task_id: str, ctx: OrgContext) -> Dict[str, Any]:
+    """Fetch an agent-test job and assert the caller's org owns it.
+
+    Ownership is derived through the job's parent agent (``agent_test_jobs`` has
+    no org column of its own). Returns the job dict on success; raises 404 with
+    the same generic ``"Task not found"`` detail for the missing / cross-org /
+    orphaned cases so existence is never leaked. A soft-deleted agent makes its
+    runs unreadable here (``get_agent`` filters ``deleted_at``), consistent with
+    the org-wide runs list. Used by the run/benchmark status and visibility
+    endpoints — keep the rule in this one place.
+    """
+    job = get_agent_test_job(task_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    agent_id = job.get("agent_id")
+    agent = get_agent(agent_id) if agent_id else None
+    if not agent or agent.get("org_uuid") != ctx.org_uuid:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return job
+
+
 class VisibilityRequest(BaseModel):
     is_public: bool
 
@@ -1922,16 +1949,7 @@ async def update_test_run_visibility(
     ctx: OrgContext = Depends(get_current_org),
 ):
     """Toggle public sharing for an agent test run."""
-    job = get_agent_test_job(task_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    agent_id = job.get("agent_id")
-    if not agent_id:
-        raise HTTPException(status_code=404, detail="Task not found")
-    agent = get_agent(agent_id)
-    if not agent or agent.get("org_uuid") != ctx.org_uuid:
-        raise HTTPException(status_code=404, detail="Task not found")
+    job = _load_owned_agent_test_job(task_id, ctx)
 
     if body.is_public:
         import uuid as _uuid
@@ -1945,15 +1963,20 @@ async def update_test_run_visibility(
 
 
 @router.get("/run/{task_id}", response_model=TestRunStatusResponse)
-async def get_agent_test_run_status(task_id: str):
+async def get_agent_test_run_status(
+    task_id: str,
+    ctx: OrgContext = Depends(get_current_org),
+):
     """
     Get the status of an agent test run.
 
+    Requires a valid JWT and org ownership of the run. Unauthenticated access
+    to a completed run is only possible once it is made public, via the
+    share-token endpoint in the public router.
+
     Returns the current status and, if done, the test results.
     """
-    job = get_agent_test_job(task_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Task not found")
+    job = _load_owned_agent_test_job(task_id, ctx)
 
     status = job["status"]
     results = job.get("results") or {}
@@ -2529,7 +2552,11 @@ def run_benchmark_task(
 
 
 @router.post("/agent/{agent_uuid}/benchmark", response_model=TaskCreateResponse)
-async def run_agent_benchmark(agent_uuid: str, request: BenchmarkRequest):
+async def run_agent_benchmark(
+    agent_uuid: str,
+    request: BenchmarkRequest,
+    ctx: OrgContext = Depends(get_current_org),
+):
     """
     Run a benchmark comparing multiple models on the same tests.
 
@@ -2538,9 +2565,9 @@ async def run_agent_benchmark(agent_uuid: str, request: BenchmarkRequest):
 
     Returns a task ID that can be used to poll for status and results.
     """
-    # Verify agent exists
+    # Verify agent exists and belongs to the caller's org.
     agent = get_agent(agent_uuid)
-    if not agent:
+    if not agent or agent.get("org_uuid") != ctx.org_uuid:
         raise HTTPException(status_code=404, detail="Agent not found")
 
     if not request.models:
@@ -2636,16 +2663,7 @@ async def update_benchmark_visibility(
     ctx: OrgContext = Depends(get_current_org),
 ):
     """Toggle public sharing for a benchmark run."""
-    job = get_agent_test_job(task_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    agent_id = job.get("agent_id")
-    if not agent_id:
-        raise HTTPException(status_code=404, detail="Task not found")
-    agent = get_agent(agent_id)
-    if not agent or agent.get("org_uuid") != ctx.org_uuid:
-        raise HTTPException(status_code=404, detail="Task not found")
+    job = _load_owned_agent_test_job(task_id, ctx)
 
     if body.is_public:
         import uuid as _uuid
@@ -2659,15 +2677,20 @@ async def update_benchmark_visibility(
 
 
 @router.get("/benchmark/{task_id}", response_model=BenchmarkStatusResponse)
-async def get_benchmark_status(task_id: str):
+async def get_benchmark_status(
+    task_id: str,
+    ctx: OrgContext = Depends(get_current_org),
+):
     """
     Get the status of a benchmark run.
 
+    Requires a valid JWT and org ownership of the run. Unauthenticated access
+    to a completed run is only possible once it is made public, via the
+    share-token endpoint in the public router.
+
     Returns the current status and, if done, results for each model and leaderboard.
     """
-    job = get_agent_test_job(task_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Task not found")
+    job = _load_owned_agent_test_job(task_id, ctx)
 
     status = job["status"]
     results = job.get("results") or {}

@@ -244,21 +244,36 @@ def test_run_agent_test_validation(client, monkeypatch):
     auth = _signup(client)
     h = auth["headers"]
 
+    # Unauthenticated → 403 (HTTPBearer rejects the missing header)
+    assert client.post("/agent-tests/agent/missing/run", json={}).status_code == 403
+
     # Missing agent
-    resp = client.post("/agent-tests/agent/missing/run", json={})
+    resp = client.post("/agent-tests/agent/missing/run", json={}, headers=h)
     assert resp.status_code == 404
 
     # Agent with no linked tests
     agent = _create_agent(client, h)
-    no_tests = client.post(f"/agent-tests/agent/{agent['uuid']}/run", json={})
+    no_tests = client.post(
+        f"/agent-tests/agent/{agent['uuid']}/run", json={}, headers=h
+    )
     assert no_tests.status_code == 400
 
     # Provide bogus test_uuids
     bad = client.post(
         f"/agent-tests/agent/{agent['uuid']}/run",
         json={"test_uuids": ["missing"]},
+        headers=h,
     )
     assert bad.status_code == 404
+
+    # Another org's user cannot run tests on this agent → 404 (existence parity)
+    other = _signup(client)
+    cross = client.post(
+        f"/agent-tests/agent/{agent['uuid']}/run",
+        json={},
+        headers=other["headers"],
+    )
+    assert cross.status_code == 404
 
 
 def test_run_agent_test_queued_path(client, monkeypatch):
@@ -275,17 +290,29 @@ def test_run_agent_test_queued_path(client, monkeypatch):
     with patch("routers.agent_tests.can_start_agent_test_job", return_value=False), patch(
         "threading.Thread"
     ):
-        resp = client.post(f"/agent-tests/agent/{agent['uuid']}/run", json={})
+        resp = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/run", json={}, headers=h
+        )
     assert resp.status_code == 200
     task_id = resp.json()["task_id"]
     assert resp.json()["status"] == "queued"
 
-    # Status
-    got = client.get(f"/agent-tests/run/{task_id}")
+    # Status requires auth
+    assert client.get(f"/agent-tests/run/{task_id}").status_code == 403
+    got = client.get(f"/agent-tests/run/{task_id}", headers=h)
     assert got.status_code == 200
 
+    # Another org's user cannot poll this run → 404
+    other_poll = _signup(client)
+    assert (
+        client.get(
+            f"/agent-tests/run/{task_id}", headers=other_poll["headers"]
+        ).status_code
+        == 404
+    )
+
     # 404 unknown run
-    assert client.get("/agent-tests/run/missing").status_code == 404
+    assert client.get("/agent-tests/run/missing", headers=h).status_code == 404
 
     # Visibility toggle
     on = client.patch(
@@ -343,7 +370,9 @@ def test_run_conversation_test_queued_path(client, monkeypatch):
     with patch(
         "routers.agent_tests.can_start_agent_test_job", return_value=False
     ), patch("threading.Thread"):
-        resp = client.post(f"/agent-tests/agent/{agent['uuid']}/run", json={})
+        resp = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/run", json={}, headers=h
+        )
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "queued"
     task_id = resp.json()["task_id"]
@@ -363,7 +392,7 @@ def test_run_conversation_test_queued_path(client, monkeypatch):
     assert conv["uuid"] in details["evaluators_by_test_id"]
 
     # Status endpoint serializes fine for a conversation run.
-    got = client.get(f"/agent-tests/run/{task_id}")
+    got = client.get(f"/agent-tests/run/{task_id}", headers=h)
     assert got.status_code == 200
 
     # Clean up the queued job so it doesn't pollute the shared session DB
@@ -387,6 +416,7 @@ def test_run_mixed_conversation_and_response_allowed(client, monkeypatch):
         resp = client.post(
             f"/agent-tests/agent/{agent['uuid']}/run",
             json={"test_uuids": [response_test["uuid"], conv["uuid"]]},
+            headers=h,
         )
     assert resp.status_code == 200, resp.text
     task_id = resp.json()["task_id"]
@@ -419,6 +449,7 @@ def test_benchmark_allows_conversation_tests(client, monkeypatch):
         resp = client.post(
             f"/agent-tests/agent/{agent['uuid']}/benchmark",
             json={"models": ["openai/gpt-4"]},
+            headers=h,
         )
     assert resp.status_code == 200, resp.text
     task_id = resp.json()["task_id"]
@@ -447,6 +478,7 @@ def test_unverified_connection_blocks_all_test_types(client, monkeypatch):
         blocked = client.post(
             f"/agent-tests/agent/{agent['uuid']}/run",
             json={"test_uuids": [test_uuid]},
+            headers=h,
         )
         assert blocked.status_code == 400, blocked.text
         assert "not verified" in blocked.json()["detail"].lower()
@@ -484,6 +516,7 @@ def test_drifted_config_eval_type_follows_immutable_row_type(client, monkeypatch
         resp = client.post(
             f"/agent-tests/agent/{agent['uuid']}/run",
             json={"test_uuids": [drifted["uuid"]]},
+            headers=h,
         )
     assert resp.status_code == 200, resp.text
     task_id = resp.json()["task_id"]
@@ -507,6 +540,7 @@ def test_run_agent_test_missing_s3_config_500(client, monkeypatch):
         resp = client.post(
             f"/agent-tests/agent/{agent['uuid']}/run",
             json={"test_uuids": [conv["uuid"]]},
+            headers=h,
         )
     assert resp.status_code == 500
 
@@ -514,8 +548,18 @@ def test_run_agent_test_missing_s3_config_500(client, monkeypatch):
 def test_run_agent_benchmark_validation(client):
     auth = _signup(client)
     h = auth["headers"]
+    # Unauthenticated → 403 (HTTPBearer rejects the missing header)
+    assert (
+        client.post(
+            "/agent-tests/agent/missing/benchmark", json={"models": ["x"]}
+        ).status_code
+        == 403
+    )
+
     # Missing agent
-    resp = client.post("/agent-tests/agent/missing/benchmark", json={"models": ["x"]})
+    resp = client.post(
+        "/agent-tests/agent/missing/benchmark", json={"models": ["x"]}, headers=h
+    )
     assert resp.status_code == 404
 
     # No models
@@ -523,6 +567,7 @@ def test_run_agent_benchmark_validation(client):
     bad = client.post(
         f"/agent-tests/agent/{agent['uuid']}/benchmark",
         json={"models": []},
+        headers=h,
     )
     assert bad.status_code == 400
 
@@ -530,6 +575,7 @@ def test_run_agent_benchmark_validation(client):
     no_tests = client.post(
         f"/agent-tests/agent/{agent['uuid']}/benchmark",
         json={"models": ["openai/gpt-4"]},
+        headers=h,
     )
     assert no_tests.status_code == 400
 
@@ -551,16 +597,31 @@ def test_run_agent_benchmark_queued_path(client, monkeypatch):
         resp = client.post(
             f"/agent-tests/agent/{agent['uuid']}/benchmark",
             json={"models": ["openai/gpt-4"]},
+            headers=h,
         )
     assert resp.status_code == 200
     task_id = resp.json()["task_id"]
-    got = client.get(f"/agent-tests/benchmark/{task_id}")
+
+    # Status requires auth
+    assert client.get(f"/agent-tests/benchmark/{task_id}").status_code == 403
+    got = client.get(f"/agent-tests/benchmark/{task_id}", headers=h)
     assert got.status_code == 200
     # `evaluators[]` block is now exposed on the benchmark status response
     # the same way it is on the unit-test status — confirm the field is
     # at least present (may be empty for a queued/never-run job).
     assert "evaluators" in got.json()
-    assert client.get("/agent-tests/benchmark/missing").status_code == 404
+
+    # Another org's user cannot poll this benchmark → 404
+    other_poll = _signup(client)
+    assert (
+        client.get(
+            f"/agent-tests/benchmark/{task_id}", headers=other_poll["headers"]
+        ).status_code
+        == 404
+    )
+    assert (
+        client.get("/agent-tests/benchmark/missing", headers=h).status_code == 404
+    )
 
     # Visibility toggle
     on = client.patch(
@@ -600,6 +661,8 @@ def test_agent_test_inflight(client, monkeypatch):
     with patch("routers.agent_tests.can_start_agent_test_job", return_value=True), patch(
         "routers.agent_tests.threading.Thread"
     ) as thread_mock:
-        resp = client.post(f"/agent-tests/agent/{agent['uuid']}/run", json={})
+        resp = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/run", json={}, headers=h
+        )
         assert resp.status_code == 200
         thread_mock.return_value.start.assert_called_once()

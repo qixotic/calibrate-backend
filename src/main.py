@@ -33,8 +33,8 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 from db import init_db, NameAlreadyExistsError
+from auth_utils import get_current_user_id
 from routers.auth import router as auth_router
-from routers.users import router as users_router
 from routers.agents import router as agents_router
 from routers.tools import router as tools_router
 from routers.agent_tools import router as agent_tools_router
@@ -142,7 +142,6 @@ def custom_openapi(_: HTTPBasicCredentials = Depends(_verify_docs_access)):
 
 # Include routers
 app.include_router(auth_router)
-app.include_router(users_router)
 app.include_router(agents_router)
 app.include_router(tools_router)
 app.include_router(agent_tools_router)
@@ -198,9 +197,14 @@ def read_root():
 
 
 @app.post("/presigned-url", response_model=PresignedURLResponse)
-async def get_presigned_url(request: PresignedURLRequest):
+async def get_presigned_url(
+    request: PresignedURLRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Generate a presigned URL for uploading files to S3.
+
+    Requires a valid JWT.
 
     The file will be stored at: bucket/task_type/media/UUID.extension
 
