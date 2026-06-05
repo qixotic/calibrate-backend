@@ -4,11 +4,13 @@ This module provides JWT token creation/validation for securing API endpoints.
 """
 
 import os
+import secrets
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
+import bcrypt
 from jose import JWTError, jwt
 from fastapi import HTTPException, Depends, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -233,3 +235,100 @@ async def get_optional_user_id(
         return None
 
     return payload.get("sub")
+
+
+# ---------------------------------------------------------------------------
+# API keys (programmatic API access)
+# ---------------------------------------------------------------------------
+#
+# Keys are prefixed `sk_` so they can coexist with JWTs in the same
+# `Authorization: Bearer …` header (JWTs are dotted base64, never start with
+# `sk_`), and are also accepted via the dedicated `X-API-Key` header. The
+# raw key is returned exactly once at creation; the DB keeps only a bcrypt hash
+# plus the first `API_KEY_PREFIX_LEN` chars for candidate lookup.
+
+API_KEY_PREFIX = "sk_"
+API_KEY_PREFIX_LEN = 12  # chars of the raw key stored verbatim for lookup
+_API_KEY_RANDOM_BYTES = 32
+
+# Optional bearer so a missing/!=API-key Authorization header doesn't 401 here
+# — these endpoints fall back to JWT/anonymous handling elsewhere.
+_optional_bearer = HTTPBearer(auto_error=False)
+
+
+def generate_api_key() -> tuple[str, str]:
+    """Return `(raw_key, key_prefix)`. The raw key is shown to the user once."""
+    raw = API_KEY_PREFIX + secrets.token_urlsafe(_API_KEY_RANDOM_BYTES)
+    return raw, raw[:API_KEY_PREFIX_LEN]
+
+
+def hash_api_key(raw_key: str) -> str:
+    """bcrypt-hash a raw API key for storage."""
+    return bcrypt.hashpw(raw_key.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _resolve_api_key(raw_key: str) -> Optional[OrgContext]:
+    """Validate a presented raw key → OrgContext, or None if it doesn't match.
+
+    API keys grant owner-level access within the org they're scoped to (they can
+    do anything their creator could). `last_used_at` is touched on success.
+    """
+    from db import (
+        find_active_api_keys_by_prefix,
+        get_organization,
+        touch_api_key_last_used,
+    )
+
+    prefix = raw_key[:API_KEY_PREFIX_LEN]
+    for row in find_active_api_keys_by_prefix(prefix):
+        if bcrypt.checkpw(raw_key.encode("utf-8"), row["key_hash"].encode("utf-8")):
+            # A revoked org (soft-deleted) invalidates its keys.
+            if get_organization(row["org_uuid"]) is None:
+                return None
+            touch_api_key_last_used(row["uuid"])
+            return OrgContext(
+                user_id=row["owner_user_id"],
+                org_uuid=row["org_uuid"],
+                role="owner",
+            )
+    return None
+
+
+async def get_org_jwt_or_api_key(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_org_uuid: Optional[str] = Header(default=None, alias="X-Org-UUID"),
+) -> OrgContext:
+    """Resolve an OrgContext from EITHER an `sk_` API key OR a JWT.
+
+    Lets a single endpoint serve both the frontend (JWT, optionally with an
+    `X-Org-UUID`) and programmatic clients (an API key via `X-API-Key` or an
+    `sk_`-prefixed bearer). The API key wins when present. Raises 401 if neither path yields a
+    valid context — i.e. this is a *required*-auth dependency; unlike the
+    JWT-only `get_current_org`, it just additionally accepts keys.
+    """
+    raw_key: Optional[str] = None
+    if x_api_key and x_api_key.strip():
+        raw_key = x_api_key.strip()
+    elif credentials and credentials.credentials.startswith(API_KEY_PREFIX):
+        raw_key = credentials.credentials.strip()
+
+    if raw_key:
+        ctx = _resolve_api_key(raw_key)
+        if ctx is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or revoked API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return ctx
+
+    # No credentials at all → 403, matching FastAPI's HTTPBearer(auto_error=True)
+    # default used by get_current_org elsewhere (a present-but-bad JWT 401s below).
+    if credentials is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await get_current_org(credentials=credentials, x_org_uuid=x_org_uuid)

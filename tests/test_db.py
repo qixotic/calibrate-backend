@@ -73,6 +73,43 @@ def test_simulation_to_conversation_migration():
     assert task_type == "conversation"
 
 
+def test_legacy_api_keys_table_is_dropped_and_recreated():
+    """init_db() drops a legacy user-scoped `api_keys` table (the abandoned
+    `user_id` shape, no `org_uuid`) and recreates the current org-scoped one,
+    since `CREATE TABLE IF NOT EXISTS` can't reshape an existing table."""
+    with db.get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS api_keys")
+        cur.execute(
+            """
+            CREATE TABLE api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                user_id TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                key_prefix TEXT NOT NULL,
+                name TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "INSERT INTO api_keys (uuid, user_id, key_hash, key_prefix, name) "
+            "VALUES (?, 'u1', 'h', 'sk_abc', 'legacy')",
+            (_uuid.uuid4().hex,),
+        )
+        conn.commit()
+
+    db.init_db()  # idempotent — runs the api_keys reshape migration
+
+    with db.get_db_connection() as conn:
+        cur = conn.cursor()
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(api_keys)").fetchall()}
+        rows = cur.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
+    assert "org_uuid" in cols and "key_last_four" in cols
+    assert "user_id" not in cols
+    assert rows == 0  # legacy row dropped with the table
+
+
 def test_is_name_taken_whitelist_only():
     with pytest.raises(ValueError):
         db.is_name_taken("not_a_table", "n", "u")

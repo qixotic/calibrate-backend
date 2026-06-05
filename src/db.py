@@ -297,6 +297,52 @@ def init_db():
             "ON organization_members(org_uuid) WHERE deleted_at IS NULL AND role = 'owner'"
         )
 
+        # API keys for programmatic API access. The raw key (`sk_…`)
+        # is shown exactly once at creation; we persist only a bcrypt `key_hash`
+        # plus the first-12-char `key_prefix` for cheap candidate lookup. A key
+        # is scoped to one org and carries its creator for audit; revoke = soft
+        # delete. `last_used_at` is best-effort touched on each successful auth.
+        #
+        # Migration: an earlier, abandoned `api_keys` schema was user-scoped
+        # (`user_id` column, no `org_uuid`). `CREATE TABLE IF NOT EXISTS` won't
+        # reshape an existing table, so if we detect a legacy column drop the
+        # table outright and let the CREATE below recreate the org-scoped shape.
+        # Safe because that schema was never wired to a working endpoint; the
+        # check is idempotent (no-op once the table is on the new shape, and the
+        # DROP also removes the legacy index).
+        existing_api_key_cols = {
+            row[1] for row in cursor.execute("PRAGMA table_info(api_keys)").fetchall()
+        }
+        if "user_id" in existing_api_key_cols or (
+            existing_api_key_cols and "org_uuid" not in existing_api_key_cols
+        ):
+            cursor.execute("DROP TABLE api_keys")
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                org_uuid TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                key_prefix TEXT NOT NULL,
+                key_last_four TEXT NOT NULL DEFAULT '',
+                key_hash TEXT NOT NULL,
+                last_used_at TIMESTAMP DEFAULT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                FOREIGN KEY (org_uuid) REFERENCES organizations(uuid),
+                FOREIGN KEY (owner_user_id) REFERENCES users(uuid)
+            )
+        """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_keys_prefix "
+            "ON api_keys(key_prefix) WHERE deleted_at IS NULL"
+        )
+
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS agents (
@@ -2627,6 +2673,122 @@ def get_member_role(org_uuid: str, user_id: str) -> Optional[str]:
         )
         row = cursor.fetchone()
         return row["role"] if row else None
+
+
+def create_api_key(
+    org_uuid: str,
+    owner_user_id: str,
+    name: str,
+    key_prefix: str,
+    key_last_four: str,
+    key_hash: str,
+) -> Dict[str, Any]:
+    """Insert an API key row and return it (without the hash)."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("api key name required")
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        key_uuid = str(uuid.uuid4())
+        cursor.execute(
+            """
+            INSERT INTO api_keys
+                (uuid, org_uuid, owner_user_id, name, key_prefix, key_last_four, key_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (key_uuid, org_uuid, owner_user_id, name, key_prefix, key_last_four, key_hash),
+        )
+        conn.commit()
+        cursor.execute(
+            "SELECT * FROM api_keys WHERE uuid = ?",
+            (key_uuid,),
+        )
+        return _parse_api_key_row(cursor.fetchone())
+
+
+def _parse_api_key_row(row) -> Optional[Dict[str, Any]]:
+    """Row → dict with the secret `key_hash` stripped (never leaves the DB layer
+    except via `find_active_api_keys_by_prefix`, which needs it to verify)."""
+    if row is None:
+        return None
+    d = dict(row)
+    d.pop("key_hash", None)
+    return d
+
+
+def list_api_keys_for_org(org_uuid: str) -> List[Dict[str, Any]]:
+    """Active (non-revoked) API keys for an org, newest first, no hashes."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM api_keys
+             WHERE org_uuid = ? AND deleted_at IS NULL
+             ORDER BY created_at DESC, id DESC
+            """,
+            (org_uuid,),
+        )
+        return [_parse_api_key_row(r) for r in cursor.fetchall()]
+
+
+def get_api_key(uuid_: str, org_uuid: str) -> Optional[Dict[str, Any]]:
+    """Fetch one active API key scoped to an org (no hash)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM api_keys
+             WHERE uuid = ? AND org_uuid = ? AND deleted_at IS NULL
+            """,
+            (uuid_, org_uuid),
+        )
+        return _parse_api_key_row(cursor.fetchone())
+
+
+def soft_delete_api_key(uuid_: str, org_uuid: str) -> bool:
+    """Revoke an API key. Returns False if it doesn't exist / already revoked."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE api_keys
+               SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE uuid = ? AND org_uuid = ? AND deleted_at IS NULL
+            """,
+            (uuid_, org_uuid),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def find_active_api_keys_by_prefix(key_prefix: str) -> List[Dict[str, Any]]:
+    """Return active key rows (INCLUDING `key_hash`) matching a prefix.
+
+    Used only by the auth layer to bcrypt-verify a presented raw key. Normally
+    one row; the prefix is not unique by construction so callers must verify
+    the hash before trusting any match.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM api_keys
+             WHERE key_prefix = ? AND deleted_at IS NULL
+            """,
+            (key_prefix,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def touch_api_key_last_used(uuid_: str) -> None:
+    """Best-effort stamp of `last_used_at` on a successful auth."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE uuid = ?",
+            (uuid_,),
+        )
+        conn.commit()
 
 
 def list_organization_members(org_uuid: str) -> List[Dict[str, Any]]:

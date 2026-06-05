@@ -39,7 +39,7 @@ from db import (
     delete_agent_test_job,
 )
 from llm_judge import build_test_evaluators_payload, evaluator_value_name
-from auth_utils import get_current_org, OrgContext
+from auth_utils import get_current_org, get_org_jwt_or_api_key, OrgContext
 from utils import (
     TaskStatus,
     TaskCreateResponse,
@@ -1807,7 +1807,7 @@ def run_llm_test_task(
 async def run_agent_test(
     agent_uuid: str,
     request: RunTestRequest,
-    ctx: OrgContext = Depends(get_current_org),
+    ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
     """
     Run one or more tests for an agent.
@@ -1816,6 +1816,9 @@ async def run_agent_test(
     with the agent's config and the combined test cases from all specified tests.
 
     Returns a task ID that can be used to poll for status and results.
+
+    Auth: requires either a JWT (frontend) or an `sk_` API key. The agent
+    must belong to the caller's org or this 404s.
     """
     # Verify agent exists and belongs to the caller's org.
     agent = get_agent(agent_uuid)
@@ -1965,14 +1968,15 @@ async def update_test_run_visibility(
 @router.get("/run/{task_id}", response_model=TestRunStatusResponse)
 async def get_agent_test_run_status(
     task_id: str,
-    ctx: OrgContext = Depends(get_current_org),
+    ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
     """
     Get the status of an agent test run.
 
-    Requires a valid JWT and org ownership of the run. Unauthenticated access
-    to a completed run is only possible once it is made public, via the
-    share-token endpoint in the public router.
+    Requires either a JWT (frontend) or an `sk_` API key, plus org
+    ownership of the run. Unauthenticated access to a completed run is only
+    possible once it is made public, via the share-token endpoint in the public
+    router.
 
     Returns the current status and, if done, the test results.
     """
