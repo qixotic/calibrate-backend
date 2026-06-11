@@ -454,8 +454,10 @@ def test_build_calibrate_config_includes_conversation_tests():
     assert case["evaluation"]["type"] == "conversation"
     assert case["evaluation"]["criteria"]
     assert case["evaluation"]["criteria"][0]["name"] in ev_names
-    # Snapshot is built for the read path.
+    # Snapshot is built for the read path, and pins the live-at-run-time
+    # evaluator version number (a fresh evaluator is on version 1).
     assert test_uuid in evaluators_by_test_id
+    assert evaluators_by_test_id[test_uuid][0]["version_number"] == 1
 
 
 def test_conversation_test_no_legacy_llm_evaluator_fallback():

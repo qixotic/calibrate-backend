@@ -696,6 +696,9 @@ def _build_calibrate_config(
             run actually used even if the link is later edited).
           - ``scale_min`` / ``scale_max`` — present only for ``rating``, derived
             from the pinned evaluator-version ``output_config.scale``.
+          - ``version_number`` — the live-at-run-time evaluator version number,
+            frozen so the finished run keeps displaying the version it judged
+            against even after the evaluator is edited again.
 
         Tests without linked evaluators (e.g. tool_call tests) are absent from
         this dict.
@@ -812,6 +815,11 @@ def _build_calibrate_config(
                 "name": refs[i].get("name", ""),
                 "output_type": output_type,
                 "variable_values": ev.get("variable_values") or {},
+                # Pin the version that actually ran (LLM tests resolve LIVE, so
+                # this is the live-at-run-time number — frozen here so the
+                # finished run keeps showing the version it judged against even
+                # after the evaluator is edited again).
+                "version_number": ev.get("version_number"),
             }
             # Snapshot the live-at-run-time version's rubric so `value_name` can
             # be resolved at read time without re-reading the version row (which
@@ -1077,8 +1085,9 @@ def _build_evaluators_block_for_test_run(
 ) -> List[Dict[str, Any]]:
     """Build the top-level `evaluators[]` block for an agent-test / benchmark
     response: one entry per unique evaluator UUID, carrying the
-    `name`/`description`/`output_type`/`output_config`/scale bounds that
-    would otherwise be duplicated across every judge_results row.
+    `name`/`description`/`output_type`/`output_config`/scale bounds/
+    `version_number` that would otherwise be duplicated across every
+    judge_results row.
 
     Sources, in order of preference:
       1. `evaluators_by_test_id` snapshot — fixed at submission time, so
@@ -1154,6 +1163,9 @@ def _build_evaluators_block_for_test_run(
                 "output_config": output_config,
                 "scale_min": snap.get("scale_min"),
                 "scale_max": snap.get("scale_max"),
+                # Version the run executed against (snapshot only — None for
+                # legacy runs whose snapshot predates this field).
+                "version_number": snap.get("version_number"),
             }
         )
     return block

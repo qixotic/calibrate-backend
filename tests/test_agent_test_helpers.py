@@ -393,6 +393,7 @@ def test_build_evaluators_block_for_test_run_dedupes_and_enriches():
                 "output_type": "rating",
                 "scale_min": 1,
                 "scale_max": 5,
+                "version_number": 3,
                 "output_config": {
                     "scale": [{"value": 5, "name": "Great"}]
                 },
@@ -426,6 +427,9 @@ def test_build_evaluators_block_for_test_run_dedupes_and_enriches():
     assert by_uuid["ev-1"]["output_config"]["scale"][0]["name"] == "Safe"
     assert by_uuid["ev-2"]["scale_min"] == 1
     assert by_uuid["ev-2"]["scale_max"] == 5
+    # version_number surfaces from the snapshot; absent ⇒ None.
+    assert by_uuid["ev-2"]["version_number"] == 3
+    assert by_uuid["ev-1"]["version_number"] is None
 
 
 def test_build_evaluators_block_for_test_run_default_output_config():
