@@ -1485,6 +1485,32 @@ DEFAULT_PROMPTS_BY_PURPOSE: Dict[str, Dict[str, Any]] = {
         "output_config": _BINARY_CONFIG,
         "variables": [],
     },
+    # `purpose=llm-general` is the non-conversational counterpart of `llm`: it
+    # judges a standalone input -> output pair (no conversation framing), for
+    # generic LLM use cases. Like `llm` it uses a literal
+    # `<ENTER EVALUATION CRITERIA HERE>` placeholder for the create-evaluator
+    # form; the seeded `default-llm-general` evaluator carries a real
+    # `{{criteria}}` variable so per-item criteria flow into calibrate.
+    "llm-general": {
+        "name": "Output correctness",
+        "system_prompt": (
+            "You are a highly accurate evaluator assessing the output produced for "
+            "a task.\n\n"
+            "You will be given the task input and the output "
+            "produced for it. Judge the output on its own merits — do not assume the "
+            "input is a conversation or that the output is a reply to a user.\n\n"
+            "Mark `match` true only if the output satisfies the following criteria, "
+            "and false otherwise:\n\n"
+            "<ENTER EVALUATION CRITERIA HERE>"
+        ),
+        "judge_model": DEFAULT_TEXT_JUDGE_MODEL,
+        "evaluator_type": "llm-general",
+        "data_type": "text",
+        "kind": "single",
+        "output_type": "binary",
+        "output_config": _BINARY_CONFIG,
+        "variables": [],
+    },
     "stt": {
         "name": "Semantic match",
         "system_prompt": (
@@ -1681,8 +1707,47 @@ _LLM_NEXT_REPLY_SEED = {
 }
 
 
+# Seed for `default-llm-general`: the non-conversational LLM judge. Like
+# `_LLM_NEXT_REPLY_SEED` it carries a real `{{criteria}}` variable so the
+# annotation eval-run flow (and any per-item criteria) substitutes via calibrate
+# `arguments`. Differs from next-reply in its non-conversational input -> output
+# framing (see DEFAULT_PROMPTS_BY_PURPOSE['llm-general']).
+_LLM_GENERAL_SEED_SYSTEM_PROMPT = (
+    "You are a highly accurate evaluator assessing the output produced for "
+    "a task.\n\n"
+    "You will be given the task input and the output "
+    "produced for it. Judge the output on its own merits — do not assume the "
+    "input is a conversation or that the output is a reply to a user.\n\n"
+    "Mark `match` true only if the output satisfies the following criteria, "
+    "and false otherwise:\n\n{{criteria}}"
+)
+
+_LLM_GENERAL_SEED = {
+    "slug": "default-llm-general",
+    "name": DEFAULT_PROMPTS_BY_PURPOSE["llm-general"]["name"],
+    "description": "Checks whether a model's output matches the user-defined criteria for a given input",
+    "evaluator_type": DEFAULT_PROMPTS_BY_PURPOSE["llm-general"]["evaluator_type"],
+    "data_type": DEFAULT_PROMPTS_BY_PURPOSE["llm-general"]["data_type"],
+    "kind": DEFAULT_PROMPTS_BY_PURPOSE["llm-general"]["kind"],
+    "output_type": DEFAULT_PROMPTS_BY_PURPOSE["llm-general"]["output_type"],
+    "version": {
+        "judge_model": DEFAULT_PROMPTS_BY_PURPOSE["llm-general"]["judge_model"],
+        "output_config": DEFAULT_PROMPTS_BY_PURPOSE["llm-general"]["output_config"],
+        "variables": [
+            {
+                "name": "criteria",
+                "description": "Criteria that the model's output should satisfy",
+                "default": "",
+            }
+        ],
+        "system_prompt": _LLM_GENERAL_SEED_SYSTEM_PROMPT,
+    },
+}
+
+
 DEFAULT_EVALUATORS_SEED = [
     _LLM_NEXT_REPLY_SEED,
+    _LLM_GENERAL_SEED,
     _seed_from_purpose(
         "default-stt-transcription",
         "Judges whether the transcription preserves the meaning of the reference texts",
@@ -3875,7 +3940,7 @@ def _validate_output(output_type: str, output_config: Optional[Dict[str, Any]]) 
         raise ValueError("output_config.scale must be a list")
 
 
-VALID_EVALUATOR_TYPES = ("tts", "stt", "llm", "conversation")
+VALID_EVALUATOR_TYPES = ("tts", "stt", "llm", "llm-general", "conversation")
 VALID_DATA_TYPES = ("text", "audio")
 
 
@@ -6328,7 +6393,7 @@ def _parse_annotation_task_row(row: sqlite3.Row) -> Dict[str, Any]:
     return dict(row)
 
 
-ANNOTATION_TASK_TYPES = ("llm", "stt", "tts", "conversation")
+ANNOTATION_TASK_TYPES = ("llm", "llm-general", "stt", "tts", "conversation")
 
 
 def create_annotation_task(

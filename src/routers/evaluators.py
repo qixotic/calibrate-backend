@@ -76,7 +76,7 @@ class EvaluatorVersionCreateRequest(EvaluatorVersionCreate):
     make_live: bool = False
 
 
-EvaluatorTypeLiteral = Literal["tts", "stt", "llm", "conversation"]
+EvaluatorTypeLiteral = Literal["tts", "stt", "llm", "llm-general", "conversation"]
 DataTypeLiteral = Literal["text", "audio"]
 
 
@@ -318,7 +318,7 @@ class DefaultPromptResponse(BaseModel):
     create-evaluator form. The `name` field is null for `purpose=conversation` because there's
     no seeded conversation evaluator — the prompt is just a template."""
 
-    purpose: Literal["llm", "stt", "tts", "conversation"]
+    purpose: Literal["llm", "llm-general", "stt", "tts", "conversation"]
     name: Optional[str] = None
     system_prompt: str
     judge_model: str
@@ -332,7 +332,7 @@ class DefaultPromptResponse(BaseModel):
 
 @router.get("/default-prompt", response_model=DefaultPromptResponse)
 async def get_default_prompt(
-    purpose: Literal["llm", "stt", "tts", "conversation"],
+    purpose: Literal["llm", "llm-general", "stt", "tts", "conversation"],
     _user_id: str = Depends(get_current_user_id),
 ):
     """Return the canonical default prompt + suggested config for a given purpose.

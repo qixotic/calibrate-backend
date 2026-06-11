@@ -511,6 +511,17 @@ def test_evaluators_list_and_default_prompt(client):
     assert prompt.status_code == 200
     assert "system_prompt" in prompt.json()
 
+    # Non-conversational LLM judge purpose.
+    general = client.get(
+        "/evaluators/default-prompt", params={"purpose": "llm-general"}, headers=h
+    )
+    assert general.status_code == 200
+    assert general.json()["evaluator_type"] == "llm-general"
+    assert general.json()["data_type"] == "text"
+
+    # The seeded default-llm-general evaluator should be visible in the list.
+    assert any(e.get("slug") == "default-llm-general" for e in listing.json())
+
     bad = client.get(
         "/evaluators/default-prompt", params={"purpose": "bogus"}, headers=h
     )

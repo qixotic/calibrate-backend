@@ -97,6 +97,18 @@ def test_public_evaluators_defaults_token_validation(client):
     )
     assert filtered.status_code == 200
 
+    # `llm-general` is an accepted filter value and returns the seeded
+    # default-llm-general evaluator.
+    general = client.get(
+        "/public/evaluators/defaults",
+        params={"share_token": token, "types": "llm-general"},
+    )
+    assert general.status_code == 200
+    general_body = general.json()
+    assert general_body
+    assert all(e["evaluator_type"] == "llm-general" for e in general_body)
+    assert any(e["name"] == "Output correctness" for e in general_body)
+
     # Invalid types value → 400
     bad = client.get(
         "/public/evaluators/defaults",

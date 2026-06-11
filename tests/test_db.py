@@ -37,6 +37,35 @@ def test_init_db_is_idempotent():
     db.init_db()
 
 
+def test_llm_general_seed_and_vocabulary(user):
+    """`llm-general` is a first-class type across all three axes: the
+    default-prompt purpose, the seeded evaluator, and the annotation-task
+    type allowlist."""
+    assert "llm-general" in db.ANNOTATION_TASK_TYPES
+    purpose = db.DEFAULT_PROMPTS_BY_PURPOSE["llm-general"]
+    assert purpose["evaluator_type"] == "llm-general"
+    assert purpose["data_type"] == "text"
+
+    db.init_db()  # idempotent — seeds default-llm-general
+    seeded = db.get_evaluator_by_slug("default-llm-general")
+    assert seeded is not None
+    assert seeded["evaluator_type"] == "llm-general"
+    assert seeded["data_type"] == "text"
+    # Carries a real {{criteria}} variable so per-item criteria substitute.
+    version = db.get_evaluator_version(seeded["live_version_id"])
+    assert any(v["name"] == "criteria" for v in (version["variables"] or []))
+
+    # `llm-general` is an accepted custom evaluator_type, not just a seed slug.
+    assert "llm-general" in db.VALID_EVALUATOR_TYPES
+    ev_uuid = db.create_evaluator(
+        name=_u("custom-llm-general"),
+        evaluator_type="llm-general",
+        owner_user_id=user["uuid"],
+        org_uuid=user["org_uuid"],
+    )
+    assert db.get_evaluator(ev_uuid)["evaluator_type"] == "llm-general"
+
+
 def test_simulation_to_conversation_migration():
     """init_db() converts the legacy `simulation` value to `conversation` for
     both `evaluators.evaluator_type` and `annotation_tasks.type`. Rows are

@@ -419,8 +419,8 @@ class AnnotationItemPayload(BaseModel):
     # `payload` is a free-form JSON value whose shape is owned by the
     # task `type`. The backend doesn't validate the shape — frontend +
     # downstream consumers (evaluator runs, agreement, etc.) interpret it.
-    # For stt/llm/conversation tasks `payload["name"]` is required and must
-    # be unique within the task.
+    # For all task types `payload["name"]` is required and must be unique
+    # within the task.
     payload: Any
     # Optional human annotations to seed alongside the item. Keys are
     # evaluator UUIDs that must be currently linked to the task; values
@@ -533,8 +533,8 @@ async def bulk_create_items(
     annotator covering every newly-inserted item. Annotations are upserted
     as if the annotator had submitted them through the public form.
     Annotations are validated against the task's *currently linked*
-    evaluator set; the task type (`stt | llm | conversation | tts`) does
-    not affect the contract. Value shape is uniform across output types:
+    evaluator set; the task type (`stt | llm | llm-general | conversation |
+    tts`) does not affect the contract. Value shape is uniform across output types:
     `{"value": <bool|number|string>, "reasoning"?: str}` — binary uses a
     bool, rating uses a number. This matches what the public form writes
     via `upsert_annotation`, and is the only shape `annotation_metrics`
@@ -1283,8 +1283,8 @@ async def start_evaluator_run(
     calibrate CLI's `--eval-only` mode. Poll
     `GET /evaluator-runs/{job_uuid}` for status.
 
-    Supported task types: `stt`, `llm`, `simulation`. (Voice simulations and
-    TTS are not supported in eval-only mode.)"""
+    Supported task types: `stt`, `llm`, `llm-general`, `conversation`. (Voice
+    simulations and TTS are not supported in eval-only mode.)"""
     task = _ensure_owned_task(task_uuid, ctx.org_uuid)
     if task.get("type") not in SUPPORTED_EVAL_TASK_TYPES:
         raise HTTPException(

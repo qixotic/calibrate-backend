@@ -1751,6 +1751,42 @@ def test_evaluator_runs_endpoints(client, monkeypatch):
     )
 
 
+def test_annotation_eval_llm_general_payload_validation(client):
+    """An `llm-general` task is eval-supported; a run with the wrong payload
+    shape 400s synchronously via `_build_llm_general_dataset` (confirming the
+    dispatch wiring) instead of failing async."""
+    auth = _signup(client)
+    h = auth["headers"]
+    llm_ev = _llm_evaluator(client, h)
+    task_uuid = client.post(
+        "/annotation-tasks",
+        json={
+            "name": f"t-{uuid.uuid4().hex[:6]}",
+            "type": "llm-general",
+            "evaluator_ids": [llm_ev["uuid"]],
+        },
+        headers=h,
+    ).json()["uuid"]
+    assert task_uuid
+
+    # Item lacks `input`/`output` → dataset build fails → 400 (not a 5xx async).
+    client.post(
+        f"/annotation-tasks/{task_uuid}/items",
+        json={"items": [{"payload": {"name": "i1"}}]},
+        headers=h,
+    )
+    resp = client.post(
+        f"/annotation-tasks/{task_uuid}/evaluator-runs",
+        json={
+            "evaluators": [{"evaluator_id": llm_ev["uuid"]}],
+            "select_all": True,
+        },
+        headers=h,
+    )
+    assert resp.status_code == 400
+    assert "input" in resp.json()["detail"]
+
+
 def test_annotation_eval_unsupported_task_type(client):
     auth = _signup(client)
     h = auth["headers"]
