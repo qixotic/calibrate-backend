@@ -4,6 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workflow
 
+- **Before any change or new feature, do this first — every time.** Whenever you're asked to make a change, add a feature, or modify anything:
+  1. **Review the existing code thoroughly** for code/functionality that already does (or partly does) what's being asked — don't build on an empty assumption.
+  2. **Make a plan** that splits the work into independent subtasks, to be executed in parallel by multiple weaker agents wherever the subtasks are disjoint (see the `parallelize` skill).
+  3. **Identify code to reuse or repackage** into shared, reusable functions to support what needs to be built, rather than duplicating logic.
+  4. **Prefer well-known, reliable libraries** over re-implementing functionality that already exists in one — unless the requirements genuinely demand a custom solution.
+  5. **Share the plan and ask** about any choices that need to be made, laying out the tradeoffs, instead of making assumptions on the user's behalf.
 - **Commit when the work is done — don't wait to be asked.** Once all the required changes for a task are made and the scoped tests pass, create the commit yourself. Use a focused message that explains the *why*. Do not push unless explicitly asked. The standard safety rules still apply: never amend published commits, never skip hooks, never `git add -A` blindly, never commit secrets.
 - **Keep CLAUDE.md in sync with the app's mental model.** After making changes, ask yourself: does this commit shift a *high-level* understanding of the app — a load-bearing invariant, an architectural rule, a convention, a non-obvious gotcha, a new subsystem, or a contract between components? If yes, update CLAUDE.md in the **same commit** so future Claude sessions inherit the new mental model. Don't record routine fixes, file moves, renames, or anything obvious from reading the code — only changes a fresh reader would otherwise miss. When in doubt, prefer updating an existing bullet over adding a new one.
 
