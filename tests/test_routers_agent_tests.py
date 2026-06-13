@@ -222,7 +222,7 @@ def test_agent_runs_list_surfaces_perf_aggregates(client):
             "total_tests": 1,
             "passed": 1,
             "failed": 0,
-            "latency_ms": {"mean": 1851.0, "min": 1851.0, "max": 1851.0, "count": 1},
+            "latency_ms": {"p50": 1851.0, "p95": 1851.0, "p99": 1851.0, "count": 1},
             "cost": {"mean": 0.0248, "min": 0.0248, "max": 0.0248, "count": 1},
             "total_tokens": {"mean": 4378.0, "min": 4369, "max": 4387, "count": 2},
             "test_results": [
@@ -241,7 +241,7 @@ def test_agent_runs_list_surfaces_perf_aggregates(client):
     resp = client.get(f"/agent-tests/agent/{agent['uuid']}/runs")
     assert resp.status_code == 200
     run = resp.json()["runs"][0]
-    assert run["latency_ms"] == {"mean": 1851.0, "min": 1851.0, "max": 1851.0, "count": 1}
+    assert run["latency_ms"] == {"p50": 1851.0, "p95": 1851.0, "p99": 1851.0, "count": 1}
     assert run["cost"]["mean"] == 0.0248
     assert run["total_tokens"] == {"mean": 4378.0, "min": 4369, "max": 4387, "count": 2}
     assert run["results"][0]["latency_ms"] == 1851.0

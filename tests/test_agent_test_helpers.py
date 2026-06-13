@@ -122,10 +122,10 @@ def test_perf_aggregate_means_accept_floats():
         task_id="t",
         status="done",
         total_tokens={"mean": 4378.5, "min": 4369, "max": 4387, "count": 2},
-        latency_ms={"mean": 1955.7, "min": 1851.0, "max": 2060.4, "count": 2},
+        latency_ms={"p50": 1955.7, "p95": 2050.0, "p99": 2060.4, "count": 2},
     )
     assert resp.total_tokens["mean"] == 4378.5
-    assert resp.latency_ms["mean"] == 1955.7
+    assert resp.latency_ms["p50"] == 1955.7
 
     mr = ModelResult(
         model="m", message="ok",
@@ -628,7 +628,7 @@ def test_update_agent_test_intermediate_results_stores_perf_aggregates(tmp_path)
             {
                 "total": 1,
                 "passed": 1,
-                "latency_ms": {"mean": 842, "min": 842, "max": 842, "count": 1},
+                "latency_ms": {"p50": 842, "p95": 842, "p99": 842, "count": 1},
                 "cost": {"mean": 0.000942, "min": 0.000942, "max": 0.000942, "count": 1},
                 # Fractional mean: per-run tokens are ints but the aggregate mean
                 # can be a float — it must round-trip, not be coerced to int.
@@ -640,7 +640,7 @@ def test_update_agent_test_intermediate_results_stores_perf_aggregates(tmp_path)
     _update_agent_test_intermediate_results(job_id, tmp_path, ["T1"])
 
     results = get_agent_test_job(job_id)["results"]
-    assert results["latency_ms"] == {"mean": 842, "min": 842, "max": 842, "count": 1}
+    assert results["latency_ms"] == {"p50": 842, "p95": 842, "p99": 842, "count": 1}
     assert results["cost"]["mean"] == 0.000942
     assert results["total_tokens"] == {"mean": 4378.0, "min": 4369, "max": 4387, "count": 2}
     assert results["test_results"][0]["latency_ms"] == 842

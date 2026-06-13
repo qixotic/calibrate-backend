@@ -290,8 +290,9 @@ class TestRunStatusResponse(BaseModel):
     total_tests: Optional[int] = None
     passed: Optional[int] = None
     failed: Optional[int] = None
-    # Aggregated response-generation latency across cases: {mean, min, max, count}
-    # (millisecond ints). Omitted by calibrate for eval-only runs, so None then.
+    # Aggregated response-generation latency across cases: {p50, p95, p99, count}
+    # (millisecond values; p50 is the closest equivalent to the old `mean`).
+    # Omitted by calibrate for eval-only runs, so None then.
     latency_ms: Optional[Dict[str, Any]] = None
     # Aggregated cost across cases: {mean, min, max, count} (USD floats). Omitted
     # by calibrate when no case reported a cost (e.g. openai provider), so None.
@@ -2246,11 +2247,13 @@ class ModelResult(BaseModel):
     failed: Optional[int] = None
     evaluator_summary: Optional[List[Dict[str, Any]]] = None
     test_results: Optional[List[Dict[str, Any]]] = None
-    # Aggregated latency/cost/total_tokens for this model: {mean, min, max, count}.
-    # Values are `Any` — don't assume int: even total_tokens (per-run an int) has a
-    # fractional `mean`, and latency/cost are floats. Lets the frontend compare
-    # models on latency, cost, and token usage. None when calibrate omits it
-    # (eval-only / openai provider) or before this model's metrics are ready.
+    # Aggregated metrics for this model. latency_ms is {p50, p95, p99, count}
+    # (calibrate switched latency to percentiles; p50 ≈ the old mean); cost and
+    # total_tokens stay {mean, min, max, count}. Values are `Any` — don't assume
+    # int: even total_tokens (per-run an int) has a fractional `mean`, and
+    # latency/cost are floats. Lets the frontend compare models on latency, cost,
+    # and token usage. None when calibrate omits it (eval-only / openai provider)
+    # or before this model's metrics are ready.
     latency_ms: Optional[Dict[str, Any]] = None
     cost: Optional[Dict[str, Any]] = None
     total_tokens: Optional[Dict[str, Any]] = None
