@@ -59,6 +59,10 @@ git config core.hooksPath .githooks
 
 Every contributor needs to run it once.
 
+### Local database
+
+For local development, [TablePlus](https://tableplus.com/) is a handy GUI for opening and inspecting the SQLite database.
+
 ### Running tests
 
 From the **repository root** (not `src/`):
