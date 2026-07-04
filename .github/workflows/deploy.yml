@@ -8,72 +8,11 @@ permissions:
   contents: read
 
 jobs:
-  detect-code-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      run_tests: ${{ steps.changes.outputs.run_tests }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check release diff for code changes
-        id: changes
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_TAG: ${{ github.event.release.tag_name }}
-          CURRENT_PUBLISHED_AT: ${{ github.event.release.published_at }}
-        run: |
-          set -euo pipefail
-
-          previous_tag="$(
-            gh release list \
-              --exclude-drafts \
-              --limit 100 \
-              --json tagName,publishedAt \
-              --jq 'sort_by(.publishedAt) | reverse | first(select(.tagName != env.CURRENT_TAG and .publishedAt < env.CURRENT_PUBLISHED_AT)) | .tagName // empty'
-          )"
-
-          if [ -z "$previous_tag" ]; then
-            echo "No previous release found; running tests."
-            echo "run_tests=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Comparing release tags: $previous_tag..$CURRENT_TAG"
-          git fetch --force --tags
-          changed_files="$(git diff --name-only "$previous_tag" "$CURRENT_TAG")"
-
-          if [ -z "$changed_files" ]; then
-            echo "No files changed since previous release; skipping tests."
-            echo "run_tests=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          while IFS= read -r file; do
-            case "$file" in
-              *.md|*.yml|*.yaml|*.ipynb)
-                ;;
-              *)
-                echo "Code-impacting change detected: $file"
-                echo "run_tests=true" >> "$GITHUB_OUTPUT"
-                exit 0
-                ;;
-            esac
-          done <<< "$changed_files"
-
-          echo "Only non-code files changed since previous release; skipping tests."
-          echo "run_tests=false" >> "$GITHUB_OUTPUT"
-
   test:
-    needs: detect-code-changes
-    if: needs.detect-code-changes.outputs.run_tests == 'true'
     uses: ./.github/workflows/tests.yml
 
   build-and-deploy:
-    needs: [detect-code-changes, test]
-    if: always() && needs.detect-code-changes.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    needs: test
     runs-on: ubuntu-latest
     environment: Production
     permissions:
