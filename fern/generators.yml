@@ -28,5 +28,18 @@ groups:
           location: pypi
           package-name: calibrate-python-sdk
           token: ${PYPI_TOKEN}
+        # Sync generated source to a GitHub repo. This ALSO populates the
+        # `Repository` project URL in the published package's metadata — without
+        # it Fern emits an empty `Project-URL: Repository,`, which PyPI rejects
+        # with `400 Must have a URL`. `.fernignore` in the repo lets us keep a
+        # hand-written README (used as the PyPI long_description).
+        github:
+          repository: dalmia/calibrate-python-sdk
+          mode: push
+        metadata:
+          author: "Aman Dalmia"
+          email: "aman.dalmia@artpark.in"
+          license: "MIT"
+          package-description: "Python SDK for the Calibrate API."
         config:
           client_class_name: Calibrate
