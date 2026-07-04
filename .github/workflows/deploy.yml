@@ -143,6 +143,7 @@ jobs:
             export PORT="${{ secrets.PORT }}"
             export DOCS_USERNAME="${{ secrets.DOCS_USERNAME }}"
             export DOCS_PASSWORD="${{ secrets.DOCS_PASSWORD }}"
+            export PUBLIC_API_BASE_URL="${{ secrets.PUBLIC_API_BASE_URL }}"
             export CORS_ALLOWED_ORIGINS="${{ secrets.CORS_ALLOWED_ORIGINS }}"
             export JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}"
             export JWT_EXPIRATION_HOURS="${{ secrets.JWT_EXPIRATION_HOURS }}"

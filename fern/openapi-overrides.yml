@@ -8,12 +8,6 @@
 # endpoint -> add/remove its entry here. Enforced by tests/test_sdk_overrides.py
 # (fails CI if this doesn't name exactly the public routes).
 
-# Production API base URL -> becomes the SDK's default base_url, so users can
-# call Calibrate(api_key=...) without passing a URL.
-servers:
-  - url: https://pense-backend.artpark.ai
-    description: Production
-
 paths:
   /agents:
     get:

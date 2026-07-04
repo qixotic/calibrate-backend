@@ -155,6 +155,10 @@ PUBLIC_API_TAG = "Public API"
 PUBLIC_API_KEY_SCHEME = "ApiKeyAuth"
 
 
+def _public_api_base_url() -> str:
+    return os.getenv("PUBLIC_API_BASE_URL", "http://localhost:8000").rstrip("/")
+
+
 def _collect_schema_refs(node: Any, acc: set) -> None:
     """Walk an OpenAPI fragment, collecting every `#/components/schemas/<Name>`
     schema name referenced (transitively) into ``acc``."""
@@ -242,6 +246,12 @@ def _build_public_openapi() -> Dict[str, Any]:
                 "header."
             ),
         },
+        "servers": [
+            {
+                "url": _public_api_base_url(),
+                "description": "API",
+            }
+        ],
         "components": components,
         "paths": public_paths,
     }

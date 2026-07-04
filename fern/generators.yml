@@ -26,7 +26,7 @@ groups:
         version: 5.15.2
         output:
           location: pypi
-          package-name: calibrate-python-sdk
+          package-name: calibrate-sdk
           token: ${PYPI_TOKEN}
         # Sync generated source to a GitHub repo. This ALSO populates the
         # `Repository` project URL in the published package's metadata — without
@@ -40,6 +40,8 @@ groups:
           author: "Aman Dalmia"
           email: "aman.dalmia@artpark.in"
           license: "MIT"
-          package-description: "Python SDK for the Calibrate API."
+          package-description: "Python SDK for the Calibrate agent evaluation platform API."
         config:
+          # Import path (pip install name stays package-name above).
+          package_name: calibrate
           client_class_name: Calibrate

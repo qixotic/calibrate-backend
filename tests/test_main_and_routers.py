@@ -85,13 +85,17 @@ def test_docs_endpoints_require_basic_auth(client):
     assert client.get("/docs", auth=("admin", "wrong")).status_code == 401
 
 
-def test_public_api_docs_are_unauthenticated_and_filtered(client):
+def test_public_api_docs_are_unauthenticated_and_filtered(client, monkeypatch):
+    monkeypatch.setenv("PUBLIC_API_BASE_URL", "http://testserver")
     # No auth required for the public subset.
     assert client.get("/public-api/docs").status_code == 200
     schema = client.get("/public-api/openapi.json")
     assert schema.status_code == 200
 
-    paths = schema.json()["paths"]
+    pub_top = schema.json()
+    assert pub_top["servers"] == [{"url": "http://testserver", "description": "API"}]
+
+    paths = pub_top["paths"]
     # Only the four API-key-accessible endpoints are exposed.
     assert ("get" in paths.get("/agents", {}))
     assert ("post" in paths.get("/agents/resolve", {}))
@@ -118,7 +122,6 @@ def test_public_api_docs_are_unauthenticated_and_filtered(client):
     # whose sole required auth param is `api_key` (no required `token`) — see the
     # SDK-auth bullet in CLAUDE.md. The auto-generated HTTPBearer scheme must be
     # gone so `Calibrate(api_key=...)` works.
-    pub_top = schema.json()
     schemes = pub_top["components"]["securitySchemes"]
     assert set(schemes) == {"ApiKeyAuth"}
     assert schemes["ApiKeyAuth"] == {
@@ -145,8 +148,7 @@ def test_public_api_docs_are_unauthenticated_and_filtered(client):
     import json
     import re
 
-    pub = schema.json()
-    pub_schemas = pub.get("components", {}).get("schemas", {})
+    pub_schemas = pub_top.get("components", {}).get("schemas", {})
     full_schemas = full.get("components", {}).get("schemas", {})
     # Public response models are present...
     assert "ResolveAgentNamesResponse" in pub_schemas  # POST /agents/resolve
@@ -159,7 +161,7 @@ def test_public_api_docs_are_unauthenticated_and_filtered(client):
     assert "AgentCreate" not in pub_schemas  # JWT-only create-agent body
     # Every $ref in the public doc resolves within the trimmed schema set.
     refs = {
-        m for m in re.findall(r'#/components/schemas/([^"]+)', json.dumps(pub))
+        m for m in re.findall(r'#/components/schemas/([^"]+)', json.dumps(pub_top))
     }
     assert refs.issubset(set(pub_schemas))
 
