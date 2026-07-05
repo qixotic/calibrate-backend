@@ -123,7 +123,7 @@ if "whoamiCmd.Hidden = true" not in auth_text:
         r"\t\tLong: `Display the currently configured settings and their sources\.\n\n"
         r"Sources are shown as:\n"
         r"  \[flag\]    - Set via command line flag\n"
-        r"  \[env\]     - Set via environment variable \(CLI_\*\)\n"
+        r"  \[env\]     - Set via environment variable \(CALIBRATE_\*\)\n"
         r"  \[keyring\] - Set via OS keychain \(stored by login/configure command\)\n"
         r"  \[config\]  - Set via config file \(~/.config/calibrate/config\.yaml\)\n"
         r"  \[unset\]   - Not configured\n\n"
@@ -137,7 +137,7 @@ if "whoamiCmd.Hidden = true" not in auth_text:
 
 Sources are shown as:
   [flag]    - Set via command line flag
-  [env]     - Set via environment variable (CLI_*)
+  [env]     - Set via environment variable (CALIBRATE_*)
   [keyring] - Set via OS keychain (stored by login/configure command)
   [config]  - Set via config file (~/.config/calibrate/config.yaml)
   [unset]   - Not configured

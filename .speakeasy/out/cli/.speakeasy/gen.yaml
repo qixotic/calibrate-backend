@@ -52,7 +52,7 @@ cli:
       publisherUrl: ""
       repositoryOwner: ""
   enableCustomCodeRegions: false
-  envVarPrefix: CLI
+  envVarPrefix: CALIBRATE
   generateRelease: true
   imports:
     option: openapi
