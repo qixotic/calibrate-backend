@@ -6,6 +6,7 @@ name: Publish SDK and CLI
 # Setup: SETUP_SDK.md
 #
 # Trigger: workflow_call (from auto-publish-sdk.yml), or workflow_dispatch.
+# Gated by Production secrets (SDK_AUTO_PUBLISH_ENABLED + PUSH_TO_REPO_TOKEN).
 on:
   workflow_dispatch:
     inputs:
@@ -27,7 +28,21 @@ permissions:
   contents: read
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    environment: Production
+    outputs:
+      publish_enabled: ${{ steps.gate.outputs.publish_enabled }}
+    steps:
+      - uses: ./.github/actions/check-publish-gate
+        id: gate
+        with:
+          sdk_auto_publish_enabled: ${{ secrets.SDK_AUTO_PUBLISH_ENABLED }}
+          push_to_repo_token: ${{ secrets.PUSH_TO_REPO_TOKEN }}
+
   prepare:
+    needs: gate
+    if: needs.gate.outputs.publish_enabled == 'true'
     runs-on: ubuntu-latest
     environment: Production
     outputs:

@@ -42,10 +42,11 @@ Add these to **this repo** → Settings → Environments → **Production**:
 
 | Secret | Used by | Notes |
 |--------|---------|-------|
+| `SDK_AUTO_PUBLISH_ENABLED` | `auto-publish-sdk.yml`, `publish-sdk.yml` | Set to **`true`** only on the canonical upstream repo (Production). **Do not set on forks or self-hosted copies** — workflows skip when absent. Both this and `PUSH_TO_REPO_TOKEN` must be set for publish to run. |
 | `FERN_TOKEN` | Fern Python SDK generate | From [buildwithfern.com](https://buildwithfern.com); Fern GitHub App must be authorized on `dalmia` |
 | `PYPI_TOKEN` | Fern generate (metadata) | Passed to `fern generate`; actual PyPI upload is in `calibrate-python-sdk` CI |
 | `SPEAKEASY_API_KEY` | Speakeasy CLI generate + validate | From [speakeasy.com](https://www.speakeasy.com) |
-| `PUSH_TO_REPO_TOKEN` | CLI sync + tagging both client repos | Classic PAT with **`contents:write`** and **`workflow`** on `dalmia/calibrate-python-sdk` and `dalmia/calibrate-cli` |
+| `PUSH_TO_REPO_TOKEN` | CLI sync + tagging both client repos | Classic PAT with **`contents:write`** and **`workflow`** on `dalmia/calibrate-python-sdk` and `dalmia/calibrate-cli`. **Required for publish workflows to start** (gate check) as well as client-repo pushes. |
 | `PUBLIC_API_BASE_URL` | Fetch public OpenAPI spec | Production API URL injected into `servers` (e.g. `https://pense-backend.artpark.ai`) |
 
 ### PAT scopes (`PUSH_TO_REPO_TOKEN`)

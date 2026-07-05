@@ -2,6 +2,7 @@ name: Auto-publish SDK and CLI
 
 # After a successful production deploy, publishes clients when the public OpenAPI
 # spec changed. Manual dispatch can force a publish or pin a version.
+# Gated by Production secrets (SDK_AUTO_PUBLISH_ENABLED + PUSH_TO_REPO_TOKEN).
 # Setup: SETUP_SDK.md
 on:
   workflow_run:
@@ -22,10 +23,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  detect:
+  gate:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: Production
+    outputs:
+      publish_enabled: ${{ steps.gate.outputs.publish_enabled }}
+    steps:
+      - uses: ./.github/actions/check-publish-gate
+        id: gate
+        with:
+          sdk_auto_publish_enabled: ${{ secrets.SDK_AUTO_PUBLISH_ENABLED }}
+          push_to_repo_token: ${{ secrets.PUSH_TO_REPO_TOKEN }}
+
+  detect:
+    needs: gate
+    if: needs.gate.outputs.publish_enabled == 'true'
     runs-on: ubuntu-latest
     environment: Production
     outputs:

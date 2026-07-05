@@ -1,0 +1,36 @@
+name: Check publish gate
+description: >-
+  Sets publish_enabled when SDK_AUTO_PUBLISH_ENABLED is true and
+  PUSH_TO_REPO_TOKEN is set (Production secrets). Used by auto-publish-sdk.yml
+  and publish-sdk.yml.
+
+inputs:
+  sdk_auto_publish_enabled:
+    description: Value of the SDK_AUTO_PUBLISH_ENABLED Production secret
+    required: false
+    default: ""
+  push_to_repo_token:
+    description: Value of the PUSH_TO_REPO_TOKEN Production secret
+    required: false
+    default: ""
+
+outputs:
+  publish_enabled:
+    description: Whether SDK/CLI publish prerequisites are met
+    value: ${{ steps.check.outputs.publish_enabled }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check publish prerequisites
+      id: check
+      shell: bash
+      env:
+        SDK_AUTO_PUBLISH_ENABLED: ${{ inputs.sdk_auto_publish_enabled }}
+        PUSH_TO_REPO_TOKEN: ${{ inputs.push_to_repo_token }}
+      run: |
+        if [ "$SDK_AUTO_PUBLISH_ENABLED" = "true" ] && [ -n "$PUSH_TO_REPO_TOKEN" ]; then
+          echo "publish_enabled=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "publish_enabled=false" >> "$GITHUB_OUTPUT"
+        fi
