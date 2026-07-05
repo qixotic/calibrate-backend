@@ -24,7 +24,7 @@ backend: sdk-v* tag or workflow_dispatch
   │
   └─ publish-cli (parallel)
        speakeasy run -t calibrate-cli
-       → sync-client-repo.sh → dalmia/calibrate-cli (code only)
+       → sync-client-repo.sh → dalmia/calibrate-cli (generated output incl. release workflow)
        → tag v<version> (PUSH_TO_REPO_TOKEN)
        → calibrate-cli release.yaml → GoReleaser → GitHub Release + homebrew-tap
 ```
@@ -41,15 +41,15 @@ Add these to **this repo** → Settings → Environments → **Production**:
 | `FERN_TOKEN` | Fern Python SDK generate | From [buildwithfern.com](https://buildwithfern.com); Fern GitHub App must be authorized on `dalmia` |
 | `PYPI_TOKEN` | Fern generate (metadata) | Passed to `fern generate`; actual PyPI upload is in `calibrate-python-sdk` CI |
 | `SPEAKEASY_API_KEY` | Speakeasy CLI generate + validate | From [speakeasy.com](https://www.speakeasy.com) |
-| `PUSH_TO_REPO_TOKEN` | CLI sync + tagging both client repos | Classic PAT with **`contents:write`** on `dalmia/calibrate-python-sdk` and `dalmia/calibrate-cli` |
+| `PUSH_TO_REPO_TOKEN` | CLI sync + tagging both client repos | Classic PAT with **`contents:write`** and **`workflow`** on `dalmia/calibrate-python-sdk` and `dalmia/calibrate-cli` |
 | `PUBLIC_API_BASE_URL` | Fetch public OpenAPI spec | Production API URL injected into `servers` (e.g. `https://pense-backend.artpark.ai`) |
 
 ### PAT scopes (`PUSH_TO_REPO_TOKEN`)
 
 | Scope | Why |
 |-------|-----|
-| `contents:write` | Push CLI code via `sync-client-repo.sh`; create tags on both client repos |
-| `workflow` | **Only if** you need to push `.github/workflows/` into `calibrate-cli` once (see below). Routine syncs skip workflows. |
+| `contents:write` | Push CLI output via `sync-client-repo.sh`; create tags on both client repos |
+| `workflow` | Push Speakeasy-generated `.github/workflows/release.yaml` into `calibrate-cli` on each sync |
 
 ## One-time: Python SDK (`calibrate-python-sdk`)
 
@@ -92,18 +92,14 @@ gpg --armor --export-secret-keys <KEY_ID>   # → CLI_GPG_SECRET_KEY
 ### Repos
 
 - [ ] **`dalmia/homebrew-tap`** exists (can start empty; GoReleaser commits `Formula/calibrate.rb` on first green release)
-- [ ] **`release.yaml`** in `calibrate-cli` (Speakeasy-generated). If missing:
-  - Push once with a PAT that has **`workflow`** scope, **or**
-  - Commit manually from Speakeasy output
-  - Subsequent backend syncs **skip** `.github/workflows/` (see sync script below)
-- [ ] **`README.md`** in `calibrate-cli` — hand-written; also excluded from sync
+- [ ] **`release.yaml`** in `calibrate-cli` — synced from Speakeasy output on each publish (`generateRelease: true`)
+- [ ] **`README.md`** in `calibrate-cli` — hand-written; excluded from sync
 
 ### What `sync-client-repo.sh` preserves
 
-On each publish, only generated **code** is synced. These paths in `calibrate-cli` are **not** overwritten:
+On each publish, generated output overwrites `calibrate-cli` except:
 
 - `README.md`
-- `.github/workflows/` (avoids needing `workflow` scope on every publish)
 - `.speakeasyignore` (if present)
 
 ## Per-release checklist
@@ -159,7 +155,7 @@ uv run --group dev pytest tests/test_sdk_overrides.py -q
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `gh: set the GH_TOKEN environment variable` | `PUSH_TO_REPO_TOKEN` missing/empty in Production | Add PAT to backend Production secrets |
-| PAT rejected pushing `release.yaml` | Missing `workflow` scope | Add scope once, or commit workflow manually; routine syncs skip it |
+| PAT rejected pushing `release.yaml` | Missing `workflow` scope on `PUSH_TO_REPO_TOKEN` | Add `workflow` scope to the backend PAT |
 | Release fails: `gpg_private_key` not supplied | GPG secrets missing in **calibrate-cli** | Add `CLI_GPG_SECRET_KEY` + `CLI_GPG_PASSPHRASE` |
 | Release fails: `field token not found in type config.Homebrew` | Speakeasy `.goreleaser.yaml` incompatible with GoReleaser >=2.17 | Merge backend patch (`patch-goreleaser-config.sh`) or move `token` under `repository` in `calibrate-cli`; re-run Release |
 | Homebrew formula never appears | `HOMEBREW_TAP_GITHUB_TOKEN` missing or tap repo missing | Add secret; create `dalmia/homebrew-tap` |

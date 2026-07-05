@@ -114,7 +114,9 @@ jobs:
             --set-version "${{ needs.prepare.outputs.version }}" \
             --skip-testing -y
           chmod +x ./.github/scripts/patch-goreleaser-config.sh
+          chmod +x ./.github/scripts/patch-cli-auth-commands.sh
           ./.github/scripts/patch-goreleaser-config.sh
+          ./.github/scripts/patch-cli-auth-commands.sh
           ./.github/scripts/sync-client-repo.sh \
             dalmia/calibrate-cli \
             .speakeasy/out/cli \

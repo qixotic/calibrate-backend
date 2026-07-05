@@ -18,15 +18,11 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "$WORKDIR/repo"
 
-# Preserve hand-written / Fern-scaffolded files in the client repo.
-# Workflows are excluded: Speakeasy emits release.yaml but PATs need the
-# `workflow` scope to push .github/workflows/*; publish is driven by tagging
-# the repo so its existing ci.yml runs (same pattern as the Fern Python SDK).
+# Preserve hand-written files in the client repo.
 rsync -a --delete \
   --exclude '.git' \
   --exclude '.speakeasyignore' \
   --exclude 'README.md' \
-  --exclude '.github/workflows/' \
   "$SRC_DIR/" "$WORKDIR/repo/"
 
 cd "$WORKDIR/repo"
