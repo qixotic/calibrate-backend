@@ -6,6 +6,30 @@ api:
   specs:
     - openapi: ../openapi/openapi.json
       overrides: ./openapi-overrides.yml
+readme:
+  apiName: "Calibrate"
+  introduction: |
+    The Calibrate Python SDK provides convenient, typed access to the Calibrate
+    agent evaluation platform API. Authenticate with an API key (`sk_…`) scoped
+    to your organization to run agent tests and poll their results.
+  disabledSections:
+    - "contributing"
+  customSections:
+    - title: "Quick Start"
+      language: "python"
+      content: |
+        ```python
+        from calibrate import Calibrate
+
+        client = Calibrate(api_key="sk_...")
+
+        # List the agents in your organization
+        agents = client.agents.list()
+
+        # Kick off a test run for an agent and poll for the result
+        run = client.agent_tests.run(agent_uuid="<agent-uuid>")
+        result = client.agent_tests.get_run(task_id=run.task_id)
+        ```
 groups:
   python-sdk:
     generators:
