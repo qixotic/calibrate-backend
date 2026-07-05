@@ -3,28 +3,20 @@ name: Run unit tests and upload coverage to Codecov
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - ".github/**"
-      - "*.md"
-      - "**/*.md"
-      - "*.yml"
-      - "**/*.yml"
-      - "*.yaml"
-      - "**/*.yaml"
-      - "*.ipynb"
-      - "**/*.ipynb"
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/tests.yml"
   pull_request:
     branches: [main]
-    paths-ignore:
-      - ".github/**"
-      - "*.md"
-      - "**/*.md"
-      - "*.yml"
-      - "**/*.yml"
-      - "*.yaml"
-      - "**/*.yaml"
-      - "*.ipynb"
-      - "**/*.ipynb"
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/tests.yml"
   workflow_call:
 
 permissions:
