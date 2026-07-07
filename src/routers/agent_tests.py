@@ -44,6 +44,8 @@ from auth_utils import get_current_org, get_org_jwt_or_api_key, OrgContext
 from utils import (
     TaskStatus,
     TaskCreateResponse,
+    TestTypeLiteral,
+    AgentTestJobType,
     get_s3_client,
     get_s3_output_config,
     can_start_agent_test_job,
@@ -204,7 +206,7 @@ class TestResponse(BaseModel):
         examples=[_EXAMPLE_TEST_UUID],
     )
     name: str = Field(description="Human-readable test name")
-    type: str = Field(
+    type: TestTypeLiteral = Field(
         description="Test type: `response`, `tool_call`, or `conversation`"
     )
     config: Dict[str, Any] | None = Field(
@@ -247,7 +249,7 @@ class AgentTestRunCreateResponse(BaseModel):
         description="Test run job ID. Poll for status and results",
         examples=[_EXAMPLE_TASK_UUID],
     )
-    status: str = Field(
+    status: TaskStatus = Field(
         description="Current status of the test run: `queued` or `in_progress`"
     )
 
@@ -274,7 +276,7 @@ class BatchTestRun(BaseModel):
         description="Test run job ID. Poll for status and results",
         examples=[_EXAMPLE_TASK_UUID],
     )
-    status: str = Field(
+    status: TaskStatus = Field(
         description="Initial status: `queued` or `in_progress`"
     )
 
@@ -391,7 +393,7 @@ class TestRunStatusResponse(BaseModel):
         description="Test run job ID",
         examples=[_EXAMPLE_TASK_UUID],
     )
-    status: str = Field(
+    status: TaskStatus = Field(
         description="Current status: `queued`, `in_progress`, `done`, or `failed`"
     )
     total_tests: Optional[int] = Field(
@@ -442,10 +444,10 @@ class AgentTestRunListItem(BaseModel):
     name: str = Field(
         description="Display name, e.g. `Run {index}` (unit test) or `Benchmark {index}`"
     )
-    status: str = Field(
+    status: TaskStatus = Field(
         description="Job status: `queued`, `in_progress`, `done`, or `failed`"
     )
-    type: str = Field(description="Job type: `llm-unit-test` or `llm-benchmark`")
+    type: AgentTestJobType = Field(description="Job type: `llm-unit-test` or `llm-benchmark`")
     updated_at: str = Field(description="Last-update timestamp (ISO 8601 UTC)")
     evaluators: Optional[List[Dict[str, Any]]] = Field(
         None, description="Top-level evaluator block; see `TestRunStatusResponse.evaluators`"
@@ -677,7 +679,7 @@ async def get_agent_test_runs(
 )
 async def get_all_test_runs_for_user(
     ctx: OrgContext = Depends(get_current_org),
-    type: Optional[str] = Query(
+    type: Optional[AgentTestJobType] = Query(
         None,
         description="Filter by job type: `llm-unit-test` or `llm-benchmark`. Omit to return both",
     ),
@@ -2453,7 +2455,7 @@ class BenchmarkStatusResponse(BaseModel):
         description="Benchmark run job ID",
         examples=[_EXAMPLE_TASK_UUID],
     )
-    status: str = Field(
+    status: TaskStatus = Field(
         description="Job status: `queued`, `in_progress`, `done`, or `failed`"
     )
     evaluators: Optional[List[Dict[str, Any]]] = Field(

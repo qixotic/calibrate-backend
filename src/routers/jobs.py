@@ -8,6 +8,7 @@ from db import get_all_jobs, get_job, delete_job, get_active_dataset_ids
 from auth_utils import get_current_org, OrgContext
 from utils import (
     TaskStatus,
+    EvalJobType,
     try_start_queued_job,
     kill_processes_from_dict,
 )
@@ -30,8 +31,8 @@ class JobListItem(BaseModel):
         max_length=36,
         description="Job ID",
     )
-    type: str = Field(description="Underlying job type, e.g. `stt-eval`, `tts-eval`")
-    status: str = Field(description="Lifecycle state, e.g. `queued`, `in_progress`, `done`, `failed`")
+    type: EvalJobType = Field(description="Underlying job type, e.g. `stt-eval`, `tts-eval`")
+    status: TaskStatus = Field(description="Lifecycle state, e.g. `queued`, `in_progress`, `done`, `failed`")
     dataset_id: Optional[str] = Field(
         None,
         min_length=36,

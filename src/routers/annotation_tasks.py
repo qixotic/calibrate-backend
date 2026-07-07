@@ -8,7 +8,6 @@ import secrets
 logger = logging.getLogger(__name__)
 
 from db import (
-    ANNOTATION_TASK_TYPES,
     create_annotation_task,
     ensure_name_unique,
     get_annotation_task,
@@ -68,6 +67,7 @@ from annotation_eval_runner import (
 )
 from utils import (
     TaskStatus,
+    AnnotationTaskTypeLiteral,
     can_start_job,
     compute_share_token_toggle,
     try_start_queued_job,
@@ -140,7 +140,7 @@ _EXAMPLE_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
 class AnnotationTaskCreate(BaseModel):
     name: str = Field(description="Human-readable task name, unique within your workspace")
-    type: str = Field(
+    type: AnnotationTaskTypeLiteral = Field(
         description="Task type (`stt`, `tts`, `llm`, `llm-general`, or `conversation`); governs item payload shape and applicable evaluators"
     )
     description: Optional[str] = Field(
@@ -169,7 +169,9 @@ class AnnotationTaskResponse(BaseModel):
         examples=[_EXAMPLE_ID],
     )
     name: str = Field(description="Human-readable task name")
-    type: str = Field(description="Task type (`stt | tts | llm | llm-general | conversation`)")
+    type: AnnotationTaskTypeLiteral = Field(
+        description="Task type (`stt | tts | llm | llm-general | conversation`)"
+    )
     description: Optional[str] = Field(None, description="Free-text task description, if any")
     created_at: str = Field(description="Creation timestamp (ISO 8601 UTC)")
     updated_at: str = Field(description="Last-update timestamp (ISO 8601 UTC)")
@@ -242,11 +244,6 @@ async def create_annotation_task_endpoint(
     ctx: OrgContext = Depends(get_current_org),
 ):
     """Create an annotation task in your workspace."""
-    if payload.type not in ANNOTATION_TASK_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"type must be one of {list(ANNOTATION_TASK_TYPES)}",
-        )
     if payload.evaluator_ids:
         for evaluator_id in payload.evaluator_ids:
             _ensure_owned_evaluator(evaluator_id, ctx.org_uuid)

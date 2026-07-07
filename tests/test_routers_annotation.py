@@ -57,13 +57,13 @@ def test_annotation_task_crud(client):
     h = auth["headers"]
     llm_ev = _llm_evaluator(client, h)
 
-    # invalid type
+    # invalid type — rejected at the schema level by AnnotationTaskTypeLiteral
     bad_type = client.post(
         "/annotation-tasks",
         json={"name": "x", "type": "bogus"},
         headers=h,
     )
-    assert bad_type.status_code == 400
+    assert bad_type.status_code == 422
 
     # invalid evaluator
     bad_ev = client.post(

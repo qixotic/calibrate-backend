@@ -30,6 +30,7 @@ from db import (
     update_evaluator,
 )
 from llm_judge import render_template
+from utils import EvaluatorTypeLiteral, DataTypeLiteral
 
 router = APIRouter(prefix="/evaluators", tags=["evaluators"])
 
@@ -93,10 +94,6 @@ class EvaluatorVersionCreateRequest(EvaluatorVersionCreate):
     make_live: bool = Field(
         False, description="When `true`, immediately point the evaluator's live version at this new version"
     )
-
-
-EvaluatorTypeLiteral = Literal["tts", "stt", "llm", "llm-general", "conversation"]
-DataTypeLiteral = Literal["text", "audio"]
 
 
 class EvaluatorCreate(BaseModel):
@@ -183,10 +180,12 @@ class EvaluatorResponseBase(BaseModel):
     )
     name: str = Field(description="Evaluator name")
     description: Optional[str] = Field(None, description="Human-readable description, or null")
-    evaluator_type: str = Field(description="Semantic category (`tts`/`stt`/`llm`/`llm-general`/`conversation`)")
-    data_type: str = Field(description="Medium the judge consumes (`text`/`audio`)")
-    kind: str = Field(description="`single` or `side_by_side`")
-    output_type: str = Field(description="`binary` or `rating`")
+    evaluator_type: EvaluatorTypeLiteral = Field(
+        description="Semantic category (`tts`/`stt`/`llm`/`llm-general`/`conversation`)"
+    )
+    data_type: DataTypeLiteral = Field(description="Medium the judge consumes (`text`/`audio`)")
+    kind: Literal["single", "side_by_side"] = Field(description="`single` or `side_by_side`")
+    output_type: Literal["binary", "rating"] = Field(description="`binary` or `rating`")
     owner_user_id: Optional[str] = Field(
         None,
         min_length=36,
@@ -409,10 +408,10 @@ class DefaultPromptResponse(BaseModel):
     )
     system_prompt: str = Field(description="Suggested judge system prompt for prefilling the create form")
     judge_model: str = Field(description="Suggested judge model")
-    evaluator_type: str = Field(description="Suggested semantic category")
-    data_type: str = Field(description="Suggested medium (`text`/`audio`)")
-    kind: str = Field(description="Suggested kind (`single`/`side_by_side`)")
-    output_type: str = Field(description="Suggested output type (`binary`/`rating`)")
+    evaluator_type: EvaluatorTypeLiteral = Field(description="Suggested semantic category")
+    data_type: DataTypeLiteral = Field(description="Suggested medium (`text`/`audio`)")
+    kind: Literal["single", "side_by_side"] = Field(description="Suggested kind (`single`/`side_by_side`)")
+    output_type: Literal["binary", "rating"] = Field(description="Suggested output type (`binary`/`rating`)")
     output_config: Optional[Dict[str, Any]] = Field(None, description="Suggested rubric, or null")
     variables: List[Dict[str, Any]] = Field(default=[], description="Suggested prompt variables (empty if none)")
 

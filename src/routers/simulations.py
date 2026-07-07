@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Depends, Path as PathParam
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from db import (
     create_simulation,
@@ -46,6 +46,11 @@ from llm_judge import build_evaluator_cli_payload
 from utils import (
     TaskStatus,
     TaskCreateResponse,
+    SimulationRunType,
+    EvaluatorTypeLiteral,
+    DataTypeLiteral,
+    OutputTypeLiteral,
+    EvaluatorKindLiteral,
     get_s3_client,
     get_s3_output_config,
     list_object_keys,
@@ -431,10 +436,12 @@ class EvaluatorResponse(BaseModel):
     )
     name: str = Field(description="Evaluator name")
     description: Optional[str] = Field(None, description="Evaluator description, or null")
-    evaluator_type: str = Field("conversation", description="Semantic category (always `conversation` for simulations)")
-    data_type: str = Field("text", description="Medium the judge consumes (`text`/`audio`)")
-    kind: str = Field("single", description="`single` or `side_by_side`")
-    output_type: str = Field("binary", description="`binary` or `rating`")
+    evaluator_type: EvaluatorTypeLiteral = Field(
+        "conversation", description="Semantic category (always `conversation` for simulations)"
+    )
+    data_type: DataTypeLiteral = Field("text", description="Medium the judge consumes (`text`/`audio`)")
+    kind: EvaluatorKindLiteral = Field("single", description="`single` or `side_by_side`")
+    output_type: OutputTypeLiteral = Field("binary", description="`binary` or `rating`")
     output_config: Optional[Dict[str, Any]] = Field(None, description="Rubric pinned at link time, or null")
     evaluator_version_id: str = Field(
         min_length=36,
@@ -504,17 +511,10 @@ class SimulationCreateResponse(BaseModel):
 
 
 class RunSimulationRequest(BaseModel):
-    type: str = Field(
+    type: SimulationRunType = Field(
         ...,
         description="Run mode: `text` for chat simulations, `voice` for spoken simulations (**unsupported with `connection` agents**)",
     )
-
-    @field_validator("type")
-    @classmethod
-    def validate_type(cls, v):
-        if v not in ["text", "voice"]:
-            raise ValueError("type must be either 'text' or 'voice'")
-        return v
 
 
 class EvaluationCriterionResult(BaseModel):
@@ -575,8 +575,8 @@ class SimulationRunStatusResponse(BaseModel):
         examples=[_EXAMPLE_ID],
     )
     name: str = Field(description='Display name in `Run {index}` form (creation order)')
-    status: str = Field(description="Run status (`queued`, `in_progress`, `done`, `failed`)")
-    type: str = Field(description="Run mode (`text` or `voice`)")
+    status: TaskStatus = Field(description="Run status (`queued`, `in_progress`, `done`, `failed`)")
+    type: SimulationRunType = Field(description="Run mode (`text` or `voice`)")
     updated_at: str = Field(description="Last-update timestamp (ISO 8601 UTC)")
     total_simulations: Optional[int] = Field(
         None, description="Expected number of persona x scenario cases; null before it's known"
@@ -604,8 +604,8 @@ class SimulationRunListItem(BaseModel):
         examples=[_EXAMPLE_ID],
     )
     name: str = Field(description='Display name in `Run {index}` form (creation order)')
-    status: str = Field(description="Run status (`queued`, `in_progress`, `done`, `failed`)")
-    type: str = Field(description="Run mode (`text` or `voice`)")
+    status: TaskStatus = Field(description="Run status (`queued`, `in_progress`, `done`, `failed`)")
+    type: SimulationRunType = Field(description="Run mode (`text` or `voice`)")
     updated_at: str = Field(description="Last-update timestamp (ISO 8601 UTC)")
 
 

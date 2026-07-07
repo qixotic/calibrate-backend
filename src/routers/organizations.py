@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 from auth_utils import get_current_user_id, is_superadmin_user
+from utils import MemberRoleLiteral
 from db import (
     add_organization_member,
     create_organization,
@@ -37,7 +38,7 @@ class OrganizationResponse(BaseModel):
         max_length=36,
         description="ID of the user who created the workspace",
     )
-    member_role: Optional[str] = Field(
+    member_role: Optional[MemberRoleLiteral] = Field(
         None,
         description="Your role in this workspace (`owner` | `admin`); `null` when not resolved",
     )
@@ -70,7 +71,9 @@ class MemberResponse(BaseModel):
     email: str = Field(description="Member's email address")
     first_name: str = Field(description="Member's given name")
     last_name: str = Field(description="Member's family name")
-    role: str = Field(description="Member's role in the workspace (`owner` | `admin`)")
+    role: MemberRoleLiteral = Field(
+        description="Member's role in the workspace (`owner` | `admin`)"
+    )
     created_at: str = Field(description="When the member was added (ISO 8601 UTC)")
 
 

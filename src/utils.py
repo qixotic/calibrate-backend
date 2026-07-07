@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Literal, Optional, Dict, Any, Union
 from urllib.parse import quote
 
 import boto3
@@ -120,12 +120,46 @@ tasks = {}
 tasks_lock = threading.Lock()
 
 
+# Lifecycle status for the run/job family (STT/TTS eval, agent tests,
+# simulations, and annotation-eval jobs). `cancelled` is retained as a
+# forward-compatible superset value; abort is tracked in `details.aborted`,
+# not here. Kept as a `#` comment (not a docstring) so this internal note does
+# NOT leak into the OpenAPI schema / public SDK — Pydantic promotes an enum's
+# docstring to the schema `description`.
 class TaskStatus(str, Enum):
     QUEUED = "queued"
     IN_PROGRESS = "in_progress"
     CANCELLED = "cancelled"
     DONE = "done"
     FAILED = "failed"
+
+
+# Lifecycle status for the annotation family — labelling jobs
+# (`pending → in_progress → completed`) and the public annotation-eval view
+# (which normalizes the internal `done` to `completed`). `queued`/`failed` are
+# included as a forward-compatible superset for eval jobs surfaced here.
+# `#` comment (not a docstring) on purpose — see TaskStatus note above.
+class AnnotationStatus(str, Enum):
+    PENDING = "pending"
+    QUEUED = "queued"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+# Concrete value sets reused across routers for entity/job "type" fields.
+EvaluatorTypeLiteral = Literal["tts", "stt", "llm", "llm-general", "conversation"]
+DataTypeLiteral = Literal["text", "audio"]
+OutputTypeLiteral = Literal["binary", "rating"]
+EvaluatorKindLiteral = Literal["single", "side_by_side"]
+SimulationRunType = Literal["text", "voice"]
+AgentTestJobType = Literal["llm-unit-test", "llm-benchmark"]
+EvalJobType = Literal["stt-eval", "tts-eval", "annotation-eval"]
+# Keep in sync with db.ANNOTATION_TASK_TYPES and db.VALID_EVALUATOR_TYPES
+# (Literal requires literal members, so the vocabulary is mirrored here).
+AnnotationTaskTypeLiteral = Literal["stt", "tts", "llm", "llm-general", "conversation"]
+TestTypeLiteral = Literal["response", "tool_call", "conversation"]
+MemberRoleLiteral = Literal["owner", "admin"]  # mirrors DB CHECK(role IN ('owner','admin'))
 
 
 class EvaluatorRunEntry(BaseModel):
@@ -154,7 +188,9 @@ class EvaluatorRunEntry(BaseModel):
         max_length=36,
         description="Pinned evaluator version ID at job-submit time",
     )
-    output_type: Optional[str] = None  # "binary" | "rating" — drives per-row typing
+    output_type: Optional[OutputTypeLiteral] = Field(
+        None, description="Output type (`binary` or `rating`); drives per-row typing"
+    )
 
 
 class ProviderResult(BaseModel):
@@ -174,7 +210,7 @@ class TaskCreateResponse(BaseModel):
         description="Unique identifier for this evaluation job",
         examples=["a3b2c1d0-e5f4-3210-abcd-ef1234567890"],
     )
-    status: str = Field(
+    status: TaskStatus = Field(
         description="Current status of the evaluation job: `queued` or `in_progress`"
     )
     dataset_id: Optional[str] = Field(
@@ -195,7 +231,9 @@ class TaskStatusResponse(BaseModel):
         max_length=36,
         description="Evaluation job ID",
     )
-    status: str
+    status: TaskStatus = Field(
+        description="Current status: `queued`, `in_progress`, `done`, or `failed`"
+    )
     language: Optional[str] = None
     dataset_id: Optional[str] = Field(
         None,

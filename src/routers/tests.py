@@ -97,7 +97,7 @@ class TestResponse(BaseModel):
         examples=[_EXAMPLE_TEST_UUID],
     )
     name: str = Field(description="Human-readable test name")
-    type: str = Field(description="Test kind: `response`, `tool_call`, or `conversation`")
+    type: TestType = Field(description="Test kind: `response`, `tool_call`, or `conversation`")
     config: Optional[Dict[str, Any]] = Field(
         None, description="Calibrate test config (`history`, `evaluation`, optional `settings`)"
     )
