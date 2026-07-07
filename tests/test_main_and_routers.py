@@ -96,15 +96,25 @@ def test_public_api_docs_are_unauthenticated_and_filtered(client, monkeypatch):
     assert pub_top["servers"] == [{"url": "http://testserver", "description": "API"}]
 
     paths = pub_top["paths"]
-    # Only the four API-key-accessible endpoints are exposed.
+    # Only the API-key-accessible endpoints are exposed.
     assert ("get" in paths.get("/agents", {}))
+    assert ("post" in paths.get("/agents", {}))
+    assert ("get" in paths.get("/agents/{agent_uuid}", {}))
+    assert ("put" in paths.get("/agents/{agent_uuid}", {}))
     assert ("post" in paths.get("/agents/resolve", {}))
     assert ("post" in paths.get("/agent-tests/agent/{agent_uuid}/run", {}))
     assert ("get" in paths.get("/agent-tests/run/{task_id}", {}))
+    assert ("post" in paths.get("/tests", {}))
+    assert ("get" in paths.get("/tests", {}))
+    assert ("get" in paths.get("/tests/{test_uuid}", {}))
+    assert ("put" in paths.get("/tests/{test_uuid}", {}))
+    assert ("post" in paths.get("/tests/bulk", {}))
     # JWT-only endpoints must NOT leak into the public schema.
     assert "/personas" not in paths
     assert "/presigned-url" not in paths
-    assert "post" not in paths.get("/agents", {})  # create-agent is JWT-only
+    assert "delete" not in paths.get("/agents/{agent_uuid}", {})  # delete stays JWT-only
+    assert "delete" not in paths.get("/tests/{test_uuid}", {})  # delete stays JWT-only
+    assert "/tests/bulk-delete" not in paths  # bulk-delete stays JWT-only
 
     # Ops keep their router-level tag (e.g. "agents") for grouping, but the
     # "Public API" filter marker is stripped so it never shows as its own group
@@ -160,7 +170,8 @@ def test_public_api_docs_are_unauthenticated_and_filtered(client, monkeypatch):
     # ...but it's a strict subset of the full set, and internal-only models are gone.
     assert set(pub_schemas).issubset(set(full_schemas))
     assert "PersonaCreate" not in pub_schemas
-    assert "AgentCreate" not in pub_schemas  # JWT-only create-agent body
+    assert "AgentCreate" in pub_schemas  # POST /agents is now public
+    assert "BulkTestDelete" not in pub_schemas  # bulk-delete stays JWT-only
     # Every $ref in the public doc resolves within the trimmed schema set.
     refs = {
         m for m in re.findall(r'#/components/schemas/([^"]+)', json.dumps(pub_top))

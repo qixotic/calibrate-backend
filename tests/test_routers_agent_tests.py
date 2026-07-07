@@ -326,6 +326,24 @@ def test_run_agent_test_validation(client, monkeypatch):
     assert cross.status_code == 404
 
 
+def test_run_agent_test_rejects_cross_org_test_uuid(client):
+    """A test_uuid from another org must not be runnable against my agent —
+    404 (existence parity), matching how a missing test_uuid already 404s."""
+    other = _signup(client)
+    other_test = _create_test(client, other["headers"])
+
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+
+    r = client.post(
+        f"/agent-tests/agent/{agent['uuid']}/run",
+        json={"test_uuids": [other_test["uuid"]]},
+        headers=h,
+    )
+    assert r.status_code == 404
+
+
 def test_run_agent_test_queued_path(client, monkeypatch):
     auth = _signup(client)
     h = auth["headers"]

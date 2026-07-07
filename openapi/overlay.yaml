@@ -27,3 +27,35 @@ actions:
     update:
       x-speakeasy-group: agent_tests
       x-speakeasy-name-override: get_run
+  - target: $.paths['/agents'].post
+    update:
+      x-speakeasy-group: agents
+      x-speakeasy-name-override: create
+  - target: $.paths['/agents/{agent_uuid}'].get
+    update:
+      x-speakeasy-group: agents
+      x-speakeasy-name-override: get
+  - target: $.paths['/agents/{agent_uuid}'].put
+    update:
+      x-speakeasy-group: agents
+      x-speakeasy-name-override: update
+  - target: $.paths['/tests'].post
+    update:
+      x-speakeasy-group: tests
+      x-speakeasy-name-override: create
+  - target: $.paths['/tests'].get
+    update:
+      x-speakeasy-group: tests
+      x-speakeasy-name-override: list
+  - target: $.paths['/tests/bulk'].post
+    update:
+      x-speakeasy-group: tests
+      x-speakeasy-name-override: bulk_create
+  - target: $.paths['/tests/{test_uuid}'].get
+    update:
+      x-speakeasy-group: tests
+      x-speakeasy-name-override: get
+  - target: $.paths['/tests/{test_uuid}'].put
+    update:
+      x-speakeasy-group: tests
+      x-speakeasy-name-override: update

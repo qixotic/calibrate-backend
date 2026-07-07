@@ -2146,11 +2146,14 @@ async def run_agent_test(
         )
 
     if request.test_uuids:
-        # Verify all specified tests exist
+        # Verify all specified tests exist and belong to the caller's org — a
+        # cross-org UUID must 404 identically to a missing one (existence-leak
+        # parity), otherwise a leaked/guessed UUID from another org could be
+        # run against this agent and its content read back via the result.
         tests = []
         for test_uuid in request.test_uuids:
             test = get_test(test_uuid)
-            if not test:
+            if not test or test.get("org_uuid") != ctx.org_uuid:
                 raise HTTPException(
                     status_code=404, detail=f"Test {test_uuid} not found"
                 )

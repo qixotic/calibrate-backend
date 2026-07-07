@@ -17,7 +17,7 @@ from db import (
     get_evaluators_for_test,
     set_test_evaluators,
 )
-from auth_utils import get_current_org, OrgContext
+from auth_utils import get_current_org, get_org_jwt_or_api_key, OrgContext
 
 import logging
 
@@ -293,9 +293,14 @@ async def bulk_delete_tests_endpoint(
     )
 
 
-@router.post("/bulk", response_model=BulkTestUploadResponse, summary="Bulk create tests")
+@router.post(
+    "/bulk",
+    response_model=BulkTestUploadResponse,
+    tags=["Public API"],
+    summary="Bulk create tests",
+)
 async def bulk_upload_tests(
-    payload: BulkTestUpload, ctx: OrgContext = Depends(get_current_org)
+    payload: BulkTestUpload, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
 ):
     """Create many tests of one type in a single call, optionally linking them to agents."""
     if payload.agent_uuids:
@@ -370,9 +375,14 @@ async def bulk_upload_tests(
     )
 
 
-@router.post("", response_model=TestCreateResponse, summary="Create test")
+@router.post(
+    "",
+    response_model=TestCreateResponse,
+    tags=["Public API"],
+    summary="Create test",
+)
 async def create_test_endpoint(
-    test: TestCreate, ctx: OrgContext = Depends(get_current_org)
+    test: TestCreate, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
 ):
     """Create a test in your workspace."""
     # Conversation tests have no evaluator fallback (unlike `response`, which can
@@ -403,20 +413,30 @@ async def create_test_endpoint(
     return TestCreateResponse(uuid=test_uuid, message="Test created successfully")
 
 
-@router.get("", response_model=List[TestResponse], summary="List tests")
-async def list_tests(ctx: OrgContext = Depends(get_current_org)):
+@router.get(
+    "",
+    response_model=List[TestResponse],
+    tags=["Public API"],
+    summary="List tests",
+)
+async def list_tests(ctx: OrgContext = Depends(get_org_jwt_or_api_key)):
     """List all tests for your workspace, each with its linked evaluators."""
     tests = get_all_tests(org_uuid=ctx.org_uuid)
     return [_with_evaluators(t) for t in tests]
 
 
-@router.get("/{test_uuid}", response_model=TestResponse, summary="Get test")
+@router.get(
+    "/{test_uuid}",
+    response_model=TestResponse,
+    tags=["Public API"],
+    summary="Get test",
+)
 async def get_test_endpoint(
     test_uuid: str = Path(
         description="Test to retrieve",
         examples=["b1c2d3e4-f5a6-7890-bcde-f12345678901"],
     ),
-    ctx: OrgContext = Depends(get_current_org),
+    ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
     """Get a test by ID, including its linked evaluators."""
     test = get_test(test_uuid)
@@ -425,14 +445,19 @@ async def get_test_endpoint(
     return _with_evaluators(test)
 
 
-@router.put("/{test_uuid}", response_model=TestResponse, summary="Update test")
+@router.put(
+    "/{test_uuid}",
+    response_model=TestResponse,
+    tags=["Public API"],
+    summary="Update test",
+)
 async def update_test_endpoint(
     test: TestUpdate,
     test_uuid: str = Path(
         description="Test to update",
         examples=["b1c2d3e4-f5a6-7890-bcde-f12345678901"],
     ),
-    ctx: OrgContext = Depends(get_current_org),
+    ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
     """Update a test's name, config, and/or evaluator links."""
     existing_test = get_test(test_uuid)

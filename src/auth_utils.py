@@ -156,11 +156,18 @@ class OrgContext:
     `role`     — the caller's role inside `org_uuid` ('owner' or 'admin').
                  Both have full access; surfaced for endpoints that branch on
                  it (e.g. the future "transfer ownership" UI).
+    `auth_method` — how this context was resolved ('jwt' or 'api_key'). Lets an
+                 endpoint served by `get_org_jwt_or_api_key` apply stricter
+                 rules to programmatic clients — e.g. an API key must not be
+                 able to self-attest `connection_verified` on an agent, since
+                 that would let it skip the real connectivity check and point
+                 the job runner at an arbitrary URL (SSRF).
     """
 
     user_id: str
     org_uuid: str
     role: str
+    auth_method: str = "jwt"
 
 
 async def get_current_org(
@@ -290,6 +297,7 @@ def _resolve_api_key(raw_key: str) -> Optional[OrgContext]:
                 user_id=row["owner_user_id"],
                 org_uuid=row["org_uuid"],
                 role="owner",
+                auth_method="api_key",
             )
     return None
 

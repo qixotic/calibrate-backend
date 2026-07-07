@@ -165,3 +165,129 @@ def test_list_agents_requires_auth(client):
 
     bad = client.get("/agents", headers={"X-API-Key": "sk_not-a-real-key"})
     assert bad.status_code == 401
+
+
+def test_create_agent_with_api_key(client):
+    """POST /agents accepts an sk_ API key."""
+    h = _signup(client)
+    raw = _raw_key(client, h)
+    name = f"key-create-{uuid.uuid4().hex[:6]}"
+    r = client.post(
+        "/agents", json={"name": name, "type": "agent"}, headers={"X-API-Key": raw}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["uuid"]
+
+
+def test_get_agent_with_api_key(client):
+    """GET /agents/{uuid} accepts an sk_ API key."""
+    h = _signup(client)
+    agent = _create_agent(client, h, f"key-get-{uuid.uuid4().hex[:6]}")
+    raw = _raw_key(client, h)
+    r = client.get(f"/agents/{agent['uuid']}", headers={"X-API-Key": raw})
+    assert r.status_code == 200, r.text
+    assert r.json()["uuid"] == agent["uuid"]
+
+
+def test_update_agent_with_api_key(client):
+    """PUT /agents/{uuid} accepts an sk_ API key."""
+    h = _signup(client)
+    agent = _create_agent(client, h, f"key-upd-{uuid.uuid4().hex[:6]}")
+    raw = _raw_key(client, h)
+    new_name = f"key-upd-new-{uuid.uuid4().hex[:6]}"
+    r = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"name": new_name},
+        headers={"X-API-Key": raw},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == new_name
+
+
+def test_create_agent_invalid_api_key(client):
+    """POST /agents with a bogus key must 401."""
+    r = client.post(
+        "/agents",
+        json={"name": f"bad-{uuid.uuid4().hex[:6]}", "type": "agent"},
+        headers={"X-API-Key": "bad"},
+    )
+    assert r.status_code == 401
+
+
+def test_get_agent_wrong_org_api_key(client):
+    """A key from another org must not read an agent — 404 (existence-leak parity)."""
+    ha = _signup(client)
+    agent = _create_agent(client, ha, f"other-org-{uuid.uuid4().hex[:6]}")
+
+    hb = _signup(client)
+    raw_b = _raw_key(client, hb)
+    r = client.get(f"/agents/{agent['uuid']}", headers={"X-API-Key": raw_b})
+    assert r.status_code == 404
+
+
+def test_create_agent_with_api_key_cannot_self_attest_verification(client):
+    """An API key must not be able to flip connection_verified=true on create.
+
+    Only POST /agents/{uuid}/verify-connection (JWT-only) may set this, since
+    it's the sole path that runs the SSRF guard (_validate_agent_url) before
+    ever contacting agent_url. Letting an API key smuggle
+    connection_verified=true through config would let it point Calibrate's
+    job runner at an unvalidated, arbitrary URL.
+    """
+    h = _signup(client)
+    raw = _raw_key(client, h)
+    r = client.post(
+        "/agents",
+        json={
+            "name": f"key-ssrf-create-{uuid.uuid4().hex[:6]}",
+            "type": "connection",
+            "config": {
+                "agent_url": "https://example.com/x",
+                "connection_verified": True,
+            },
+        },
+        headers={"X-API-Key": raw},
+    )
+    assert r.status_code == 200, r.text
+    agent = client.get(f"/agents/{r.json()['uuid']}", headers={"X-API-Key": raw}).json()
+    assert agent["config"].get("connection_verified") is not True
+
+
+def test_update_agent_with_api_key_cannot_self_attest_verification(client):
+    """An API key must not be able to flip connection_verified=true via PUT,
+    whether through the dedicated field or smuggled inside `config`."""
+    h = _signup(client)
+    raw = _raw_key(client, h)
+    agent = client.post(
+        "/agents",
+        json={
+            "name": f"key-ssrf-update-{uuid.uuid4().hex[:6]}",
+            "type": "connection",
+            "config": {"agent_url": "https://example.com/x"},
+        },
+        headers={"X-API-Key": raw},
+    ).json()
+
+    # Paired with a real field change (name) so the request isn't a pure no-op
+    # once the verification fields are stripped — isolates the strip behavior
+    # rather than the separate "nothing to update" 400 path.
+    r1 = client.put(
+        f"/agents/{agent['uuid']}",
+        json={
+            "name": f"key-ssrf-update-renamed-{uuid.uuid4().hex[:6]}",
+            "connection_verified": True,
+            "benchmark_models_verified": {"x": True},
+        },
+        headers={"X-API-Key": raw},
+    )
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["config"].get("connection_verified") is not True
+    assert not r1.json()["config"].get("benchmark_models_verified")
+
+    r2 = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"config": {"agent_url": "https://example.com/x", "connection_verified": True}},
+        headers={"X-API-Key": raw},
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["config"].get("connection_verified") is not True

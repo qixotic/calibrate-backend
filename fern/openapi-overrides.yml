@@ -13,6 +13,34 @@ paths:
     get:
       x-fern-sdk-group-name: agents
       x-fern-sdk-method-name: list
+    post:
+      x-fern-sdk-group-name: agents
+      x-fern-sdk-method-name: create
+  /agents/{agent_uuid}:
+    get:
+      x-fern-sdk-group-name: agents
+      x-fern-sdk-method-name: get
+    put:
+      x-fern-sdk-group-name: agents
+      x-fern-sdk-method-name: update
+  /tests:
+    post:
+      x-fern-sdk-group-name: tests
+      x-fern-sdk-method-name: create
+    get:
+      x-fern-sdk-group-name: tests
+      x-fern-sdk-method-name: list
+  /tests/bulk:
+    post:
+      x-fern-sdk-group-name: tests
+      x-fern-sdk-method-name: bulk_create
+  /tests/{test_uuid}:
+    get:
+      x-fern-sdk-group-name: tests
+      x-fern-sdk-method-name: get
+    put:
+      x-fern-sdk-group-name: tests
+      x-fern-sdk-method-name: update
   /agents/resolve:
     post:
       x-fern-sdk-group-name: agents
