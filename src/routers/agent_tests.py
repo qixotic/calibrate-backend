@@ -498,6 +498,44 @@ class TestRunStatusResponse(BaseModel):
     )
 
 
+class TestRunCaseSummary(BaseModel):
+    """Flat summary for one test case in the run-LIST endpoints. Carries only
+    enough to render a run's pass/fail breakdown and a case name. The full detail
+    for each case (agent output, judge verdicts, reasoning, latency, cost, the
+    test-case definition) lives on the run-DETAIL endpoint
+    (`GET /agent-tests/run/{task_id}`)."""
+
+    name: Optional[str] = Field(
+        None, description="Name of the test case"
+    )
+    passed: Optional[bool] = Field(
+        None, description="Whether the case passed (null if it errored or is still running)"
+    )
+
+
+class ModelRunSummary(BaseModel):
+    """Flat summary for one model in a benchmark run-LIST item. The full results
+    for each case of a model live on the benchmark detail endpoint
+    (`GET /agent-tests/benchmark/{task_id}`), not here."""
+
+    model: str = Field(
+        description="Model name these results are for", examples=["openai/gpt-4.1"]
+    )
+    success: Optional[bool] = Field(
+        None, description="Whether this model's run succeeded"
+    )
+    message: str = Field("", description="Status or result message for this model")
+    total_tests: Optional[int] = Field(
+        None, description="Total test cases for this model"
+    )
+    passed: Optional[int] = Field(
+        None, description="Number of test cases that passed for this model"
+    )
+    failed: Optional[int] = Field(
+        None, description="Number of test cases that failed for this model"
+    )
+
+
 class AgentTestRunListItem(BaseModel):
     uuid: str = Field(
         min_length=36,
@@ -517,10 +555,6 @@ class AgentTestRunListItem(BaseModel):
         )
     )
     updated_at: str = Field(description="When the run was last updated (ISO 8601 UTC)")
-    evaluators: Optional[List[TestRunEvaluator]] = Field(
-        None,
-        description="The evaluators used in this run. Each verdict in `judge_results` links to one of these by `evaluator_uuid`",
-    )
     total_tests: Optional[int] = Field(
         None,
         description="Total number of test cases",
@@ -531,8 +565,9 @@ class AgentTestRunListItem(BaseModel):
     failed: Optional[int] = Field(
         None, description="Number of test cases that failed"
     )
-    results: Optional[List[TestCaseResult]] = Field(
-        None, description="Results for each test case"
+    results: Optional[List[TestRunCaseSummary]] = Field(
+        None,
+        description="Flat pass/fail summary for each test case (fetch the run detail for full results)",
     )
     latency_ms: Optional[Dict[str, Any]] = Field(
         None,
@@ -545,13 +580,9 @@ class AgentTestRunListItem(BaseModel):
         None,
         description="Aggregated token usage as `{mean, min, max, count}`",
     )
-    model_results: Optional[List["ModelResult"]] = Field(
-        None, description="Results for each model in a benchmark run"
-    )
-    leaderboard_summary: Optional[List[Dict[str, Any]]] = Field(
+    model_results: Optional[List[ModelRunSummary]] = Field(
         None,
-        description=LEADERBOARD_SUMMARY_DESCRIPTION,
-        examples=[LEADERBOARD_SUMMARY_EXAMPLE],
+        description="Flat summary for each model in a benchmark run (fetch the benchmark detail for full results)",
     )
     error: bool = Field(False, description="True if the run failed")
     is_public: bool = Field(False, description="Whether the run is shared publicly")
@@ -657,34 +688,62 @@ async def get_agent_tests_endpoint(
     return tests
 
 
+def _slim_test_results(test_results: Any) -> Optional[List[Dict[str, Any]]]:
+    """Flatten stored per-case results into `{name, passed}` rows for the run-list.
+    Lifts the nested `test_case.name` up onto `name` so the row carries no nested
+    objects; the full per-case detail stays on the run-detail endpoint."""
+    if not test_results:
+        return None
+    slim = []
+    for r in test_results:
+        if not isinstance(r, dict):
+            continue
+        test_case = r.get("test_case") if isinstance(r.get("test_case"), dict) else {}
+        slim.append(
+            {
+                "name": r.get("name") or (test_case or {}).get("name"),
+                "passed": r.get("passed"),
+            }
+        )
+    return slim or None
+
+
+def _slim_model_results(model_results: Any) -> Optional[List[Dict[str, Any]]]:
+    """Flatten stored per-model benchmark results into scalar-only rows for the
+    run-list, dropping each model's per-case `test_results`. Full per-case detail
+    stays on the benchmark-detail endpoint."""
+    if not model_results:
+        return None
+    slim = []
+    for m in model_results:
+        if not isinstance(m, dict):
+            continue
+        slim.append(
+            {
+                "model": m.get("model", ""),
+                "success": m.get("success"),
+                "message": m.get("message", ""),
+                "total_tests": m.get("total_tests"),
+                "passed": m.get("passed"),
+                "failed": m.get("failed"),
+            }
+        )
+    return slim or None
+
+
 def _build_agent_test_run_item_fields(job: Dict[str, Any], name: str) -> Dict[str, Any]:
     """Shared field mapping for the run-list item models (``AgentTestRunListItem``
     and its ``GlobalTestRunListItem`` subclass).
 
-    Runs evaluator enrichment on the stored test/model results, builds the shared
-    top-level ``evaluators`` block, and maps job + results into the common kwargs
-    both endpoints need. Callers spread the result and append any model-specific
-    fields (e.g. ``agent_id``/``agent_name`` for the global view). Keeping this in
-    one place means new result fields (latency/cost/tokens, …) are wired once.
+    The list is a lightweight index: it carries flat per-case (`{name, passed}`)
+    and per-model scalar summaries plus run-level aggregates — NOT the heavy
+    per-case detail (agent output, judge verdicts, reasoning, the test-case
+    definition, per-model `test_results`, leaderboard, evaluator rubrics). Those
+    live on the run-detail endpoints, which every viewer re-fetches by task id.
+    Callers spread the result and append any model-specific fields (e.g.
+    ``agent_id``/``agent_name`` for the global view).
     """
     job_results = job.get("results") or {}
-    job_details = job.get("details") or {}
-    evaluators_snapshot = job_details.get("evaluators_by_test_id") or {}
-
-    # Refresh evaluator names + uuids on per-row judge_results before serializing
-    evaluator_cache: Dict[str, Optional[Dict[str, Any]]] = {}
-    _enrich_test_results_with_evaluators(
-        job_results.get("test_results"), evaluators_snapshot, evaluator_cache
-    )
-    _enrich_model_results_with_evaluators(
-        job_results.get("model_results"), evaluators_snapshot, evaluator_cache
-    )
-    evaluators_block = _build_evaluators_block_for_test_run(
-        evaluators_snapshot,
-        test_results=job_results.get("test_results"),
-        model_results=job_results.get("model_results"),
-        evaluator_cache=evaluator_cache,
-    )
 
     return {
         "uuid": job["uuid"],
@@ -692,7 +751,6 @@ def _build_agent_test_run_item_fields(job: Dict[str, Any], name: str) -> Dict[st
         "status": job["status"],
         "type": job.get("type", ""),
         "updated_at": job.get("updated_at", job.get("created_at", "")),
-        "evaluators": evaluators_block or None,
         # Unit test results
         "total_tests": job_results.get("total_tests"),
         "passed": job_results.get("passed"),
@@ -700,10 +758,9 @@ def _build_agent_test_run_item_fields(job: Dict[str, Any], name: str) -> Dict[st
         "latency_ms": job_results.get("latency_ms"),
         "cost": job_results.get("cost"),
         "total_tokens": job_results.get("total_tokens"),
-        "results": job_results.get("test_results"),
+        "results": _slim_test_results(job_results.get("test_results")),
         # Benchmark results
-        "model_results": job_results.get("model_results"),
-        "leaderboard_summary": job_results.get("leaderboard_summary"),
+        "model_results": _slim_model_results(job_results.get("model_results")),
         # Common fields
         "error": bool(job_results.get("error")),
         "is_public": bool(job.get("is_public")),
@@ -2548,10 +2605,6 @@ class ModelResult(BaseModel):
     )
 
 
-# `AgentTestRunListItem.model_results` forward-references `ModelResult` (defined
-# above, after the list model). Resolve it now that the name exists.
-AgentTestRunListItem.model_rebuild()
-GlobalTestRunListItem.model_rebuild()
 
 
 class BenchmarkStatusResponse(BaseModel):
