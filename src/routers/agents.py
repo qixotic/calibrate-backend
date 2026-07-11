@@ -5,7 +5,7 @@ import socket
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Literal
 from urllib.parse import urlparse
-from fastapi import APIRouter, HTTPException, Depends, Path
+from fastapi import APIRouter, HTTPException, Depends, Path, Body
 from pagination import (
     OptionalPaginationParams,
     PaginatedResponse,
@@ -293,6 +293,46 @@ class AgentCreate(BaseModel):
     )
 
 
+# Named request-body examples for `POST /agents`. Rendered as a switchable
+# dropdown in the API reference (and as per-variant snippets in the generated
+# SDK/CLI docs) so a reader can toggle between building an agent inside Calibrate
+# and connecting their own HTTP endpoint. The Calibrate example's config is built
+# from `_default_agent_config()` itself, so it always shows the exact managed
+# defaults a caller gets — it can't drift out of sync.
+_CREATE_AGENT_EXAMPLES = {
+    "agent_within_calibrate": {
+        "summary": "Agent within Calibrate",
+        "description": (
+            "Build a voice/chat agent inside Calibrate. This config is the managed "
+            "defaults spelled out. Override only the keys you want to change; "
+            "omitted keys still inherit the defaults."
+        ),
+        "value": {
+            "name": "Support Agent",
+            "type": "agent",
+            "config": _default_agent_config(),
+        },
+    },
+    "openai_compatible_connection": {
+        "summary": "Connect OpenAI-compatible agent",
+        "description": (
+            "Connect your own agent over an OpenAI-compatible HTTP endpoint. "
+            "`config.agent_url` is required; `agent_headers` carries the auth "
+            "token the endpoint expects."
+        ),
+        "value": {
+            "name": "My Hosted Agent",
+            "type": "connection",
+            "config": {
+                "agent_url": "https://api.example.com/v1/chat/completions",
+                "agent_headers": {"Authorization": "Bearer <token>"},
+                "benchmark_provider": "openrouter",
+            },
+        },
+    },
+}
+
+
 class AgentUpdate(BaseModel):
     name: Optional[str] = Field(
         None, description="New agent name. Omit to leave the name unchanged"
@@ -572,7 +612,8 @@ async def resolve_agent_names(
     summary="Create agent",
 )
 async def create_agent_endpoint(
-    agent: AgentCreate, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
+    agent: AgentCreate = Body(openapi_examples=_CREATE_AGENT_EXAMPLES),
+    ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
     """Create an agent to test inside Calibrate or connect your existing agent to Calibrate"""
     if agent.type == "agent":
