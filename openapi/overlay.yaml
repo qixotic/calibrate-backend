@@ -137,6 +137,35 @@ actions:
           Update an existing agent by UUID within the caller's org. Supply the
           fields to change (name, type, config). Returns the updated agent.
           Fails with 404 if the agent does not exist or belongs to another org.
+  - target: $.paths['/agents/{agent_uuid}/evaluators'].get
+    update:
+      x-speakeasy-group: agents
+      x-speakeasy-name-override: list_evaluators
+      x-speakeasy-mcp:
+        name: list-agent-evaluators
+        title: List evaluators linked to an agent
+        scopes: [read]
+        readOnlyHint: true
+        openWorldHint: true
+        description: |
+          List the evaluators linked to an agent, most recently linked first.
+          Returns each evaluator's UUID, name, type, and live version summary.
+  - target: $.paths['/agents/{agent_uuid}/evaluators'].post
+    update:
+      x-speakeasy-group: agents
+      x-speakeasy-name-override: link_evaluators
+      x-speakeasy-mcp:
+        name: link-evaluators-to-agent
+        title: Link evaluators to an agent
+        scopes: [write]
+        readOnlyHint: false
+        destructiveHint: false
+        idempotentHint: true
+        openWorldHint: true
+        description: |
+          Link one or more evaluators to an agent, skipping any already linked.
+          Each evaluator must be one you created or a built-in default, and the
+          agent must be in your workspace.
   - target: $.paths['/tests'].post
     update:
       x-speakeasy-group: tests

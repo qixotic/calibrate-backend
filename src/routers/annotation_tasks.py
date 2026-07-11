@@ -260,6 +260,7 @@ class EvaluatorRunResponse(BaseModel):
         description="Token for building the public share URL"
     )
 from auth_utils import get_current_org, get_org_jwt_or_api_key, OrgContext
+from org_scope import ensure_owned_evaluator
 from pagination import (
     OptionalPaginationParams,
     PaginatedResponse,
@@ -457,17 +458,6 @@ def _ensure_owned_task(task_uuid: str, org_uuid: str) -> Dict[str, Any]:
     return task
 
 
-def _ensure_owned_evaluator(evaluator_uuid: str, org_uuid: str) -> Dict[str, Any]:
-    evaluator = get_evaluator(evaluator_uuid)
-    if not evaluator:
-        raise HTTPException(status_code=404, detail="Evaluator not found")
-    owner_org = evaluator.get("org_uuid")
-    # org_uuid IS NULL ⇒ seeded default (visible to every org)
-    if owner_org is not None and owner_org != org_uuid:
-        raise HTTPException(status_code=404, detail="Evaluator not found")
-    return evaluator
-
-
 @router.post("", response_model=AnnotationTaskCreateResponse, summary="Create annotation task", tags=["Public API"])
 async def create_annotation_task_endpoint(
     payload: AnnotationTaskCreate,
@@ -476,7 +466,7 @@ async def create_annotation_task_endpoint(
     """Create an annotation task for annotators to label items against evaluators"""
     if payload.evaluator_ids:
         for evaluator_id in payload.evaluator_ids:
-            _ensure_owned_evaluator(evaluator_id, ctx.org_uuid)
+            ensure_owned_evaluator(evaluator_id, ctx.org_uuid)
 
     with ensure_name_unique(
         "annotation_tasks", payload.name, ctx.org_uuid, entity="Annotation task"
@@ -688,7 +678,7 @@ async def link_evaluator_to_task(
 ):
     """Link an evaluator to a task, appending it to the display order"""
     _ensure_owned_task(task_uuid, ctx.org_uuid)
-    _ensure_owned_evaluator(payload.evaluator_id, ctx.org_uuid)
+    ensure_owned_evaluator(payload.evaluator_id, ctx.org_uuid)
     add_evaluator_to_annotation_task(task_uuid, payload.evaluator_id)
     return {"message": "Evaluator linked to annotation task"}
 
@@ -738,7 +728,7 @@ async def set_task_evaluators(
         )
     # Validate the whole set up front so a bad id links/unlinks nothing.
     for evaluator_id in payload.evaluator_ids:
-        _ensure_owned_evaluator(evaluator_id, ctx.org_uuid)
+        ensure_owned_evaluator(evaluator_id, ctx.org_uuid)
     changed = set_evaluators_for_annotation_task(task_uuid, payload.evaluator_ids)
     current_ids = [e["uuid"] for e in get_evaluators_for_annotation_task(task_uuid)]
     return EvaluatorSetResponse(

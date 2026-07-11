@@ -31,6 +31,13 @@ paths:
     post:
       x-fern-sdk-group-name: agents
       x-fern-sdk-method-name: verify_connection
+  /agents/{agent_uuid}/evaluators:
+    get:
+      x-fern-sdk-group-name: agents
+      x-fern-sdk-method-name: list_evaluators
+    post:
+      x-fern-sdk-group-name: agents
+      x-fern-sdk-method-name: link_evaluators
   /tests:
     post:
       x-fern-sdk-group-name: tests

@@ -9,14 +9,14 @@ import json
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import List, Literal, Optional, Dict, Any, Union
+from typing import Annotated, List, Literal, Optional, Dict, Any, Union
 from urllib.parse import quote
 
 import boto3
 from botocore.config import Config
 import openpyxl
 import sentry_sdk
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +182,7 @@ EvalJobType = Literal["stt-eval", "tts-eval", "annotation-eval"]
 AnnotationTaskTypeLiteral = Literal["stt", "llm", "llm-general", "conversation"]
 TestTypeLiteral = Literal["response", "tool_call", "conversation"]
 MemberRoleLiteral = Literal["owner", "admin"]  # mirrors DB CHECK(role IN ('owner','admin'))
+EvaluatorUuid = Annotated[str, StringConstraints(min_length=36, max_length=36)]
 
 # Bulleted gloss of the agent `type` enum, shared across every model that
 # exposes it (agents, agent-tools, agent-tests, simulations) so the two values

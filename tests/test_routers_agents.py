@@ -385,3 +385,247 @@ def test_update_agent_with_api_key_cannot_self_attest_verification(client):
     )
     assert r2.status_code == 200, r2.text
     assert r2.json()["config"].get("connection_verified") is not True
+
+
+# ============ Agent <-> Evaluator association ============
+
+
+def _create_evaluator(client, h, name=None):
+    """Create a minimal LLM evaluator owned by the caller's org."""
+    resp = client.post(
+        "/evaluators",
+        json={
+            "name": name or f"ev-{uuid.uuid4().hex[:6]}",
+            "evaluator_type": "llm",
+            "output_type": "binary",
+            "version": {
+                "judge_model": "openai/gpt-4.1",
+                "system_prompt": "Judge the reply.",
+            },
+        },
+        headers=h,
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["uuid"]
+
+
+def _default_evaluator_uuid(client, h):
+    """A seeded default evaluator (owner_user_id IS NULL), visible to every org."""
+    items = client.get("/evaluators", headers=h).json()["items"]
+    defaults = [e for e in items if e["is_default"]]
+    assert defaults, "expected at least one seeded default evaluator"
+    return defaults[0]["uuid"]
+
+
+def test_link_list_and_unlink_evaluator(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    ev = _create_evaluator(client, h)
+
+    # Initially none linked.
+    r = client.get(f"/agents/{agent['uuid']}/evaluators", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["total"] == 0
+
+    # Link.
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(f"/agents/{agent['uuid']}/evaluators", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    assert body["items"][0]["uuid"] == ev
+    # Slim list shape (mirrors GET /evaluators).
+    assert "is_default" in body["items"][0]
+    assert "live_version" in body["items"][0]
+
+    # Unlink.
+    r = client.delete(f"/agents/{agent['uuid']}/evaluators/{ev}", headers=h)
+    assert r.status_code == 200, r.text
+    assert client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).json()["total"] == 0
+
+    # Unlinking again is a 404 (link no longer present).
+    r = client.delete(f"/agents/{agent['uuid']}/evaluators/{ev}", headers=h)
+    assert r.status_code == 404
+
+
+def test_link_multiple_evaluators_skips_already_linked(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    a = _create_evaluator(client, h)
+    b = _create_evaluator(client, h)
+    c = _create_evaluator(client, h)
+
+    # Link two at once.
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [a, b]}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert sorted(body["linked"]) == sorted([a, b])
+    assert body["already_linked"] == []
+    assert client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).json()["total"] == 2
+
+    # Link again with one existing + one new: only the new one is linked.
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [b, c]}, headers=h
+    ).json()
+    assert r["linked"] == [c]
+    assert r["already_linked"] == [b]
+    assert client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).json()["total"] == 3
+
+    # A bad id in the set links nothing (validated up front).
+    other_org = _signup(client)
+    foreign = _create_evaluator(client, other_org)
+    d = _create_evaluator(client, h)
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators",
+        json={"evaluator_ids": [d, foreign]},
+        headers=h,
+    )
+    assert r.status_code == 404, r.text
+    assert client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).json()["total"] == 3
+
+
+def test_relink_evaluator_restores_link(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    ev = _create_evaluator(client, h)
+
+    client.post(f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h)
+    client.delete(f"/agents/{agent['uuid']}/evaluators/{ev}", headers=h)
+    # Re-link restores the soft-deleted row rather than erroring on UNIQUE.
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    assert client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).json()["total"] == 1
+
+
+def test_link_evaluator_twice_is_idempotent(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    ev = _create_evaluator(client, h)
+
+    r1 = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h
+    )
+    assert r1.status_code == 200, r1.text
+    r2 = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h
+    )
+    assert r2.status_code == 200, r2.text
+    assert client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).json()["total"] == 1
+
+
+def test_link_default_evaluator_allowed(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    ev = _default_evaluator_uuid(client, h)
+
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    listed = client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).json()
+    assert ev in [e["uuid"] for e in listed["items"]]
+
+
+def test_link_evaluator_from_another_org_is_404(client):
+    h1 = _signup(client)
+    h2 = _signup(client)
+    agent = _create_agent(client, h1, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    other_ev = _create_evaluator(client, h2)  # owned by org 2
+
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [other_ev]}, headers=h1
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_link_evaluator_to_other_org_agent_is_404(client):
+    h1 = _signup(client)
+    h2 = _signup(client)
+    agent = _create_agent(client, h1, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    ev = _create_evaluator(client, h2)
+
+    # org 2 cannot see org 1's agent.
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h2
+    )
+    assert r.status_code == 404, r.text
+    r = client.get(f"/agents/{agent['uuid']}/evaluators", headers=h2)
+    assert r.status_code == 404, r.text
+
+
+def test_evaluator_public_surface_with_api_key(client):
+    """GET (list) and POST (link) are Public API; DELETE (unlink) is JWT-only,
+    so an API key alone is rejected there."""
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    ev = _create_evaluator(client, h)
+    raw = _raw_key(client, h)
+
+    # POST (link) accepts an API key.
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators",
+        json={"evaluator_ids": [ev]},
+        headers={"X-API-Key": raw},
+    )
+    assert r.status_code == 200, r.text
+
+    # GET (list) accepts an API key.
+    r = client.get(
+        f"/agents/{agent['uuid']}/evaluators", headers={"X-API-Key": raw}
+    )
+    assert r.status_code == 200, r.text
+    assert ev in [e["uuid"] for e in r.json()["items"]]
+
+    # DELETE (unlink) is JWT-only — an API key alone is not accepted.
+    r = client.delete(
+        f"/agents/{agent['uuid']}/evaluators/{ev}",
+        headers={"X-API-Key": raw},
+    )
+    assert r.status_code == 403, r.text
+
+
+def test_link_evaluators_malformed_id_is_422(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    r = client.post(
+        f"/agents/{agent['uuid']}/evaluators",
+        json={"evaluator_ids": ["not-a-uuid"]},
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_duplicate_agent_copies_evaluator_links(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    ev = _create_evaluator(client, h)
+    client.post(f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h)
+
+    dup = client.post(
+        f"/agents/{agent['uuid']}/duplicate",
+        json={"name": f"dup-{uuid.uuid4().hex[:6]}"},
+        headers=h,
+    )
+    assert dup.status_code == 200, dup.text
+    dup_uuid = dup.json()["uuid"]
+    listed = client.get(f"/agents/{dup_uuid}/evaluators", headers=h).json()
+    assert ev in [e["uuid"] for e in listed["items"]]
+
+
+def test_delete_agent_removes_evaluator_links(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"ev-agent-{uuid.uuid4().hex[:6]}")
+    ev = _create_evaluator(client, h)
+    client.post(f"/agents/{agent['uuid']}/evaluators", json={"evaluator_ids": [ev]}, headers=h)
+
+    assert client.delete(f"/agents/{agent['uuid']}", headers=h).status_code == 200
+    # The agent is gone -> its evaluator listing 404s.
+    assert client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).status_code == 404

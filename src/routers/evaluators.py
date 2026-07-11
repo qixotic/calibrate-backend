@@ -449,6 +449,26 @@ def _evaluator_response(
     )
 
 
+def build_evaluator_page(
+    page: List[Dict[str, Any]],
+    total: int,
+    pagination,
+) -> PaginatedResponse:
+    """Shape an already-sliced page of evaluator rows into the paginated slim
+    response envelope, resolving every row's live version in ONE batched query
+    (avoids a per-evaluator `get_evaluator_version` N+1). Shared by every
+    endpoint that returns `PaginatedResponse[EvaluatorResponse]` (the global
+    evaluators list and the per-agent evaluators list)."""
+    version_by_id = get_evaluator_versions_by_uuids(
+        [e["live_version_id"] for e in page if e.get("live_version_id")]
+    )
+    return page_envelope(
+        [_evaluator_response(e, version_by_id=version_by_id) for e in page],
+        total,
+        pagination,
+    )
+
+
 # ============ CRUD ============
 
 
@@ -563,17 +583,7 @@ async def list_evaluators(
     )
     evaluators = search.apply(evaluators)
     page, total = count_and_page(evaluators, pagination)
-    # Resolve the PAGE's evaluators' live versions in ONE batched query, then
-    # shape against that map — avoids a per-evaluator `get_evaluator_version`
-    # (N+1), and only over the rows actually returned.
-    version_by_id = get_evaluator_versions_by_uuids(
-        [e["live_version_id"] for e in page if e.get("live_version_id")]
-    )
-    return page_envelope(
-        [_evaluator_response(e, version_by_id=version_by_id) for e in page],
-        total,
-        pagination,
-    )
+    return build_evaluator_page(page, total, pagination)
 
 
 @router.get("/{evaluator_uuid}", response_model=EvaluatorDetailResponseCompact, summary="Get evaluator", tags=["Public API"])

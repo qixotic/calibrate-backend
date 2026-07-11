@@ -425,6 +425,30 @@ def init_db():
 
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS _schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_evaluators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                evaluator_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL,
+                UNIQUE(agent_id, evaluator_id),
+                FOREIGN KEY (agent_id) REFERENCES agents(uuid),
+                FOREIGN KEY (evaluator_id) REFERENCES evaluators(uuid)
+            )
+        """
+        )
+
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uuid TEXT NOT NULL UNIQUE,
@@ -1422,6 +1446,18 @@ def init_db():
         # ============ Evaluator migrations + seed ============
         _seed_default_evaluators(cursor, conn)
         _backfill_test_evaluator_links(cursor, conn)
+        if not _schema_migration_applied(
+            cursor, AGENT_EVALUATORS_BACKFILL_MIGRATION
+        ):
+            inserted = _backfill_agent_evaluator_links(cursor)
+            _mark_schema_migration_applied(
+                cursor, AGENT_EVALUATORS_BACKFILL_MIGRATION
+            )
+            conn.commit()
+            if inserted:
+                logger.info(
+                    f"Backfilled {inserted} agent-evaluator link(s) from test evaluators"
+                )
 
         conn.commit()
         logger.info("Database initialized successfully")
@@ -2371,6 +2407,45 @@ def _backfill_test_evaluator_links(
         logger.info(f"Backfilled {backfilled} LLM test(s) with default evaluator link")
 
 
+AGENT_EVALUATORS_BACKFILL_MIGRATION = "agent_evaluators_from_test_evaluators_v1"
+
+
+def _schema_migration_applied(cursor: sqlite3.Cursor, name: str) -> bool:
+    cursor.execute("SELECT 1 FROM _schema_migrations WHERE name = ?", (name,))
+    return cursor.fetchone() is not None
+
+
+def _mark_schema_migration_applied(cursor: sqlite3.Cursor, name: str) -> None:
+    cursor.execute(
+        "INSERT OR IGNORE INTO _schema_migrations (name) VALUES (?)", (name,)
+    )
+
+
+def _backfill_agent_evaluator_links(cursor: sqlite3.Cursor) -> int:
+    """One-time migration: copy every evaluator linked on an agent's tests onto
+    the agent. Caller commits and records `AGENT_EVALUATORS_BACKFILL_MIGRATION`
+    in the same transaction so a crash mid-migration retries on next init_db."""
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO agent_evaluators (agent_id, evaluator_id)
+        SELECT DISTINCT at.agent_id, te.evaluator_id
+          FROM agent_tests at
+          JOIN test_evaluators te
+            ON te.test_id = at.test_id AND te.deleted_at IS NULL
+          JOIN evaluators e
+            ON e.uuid = te.evaluator_id AND e.deleted_at IS NULL
+          JOIN agents a
+            ON a.uuid = at.agent_id AND a.deleted_at IS NULL
+          JOIN tests t
+            ON t.uuid = at.test_id AND t.deleted_at IS NULL
+         WHERE at.deleted_at IS NULL
+        """
+    )
+    cursor.execute("SELECT changes()")
+    row = cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
 # ============ Users Functions ============
 
 
@@ -2761,7 +2836,15 @@ def create_api_key(
                 (uuid, org_uuid, owner_user_id, name, key_prefix, key_last_four, key_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (key_uuid, org_uuid, owner_user_id, name, key_prefix, key_last_four, key_hash),
+            (
+                key_uuid,
+                org_uuid,
+                owner_user_id,
+                name,
+                key_prefix,
+                key_last_four,
+                key_hash,
+            ),
         )
         conn.commit()
         cursor.execute(
@@ -3127,7 +3210,7 @@ def update_agent(
 
 def delete_agent(agent_uuid: str) -> bool:
     """Soft delete an agent. Returns True if the agent was found and deleted.
-    Also soft deletes related agent_tools and agent_tests.
+    Also soft deletes related agent_tools, agent_tests, and agent_evaluators.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -3146,6 +3229,11 @@ def delete_agent(agent_uuid: str) -> bool:
             # Soft delete related agent_tests
             cursor.execute(
                 "UPDATE agent_tests SET deleted_at = CURRENT_TIMESTAMP WHERE agent_id = ? AND deleted_at IS NULL",
+                (agent_uuid,),
+            )
+            # Soft delete related agent_evaluators
+            cursor.execute(
+                "UPDATE agent_evaluators SET deleted_at = CURRENT_TIMESTAMP WHERE agent_id = ? AND deleted_at IS NULL",
                 (agent_uuid,),
             )
             logger.info(f"Soft deleted agent with UUID: {agent_uuid}")
@@ -3365,6 +3453,114 @@ def get_tools_for_agent(agent_id: str) -> List[Dict[str, Any]]:
         )
         rows = cursor.fetchall()
         return [_parse_tool_row(row) for row in rows]
+
+
+# ============ Agent Evaluators Functions ============
+
+
+def _restore_agent_evaluator_link(cursor: sqlite3.Cursor, link_id: int) -> None:
+    """Un-soft-delete an `agent_evaluators` row, refreshing `created_at` so the
+    re-link sorts as recently-added rather than inheriting its first-add time.
+    Caller commits."""
+    cursor.execute(
+        "UPDATE agent_evaluators SET deleted_at = NULL, "
+        "created_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (link_id,),
+    )
+
+
+def add_evaluator_to_agent(agent_id: str, evaluator_id: str) -> int:
+    """Link an evaluator to an agent. Returns the id of the created/restored link.
+    If a soft-deleted link exists, it is restored by unsetting deleted_at and
+    resetting created_at to now, so a re-added evaluator sorts as recently-linked
+    in get_evaluators_for_agent's created_at order rather than inheriting its
+    original link time. An already-active link is a no-op that returns the
+    existing pivot id.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, deleted_at FROM agent_evaluators "
+            "WHERE agent_id = ? AND evaluator_id = ?",
+            (agent_id, evaluator_id),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            if existing["deleted_at"] is None:
+                return existing["id"]
+            _restore_agent_evaluator_link(cursor, existing["id"])
+            conn.commit()
+            logger.info(f"Restored evaluator {evaluator_id} to agent {agent_id}")
+            return existing["id"]
+        try:
+            cursor.execute(
+                """
+                INSERT INTO agent_evaluators (agent_id, evaluator_id)
+                VALUES (?, ?)
+                """,
+                (agent_id, evaluator_id),
+            )
+            conn.commit()
+            link_id = cursor.lastrowid
+            logger.info(f"Added evaluator {evaluator_id} to agent {agent_id}")
+            return link_id
+        except sqlite3.IntegrityError:
+            # A concurrent request inserted the same (agent_id, evaluator_id)
+            # between the SELECT above and this INSERT, tripping the UNIQUE
+            # constraint. Treat it as an already-satisfied link: roll back, then
+            # re-read the winning row (restoring it if that racer left it
+            # soft-deleted) and return its id instead of surfacing a 500.
+            conn.rollback()
+            cursor.execute(
+                "SELECT id, deleted_at FROM agent_evaluators "
+                "WHERE agent_id = ? AND evaluator_id = ?",
+                (agent_id, evaluator_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise
+            if row["deleted_at"] is not None:
+                _restore_agent_evaluator_link(cursor, row["id"])
+                conn.commit()
+            return row["id"]
+
+
+def remove_evaluator_from_agent(agent_id: str, evaluator_id: str) -> bool:
+    """Soft delete an evaluator from an agent. Returns True if the link was found and deleted."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE agent_evaluators SET deleted_at = CURRENT_TIMESTAMP WHERE agent_id = ? AND evaluator_id = ? AND deleted_at IS NULL",
+            (agent_id, evaluator_id),
+        )
+        conn.commit()
+        deleted = cursor.rowcount > 0
+
+        if deleted:
+            logger.info(f"Soft deleted evaluator {evaluator_id} from agent {agent_id}")
+
+        return deleted
+
+
+def get_evaluators_for_agent(agent_id: str) -> List[Dict[str, Any]]:
+    """Get all evaluators linked to an agent.
+
+    Returns full evaluator rows (same shape as `get_evaluator`), most recently
+    linked first. Evaluator soft-delete does not cascade to the pivot, so the
+    JOIN filters `e.deleted_at IS NULL` to hide links whose evaluator is gone.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT e.* FROM evaluators e
+            INNER JOIN agent_evaluators ae ON e.uuid = ae.evaluator_id
+            WHERE ae.agent_id = ? AND ae.deleted_at IS NULL AND e.deleted_at IS NULL
+            ORDER BY ae.created_at DESC, ae.id DESC
+            """,
+            (agent_id,),
+        )
+        return [_parse_evaluator_row(row) for row in cursor.fetchall()]
 
 
 def get_agents_for_tool(tool_id: str) -> List[Dict[str, Any]]:
@@ -4365,8 +4561,7 @@ def get_evaluator_versions_by_uuids(
             unique_uuids,
         )
         return {
-            row["uuid"]: _parse_evaluator_version_row(row)
-            for row in cursor.fetchall()
+            row["uuid"]: _parse_evaluator_version_row(row) for row in cursor.fetchall()
         }
 
 
@@ -7284,9 +7479,7 @@ def create_annotation_job(
             # position order (re-numbered 1..N below so the job's own
             # positions stay gap-free).
             wanted = set(evaluator_ids)
-            snapshot_rows = [
-                r for r in snapshot_rows if r["evaluator_id"] in wanted
-            ]
+            snapshot_rows = [r for r in snapshot_rows if r["evaluator_id"] in wanted]
         if snapshot_rows:
             cursor.executemany(
                 "INSERT INTO annotation_job_evaluators "

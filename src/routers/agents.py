@@ -15,10 +15,11 @@ from pagination import (
 )
 
 _AgentSearch = make_search_params(searchable=["name"])
+_AgentEvaluatorSearch = make_search_params(searchable=["name"])
 from pydantic import BaseModel, Field
 from calibrate_agent.connections import TextAgentConnection
 
-from utils import env_bool, env_int, env_str, AGENT_TYPE_DESCRIPTION
+from utils import env_bool, env_int, env_str, AGENT_TYPE_DESCRIPTION, EvaluatorUuid
 
 from db import (
     create_agent,
@@ -31,8 +32,18 @@ from db import (
     get_tests_for_agent,
     add_tool_to_agent,
     add_test_to_agent,
+    get_evaluators_for_agent,
+    add_evaluator_to_agent,
+    remove_evaluator_from_agent,
 )
 from auth_utils import get_current_org, get_org_jwt_or_api_key, OrgContext
+from org_scope import ensure_owned_agent, ensure_owned_evaluator
+
+# Evaluators router imports no routers, so this edge (agents -> evaluators) is
+# acyclic and safe at module load — needed because the list endpoint's
+# `response_model` references `EvaluatorResponse` and it shares that router's
+# page-shaping helper.
+from routers.evaluators import EvaluatorResponse, build_evaluator_page
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +438,26 @@ class AgentDuplicateResponse(BaseModel):
     message: str = Field(description="Confirmation message")
 
 
+class EvaluatorLinkRequest(BaseModel):
+    evaluator_ids: List[EvaluatorUuid] = Field(
+        description="The evaluators to link to the agent. Ones that are already linked are skipped. Each must be one you created or a built-in default",
+        examples=[["f47ac10b-58cc-4372-a567-0e02b2c3d479"]],
+    )
+
+
+class EvaluatorLinkResponse(BaseModel):
+    message: str = Field(
+        description="Confirmation that the evaluators were linked",
+        examples=["Evaluators linked to agent"],
+    )
+    linked: List[str] = Field(
+        description="Evaluator IDs newly linked by this request"
+    )
+    already_linked: List[str] = Field(
+        description="Evaluator IDs skipped because they were already linked"
+    )
+
+
 class ResolveAgentNamesRequest(BaseModel):
     names: List[str] = Field(
         description="Agent names to resolve to IDs",
@@ -819,7 +850,108 @@ async def duplicate_agent_endpoint(
                 f"Failed to link test {test['uuid']} to duplicated agent: {e}"
             )
 
+    # Copy all linked evaluators
+    linked_evaluators = get_evaluators_for_agent(agent_uuid)
+    for evaluator in linked_evaluators:
+        try:
+            add_evaluator_to_agent(new_agent_uuid, evaluator["uuid"])
+        except Exception as e:
+            # Log but continue - don't fail the entire duplication
+            logger.warning(
+                f"Failed to link evaluator {evaluator['uuid']} to duplicated agent: {e}"
+            )
+
     return AgentDuplicateResponse(
         uuid=new_agent_uuid,
-        message="Agent duplicated successfully with all linked tools and tests",
+        message="Agent duplicated successfully with all linked tools, tests, and evaluators",
     )
+
+
+# ============ Evaluator linking ============
+
+
+@router.get(
+    "/{agent_uuid}/evaluators",
+    response_model=PaginatedResponse[EvaluatorResponse],
+    summary="List agent evaluators",
+    tags=["Public API"],
+)
+async def list_agent_evaluators(
+    agent_uuid: str = Path(
+        description="The agent whose evaluators to list",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    ctx: OrgContext = Depends(get_org_jwt_or_api_key),
+    search: _AgentEvaluatorSearch = Depends(),
+    pagination: OptionalPaginationParams = Depends(),
+):
+    """List evaluators linked to an agent"""
+    ensure_owned_agent(agent_uuid, ctx.org_uuid)
+    evaluators = get_evaluators_for_agent(agent_uuid)
+    evaluators = search.apply(evaluators)
+    page, total = count_and_page(evaluators, pagination)
+    return build_evaluator_page(page, total, pagination)
+
+
+@router.post(
+    "/{agent_uuid}/evaluators",
+    response_model=EvaluatorLinkResponse,
+    summary="Link evaluators to agent",
+    tags=["Public API"],
+)
+async def link_evaluators_to_agent(
+    agent_uuid: str = Path(
+        description="The agent to link the evaluators to",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    payload: EvaluatorLinkRequest = ...,
+    ctx: OrgContext = Depends(get_org_jwt_or_api_key),
+):
+    """Link one or more existing evaluators to an agent, skipping any already linked"""
+    ensure_owned_agent(agent_uuid, ctx.org_uuid)
+    # Validate every id up front so a bad one links nothing.
+    for evaluator_id in payload.evaluator_ids:
+        ensure_owned_evaluator(evaluator_id, ctx.org_uuid)
+    current = {e["uuid"] for e in get_evaluators_for_agent(agent_uuid)}
+    linked: List[str] = []
+    already_linked: List[str] = []
+    seen: set = set()
+    for evaluator_id in payload.evaluator_ids:
+        if evaluator_id in seen:
+            continue
+        seen.add(evaluator_id)
+        if evaluator_id in current:
+            already_linked.append(evaluator_id)
+        else:
+            add_evaluator_to_agent(agent_uuid, evaluator_id)
+            linked.append(evaluator_id)
+    return EvaluatorLinkResponse(
+        message="Evaluators linked to agent",
+        linked=linked,
+        already_linked=already_linked,
+    )
+
+
+@router.delete(
+    "/{agent_uuid}/evaluators/{evaluator_uuid}",
+    summary="Unlink evaluator from agent",
+)
+async def unlink_evaluator_from_agent(
+    agent_uuid: str = Path(
+        description="The agent to unlink the evaluator from",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    evaluator_uuid: str = Path(
+        description="The evaluator to unlink from the agent",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    ctx: OrgContext = Depends(get_current_org),
+):
+    """Unlink an evaluator from an agent"""
+    ensure_owned_agent(agent_uuid, ctx.org_uuid)
+    removed = remove_evaluator_from_agent(agent_uuid, evaluator_uuid)
+    if not removed:
+        raise HTTPException(
+            status_code=404, detail="Evaluator is not linked to this agent"
+        )
+    return {"message": "Evaluator unlinked from agent"}

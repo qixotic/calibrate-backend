@@ -11,8 +11,10 @@ freshly minted name/uuid so tests are order-independent.
 
 from __future__ import annotations
 
+import sqlite3
 import time
 import uuid as _uuid
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -593,6 +595,78 @@ def test_agent_tests_pivot_and_test_evaluators(user):
     no_live = db.create_evaluator(name=_u("no-live"), owner_user_id=user["uuid"], org_uuid=user["org_uuid"])
     with pytest.raises(ValueError):
         db.set_test_evaluators(test_uuid, [{"evaluator_id": no_live}])
+
+
+def test_backfill_agent_evaluator_links_from_test_evaluators(user):
+    """On first deploy the agent_evaluators pivot is backfilled once from
+    test_evaluators; later init_db() runs skip it."""
+    agent_uuid = db.create_agent(
+        name=_u("a-backfill-ev"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    test_uuid = db.create_test(
+        name=_u("t-backfill-ev"), type="llm", user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    other_test = db.create_test(
+        name=_u("t-backfill-ev2"), type="llm", user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    db.add_test_to_agent(agent_uuid, test_uuid)
+    db.add_test_to_agent(agent_uuid, other_test)
+
+    seeded_a = db.get_evaluator_by_slug("default-safety")
+    seeded_b = db.get_evaluator_by_slug("default-helpfulness")
+    v_a = db.get_evaluator_versions(seeded_a["uuid"])[0]
+    v_b = db.get_evaluator_versions(seeded_b["uuid"])[0]
+    db.add_evaluator_to_test(test_uuid, seeded_a["uuid"], v_a["uuid"])
+    db.add_evaluator_to_test(other_test, seeded_b["uuid"], v_b["uuid"])
+
+    # Simulate a pre-feature DB: pivots exist, but agent_evaluators and its
+    # migration flag have not been applied yet.
+    with db.get_db_connection() as conn:
+        conn.execute("DROP TABLE IF EXISTS agent_evaluators")
+        conn.execute(
+            "DELETE FROM _schema_migrations WHERE name = ?",
+            (db.AGENT_EVALUATORS_BACKFILL_MIGRATION,),
+        )
+        conn.commit()
+
+    db.init_db()
+    linked = {e["uuid"] for e in db.get_evaluators_for_agent(agent_uuid)}
+    assert linked == {seeded_a["uuid"], seeded_b["uuid"]}
+
+    # Migration flag is set — a later init_db() does not re-run the backfill.
+    assert db.remove_evaluator_from_agent(agent_uuid, seeded_a["uuid"]) is True
+    db.init_db()
+    assert seeded_a["uuid"] not in {e["uuid"] for e in db.get_evaluators_for_agent(agent_uuid)}
+    assert seeded_b["uuid"] in {e["uuid"] for e in db.get_evaluators_for_agent(agent_uuid)}
+
+
+def test_backfill_agent_evaluator_links_retries_after_crash_mid_migration(user):
+    """If deploy creates agent_evaluators but crashes before the backfill
+    commits, the next init_db() still runs the migration."""
+    agent_uuid = db.create_agent(
+        name=_u("a-crash-ev"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    test_uuid = db.create_test(
+        name=_u("t-crash-ev"), type="llm", user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    db.add_test_to_agent(agent_uuid, test_uuid)
+    seeded = db.get_evaluator_by_slug("default-safety")
+    v = db.get_evaluator_versions(seeded["uuid"])[0]
+    db.add_evaluator_to_test(test_uuid, seeded["uuid"], v["uuid"])
+
+    with db.get_db_connection() as conn:
+        conn.execute("DELETE FROM agent_evaluators")
+        conn.execute(
+            "DELETE FROM _schema_migrations WHERE name = ?",
+            (db.AGENT_EVALUATORS_BACKFILL_MIGRATION,),
+        )
+        conn.commit()
+
+    assert db.get_evaluators_for_agent(agent_uuid) == []
+
+    db.init_db()
+    linked = {e["uuid"] for e in db.get_evaluators_for_agent(agent_uuid)}
+    assert linked == {seeded["uuid"]}
 
 
 def test_get_evaluators_for_test_resolves_live_version(user):
@@ -1377,3 +1451,61 @@ def test_name_uniqueness_helpers(user):
             "personas", name, user["org_uuid"], entity="Persona"
         ):
             pass  # would do an insert
+
+
+def test_add_evaluator_to_agent_recovers_from_concurrent_insert():
+    """If a racing insert trips the UNIQUE(agent_id, evaluator_id) constraint
+    between the existence check and our INSERT, add_evaluator_to_agent recovers
+    to the winning row and returns its id instead of raising a 500."""
+    cursor = MagicMock()
+    # SELECT (miss) -> INSERT (UNIQUE conflict) -> re-SELECT (winning row).
+    cursor.execute.side_effect = [
+        None,
+        sqlite3.IntegrityError(
+            "UNIQUE constraint failed: agent_evaluators.agent_id, "
+            "agent_evaluators.evaluator_id"
+        ),
+        None,
+    ]
+    cursor.fetchone.side_effect = [
+        None,  # initial existence check: nothing yet
+        {"id": 4242, "deleted_at": None},  # the racer's committed row
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    cm = MagicMock()
+    cm.__enter__.return_value = conn
+    cm.__exit__.return_value = False
+
+    with patch("db.get_db_connection", return_value=cm):
+        link_id = db.add_evaluator_to_agent("agent-x", "eval-y")
+
+    assert link_id == 4242
+    conn.rollback.assert_called_once()
+
+
+def test_add_evaluator_to_agent_race_restores_soft_deleted_winner():
+    """If the racing row landed soft-deleted, the recovery path restores it."""
+    cursor = MagicMock()
+    cursor.execute.side_effect = [
+        None,  # initial SELECT
+        sqlite3.IntegrityError("UNIQUE constraint failed"),  # INSERT
+        None,  # re-SELECT
+        None,  # UPDATE restore
+    ]
+    cursor.fetchone.side_effect = [
+        None,
+        {"id": 77, "deleted_at": "2026-07-11 00:00:00"},
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    cm = MagicMock()
+    cm.__enter__.return_value = conn
+    cm.__exit__.return_value = False
+
+    with patch("db.get_db_connection", return_value=cm):
+        link_id = db.add_evaluator_to_agent("agent-x", "eval-y")
+
+    assert link_id == 77
+    # The restore UPDATE ran (4 execute calls total incl. the restore).
+    assert cursor.execute.call_count == 4
