@@ -224,8 +224,9 @@ class TaskSummaryResponse(BaseModel):
     rows: List[Dict[str, Any]] = Field(
         description="One row per item, evaluator, and version on this page, with the evaluator's value and each annotator's label"
     )
-    item_comments: Dict[str, Any] = Field(
-        description="Annotator comments, keyed by item ID"
+    item_comments: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Annotator comments, keyed by item ID",
     )
     pagination: PaginationMeta = Field(
         description="Where this page sits in the full item list"
@@ -263,6 +264,7 @@ from pagination import (
     PaginatedResponse,
     PaginationParams,
     count_and_page,
+    make_projection_params,
     make_search_params,
     make_sort_params,
     page_envelope,
@@ -278,6 +280,20 @@ _SummarySort = make_sort_params(
     default_order="desc",
 )
 _SummarySearch = make_search_params(searchable=["payload.name"])
+
+# `?compact` drops the heavy fields, keeping values/agreement/ids so the table
+# pages cheaply.
+_SummaryProjection = make_projection_params(
+    heavy_fields=[
+        "rows[].payload",
+        "rows[].evaluator_reasoning",
+        "rows[].annotations.*.reasoning",
+        "evaluators[].versions[].system_prompt",
+        "evaluators[].versions[].output_config",
+        "evaluators[].versions[].variables",
+        "item_comments",
+    ]
+)
 from annotation_metrics import (
     aggregate_agreement,
     aggregate_human_evaluator_agreement,
@@ -2503,10 +2519,15 @@ async def task_summary(
         False,
         description="When true, emit only one row for each (item, evaluator) pair using the evaluator's live version. Versions other than the live one that have runs are excluded",
     ),
+    disagreement_only: bool = Query(
+        False,
+        description="When true, keep only rows where the evaluator disagreed with at least one annotator",
+    ),
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
     search: _SummarySearch = Depends(),
     sort: _SummarySort = Depends(),
     pagination: PaginationParams = Depends(),
+    projection: _SummaryProjection = Depends(),
 ):
     """Get a paginated summary table of items, evaluator runs, and human annotations for a task"""
     task = _ensure_owned_task(task_uuid, ctx.org_uuid)
@@ -2535,12 +2556,11 @@ async def task_summary(
     # Mechanics live in `pagination.make_search_params`.
     items = search.apply(items)
 
-    # `items` is now the full scope (task-wide or filtered by item_id/q).
-    # Keep it untouched for scoped_item_ids / annotator union / run_count
-    # so the top-level evaluators[] and annotators[] blocks stay stable
-    # across pages (consistent column headers in the FE table). Pagination
-    # only slices which items get expanded into `rows`.
-    total_items = len(items)
+    # `items` is the full in-scope set (task-wide or filtered by item_id/q).
+    # scoped_item_ids / the annotator union / run_count read from it so the
+    # top-level evaluators[] and annotators[] column headers stay stable across
+    # pages. `total_items` and the slice are taken after the disagreement filter
+    # below, so paging covers only the matching items.
 
     # Sort the in-scope items before pagination so paging is stable across
     # requests. Mechanics live in `pagination.make_sort_params`.
@@ -2553,7 +2573,6 @@ async def task_summary(
     # which matches `get_annotation_items_for_task`'s historical
     # `ORDER BY id DESC` and is what users actually expect after a bulk add.
     items = sort.apply(items, secondary_key="id")
-    paged_items = items[pagination.offset : pagination.offset + pagination.limit]
 
     # Latest evaluator_run per (item, evaluator, version). One row in the
     # response per distinct version that has run, so re-running on a new
@@ -2709,6 +2728,65 @@ async def task_summary(
             return (0 if v_id == live_v else 1, num if num is not None else 1 << 30)
         return sorted(versions, key=_sort_key)
 
+    # Shared agreement math for the row builder and the `disagreement_only`
+    # pre-filter, so the paging count and the visible rows can't diverge.
+
+    def _slot_human_scalars(item_uuid: str, ev_id: str) -> List[Any]:
+        """Non-null human annotation scalars for one (item, evaluator) slot."""
+        out: List[Any] = []
+        for annotator in annotators:
+            a = latest_ann.get((item_uuid, ev_id, annotator["uuid"]))
+            if a is None:
+                continue
+            scalar = _scalar(a.get("value"))
+            if scalar is not None:
+                out.append(scalar)
+        return out
+
+    def _evaluator_agreement(
+        run_value: Any, slot_human_scalars: List[Any]
+    ) -> Optional[float]:
+        """Evaluator-vs-human agreement for one (item, evaluator, version) slot,
+        or None when the evaluator produced no value or there are no human
+        labels. Shares `evaluator_human_pair_agreement` with the task-level
+        rollup so the two endpoints stay consistent."""
+        eval_scalar = _scalar(run_value) if run_value is not None else None
+        if eval_scalar is None or not slot_human_scalars:
+            return None
+        total, pairs = evaluator_human_pair_agreement(eval_scalar, slot_human_scalars)
+        return _round_agreement(total / pairs) if pairs > 0 else None
+
+    def _is_disagreement(agreement: Optional[float]) -> bool:
+        """A slot disagrees when the evaluator scored below perfect agreement.
+        None (no evaluator value / no human labels) is NOT a disagreement."""
+        return agreement is not None and agreement < 1.0
+
+    def _item_disagrees(item: Dict[str, Any]) -> bool:
+        """True if any (evaluator, version) slot on this item disagrees."""
+        item_uuid = item["uuid"]
+        for ev in evaluators:
+            ev_id = ev["uuid"]
+            live_v = ev.get("live_version_id")
+            slot_human_scalars = _slot_human_scalars(item_uuid, ev_id)
+            if not slot_human_scalars:
+                continue
+            for version_id in _version_row_keys(ev_id, live_v):
+                run = latest_run.get((item_uuid, ev_id, version_id))
+                run_value = run.get("value") if run else None
+                if _is_disagreement(
+                    _evaluator_agreement(run_value, slot_human_scalars)
+                ):
+                    return True
+        return False
+
+    # Filter items before slicing so `total` and paging cover the whole
+    # disagreeing set, not just matches on the current page. The row-level
+    # filter below then drops the agreeing rows within each surviving item.
+    if disagreement_only:
+        items = [it for it in items if _item_disagrees(it)]
+    total_items = len(items)
+    paged_items = items[pagination.offset : pagination.offset + pagination.limit]
+
     rows: List[Dict[str, Any]] = []
     for item in paged_items:
         # Annotations are not version-scoped (the table has no
@@ -2719,7 +2797,6 @@ async def task_summary(
             live_v = ev.get("live_version_id")
 
             ann_cells: Dict[str, Optional[Dict[str, Any]]] = {}
-            slot_human_scalars: List[Any] = []
             for annotator in annotators:
                 a = latest_ann.get((item["uuid"], ev_id, annotator["uuid"]))
                 if a is None:
@@ -2730,9 +2807,7 @@ async def task_summary(
                     "value": val,
                     "reasoning": reasoning,
                 }
-                scalar = _scalar(a.get("value"))
-                if scalar is not None:
-                    slot_human_scalars.append(scalar)
+            slot_human_scalars = _slot_human_scalars(item["uuid"], ev_id)
 
             hh_mean, hh_pairs = _pairwise_agreement(slot_human_scalars)
             human_agreement = (
@@ -2745,21 +2820,9 @@ async def task_summary(
                 ev_value, ev_reasoning = _scalar_and_reasoning(run_value)
                 version_meta = _version_meta(version_id)
 
-                # Per-row evaluator agreement: pairs THIS version's run value
-                # with every human annotation on the (item, evaluator) slot.
-                # Per-version, so each version row gets its own number. Shares
-                # `evaluator_human_pair_agreement` with the task-level rollup
-                # so the two endpoints stay consistent.
-                eval_scalar = (
-                    _scalar(run_value) if run_value is not None else None
+                evaluator_agreement = _evaluator_agreement(
+                    run_value, slot_human_scalars
                 )
-                evaluator_agreement: Optional[float] = None
-                if eval_scalar is not None and slot_human_scalars:
-                    total, pairs = evaluator_human_pair_agreement(
-                        eval_scalar, slot_human_scalars
-                    )
-                    if pairs > 0:
-                        evaluator_agreement = _round_agreement(total / pairs)
 
                 rows.append(
                     {
@@ -2783,6 +2846,11 @@ async def task_summary(
                         "evaluator_agreement": evaluator_agreement,
                     }
                 )
+
+    # Drop the agreeing rows within the (already item-filtered) page.
+    # `pagination.total` stays the item count; each item keeps ≥1 row.
+    if disagreement_only:
+        rows = [r for r in rows if _is_disagreement(r.get("evaluator_agreement"))]
 
     # Build the enriched top-level `evaluators[]` block — one entry per
     # linked evaluator with the per-version rubric inlined so the FE has
@@ -2868,7 +2936,7 @@ async def task_summary(
         if surviving_cells:
             item_comments[cmt_item_id] = surviving_cells
 
-    return {
+    response: Dict[str, Any] = {
         "task_id": task_uuid,
         "task_type": task["type"],
         "evaluators": evaluators_block,
@@ -2881,6 +2949,9 @@ async def task_summary(
             "offset": pagination.offset,
         },
     }
+
+    # `?compact` nulls the heavy fields in place; no-op otherwise.
+    return projection.apply(response)
 
 
 @router.delete("/{task_uuid}/evaluators/{evaluator_uuid}", summary="Unlink evaluator from task")

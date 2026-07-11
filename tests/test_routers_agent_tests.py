@@ -505,6 +505,262 @@ def test_slim_run_list_helpers_guard_edge_cases():
     ]
 
 
+def _seed_run_job(client, h, agent):
+    """Seed a unit-test run with three cases (one pass, one fail, one still
+    pending/`passed=None`) and an evaluator carrying a rubric, for the
+    run-detail compact/only_failed tests."""
+    from db import create_agent_test_job, update_agent_test_job
+
+    job_id = create_agent_test_job(
+        agent_id=agent["uuid"],
+        job_type="llm-unit-test",
+        details={
+            "evaluators_by_test_id": {
+                "tc_pass": [
+                    {
+                        "uuid": "ev1",
+                        "name": "correctness",
+                        "output_type": "binary",
+                        "output_config": {
+                            "scale": [
+                                {"value": False, "name": "Wrong"},
+                                {"value": True, "name": "Right"},
+                            ]
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    update_agent_test_job(
+        job_id,
+        status="done",
+        results={
+            "total_tests": 3,
+            "passed": 1,
+            "failed": 1,
+            "test_results": [
+                {
+                    "name": "tc_pass",
+                    "test_case_id": "tc_pass",
+                    "passed": True,
+                    "output": {"response": "hi", "tool_calls": None},
+                    "test_case": {"name": "tc_pass", "history": []},
+                    "reasoning": "looks good",
+                    "judge_results": [
+                        {"evaluator_uuid": NONEXISTENT_UUID, "match": True}
+                    ],
+                },
+                {
+                    "name": "tc_fail",
+                    "test_case_id": "tc_fail",
+                    "passed": False,
+                    "output": {"response": "nope", "tool_calls": None},
+                    "test_case": {"name": "tc_fail", "history": []},
+                    "reasoning": "wrong answer",
+                    "judge_results": [
+                        {"evaluator_uuid": NONEXISTENT_UUID, "match": False}
+                    ],
+                },
+                {
+                    # Pending case — not finished yet (`passed is None`),
+                    # matching the pending placeholder shape.
+                    "name": "tc_pending",
+                    "test_case_id": None,
+                    "passed": None,
+                    "output": None,
+                    "test_case": None,
+                    "reasoning": None,
+                    "judge_results": None,
+                },
+            ],
+        },
+    )
+    return job_id
+
+
+def test_run_detail_default_is_full(client):
+    """No query params → the run-detail response carries every heavy field."""
+    h = _signup(client)["headers"]
+    agent = _create_agent(client, h)
+    job_id = _seed_run_job(client, h, agent)
+
+    resp = client.get(f"/agent-tests/run/{job_id}", headers=h)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["results"]) == 3
+    case = body["results"][0]
+    assert case["output"] is not None
+    assert case["test_case"] is not None
+    assert case["judge_results"] is not None
+    assert case["reasoning"] is not None
+    assert body["evaluators"][0]["output_config"] is not None
+
+
+def test_run_detail_compact_nulls_heavy_fields(client):
+    """`?compact=true` nulls the heavy per-case + evaluator fields but keeps the
+    slim identity fields (name/passed/status)."""
+    h = _signup(client)["headers"]
+    agent = _create_agent(client, h)
+    job_id = _seed_run_job(client, h, agent)
+
+    resp = client.get(
+        f"/agent-tests/run/{job_id}", params={"compact": "true"}, headers=h
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "done"
+    assert len(body["results"]) == 3
+    for case in body["results"]:
+        assert case["output"] is None
+        assert case["test_case"] is None
+        assert case["judge_results"] is None
+        assert case["reasoning"] is None
+        # Slim fields survive.
+        assert case["name"] in {"tc_pass", "tc_fail", "tc_pending"}
+        assert case["passed"] in {True, False, None}
+    assert body["evaluators"][0]["output_config"] is None
+    # Non-heavy evaluator fields survive.
+    assert body["evaluators"][0]["name"] == "correctness"
+
+
+def test_run_detail_only_failed_narrows_results(client):
+    """`?only_failed=true` keeps only failing cases (`passed is False`). The
+    pass is dropped, and the still-pending case (`passed is None`) is dropped
+    too — a mid-run poll must not surface unfinished cases as failures."""
+    h = _signup(client)["headers"]
+    agent = _create_agent(client, h)
+    job_id = _seed_run_job(client, h, agent)
+
+    resp = client.get(
+        f"/agent-tests/run/{job_id}", params={"only_failed": "true"}, headers=h
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [c["name"] for c in body["results"]] == ["tc_fail"]
+    # Heavy fields still present (compact not requested).
+    assert body["results"][0]["output"] is not None
+
+
+def _seed_benchmark_job(client, h, agent):
+    """Seed a completed benchmark run with one model holding a pass + fail case."""
+    from db import create_agent_test_job, update_agent_test_job
+
+    job_id = create_agent_test_job(
+        agent_id=agent["uuid"],
+        job_type="llm-benchmark",
+        details={
+            "evaluators_by_test_id": {
+                "tc_pass": [
+                    {
+                        "uuid": "ev1",
+                        "name": "correctness",
+                        "output_type": "binary",
+                        "output_config": {
+                            "scale": [
+                                {"value": False, "name": "Wrong"},
+                                {"value": True, "name": "Right"},
+                            ]
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    update_agent_test_job(
+        job_id,
+        status="done",
+        results={
+            "model_results": [
+                {
+                    "model": "openai/gpt-4.1",
+                    "success": True,
+                    "message": "ok",
+                    "total_tests": 3,
+                    "passed": 1,
+                    "failed": 1,
+                    "test_results": [
+                        {
+                            "name": "tc_pass",
+                            "passed": True,
+                            "output": {"response": "hi"},
+                        },
+                        {
+                            "name": "tc_fail",
+                            "passed": False,
+                            "output": {"response": "no"},
+                        },
+                        {
+                            # Pending case — not finished yet (`passed is None`).
+                            "name": "tc_pending",
+                            "passed": None,
+                            "output": None,
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+    return job_id
+
+
+def test_benchmark_detail_default_is_full(client):
+    """No query params → benchmark detail keeps each model's test_results and the
+    evaluator rubric."""
+    h = _signup(client)["headers"]
+    agent = _create_agent(client, h)
+    job_id = _seed_benchmark_job(client, h, agent)
+
+    resp = client.get(f"/agent-tests/benchmark/{job_id}", headers=h)
+    assert resp.status_code == 200
+    body = resp.json()
+    model = body["model_results"][0]
+    assert len(model["test_results"]) == 3
+    assert body["evaluators"][0]["output_config"] is not None
+
+
+def test_benchmark_detail_compact_nulls_heavy_fields(client):
+    """`?compact=true` nulls each model's test_results + the evaluator rubric,
+    keeping model-level scalar fields."""
+    h = _signup(client)["headers"]
+    agent = _create_agent(client, h)
+    job_id = _seed_benchmark_job(client, h, agent)
+
+    resp = client.get(
+        f"/agent-tests/benchmark/{job_id}", params={"compact": "true"}, headers=h
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "done"
+    model = body["model_results"][0]
+    assert model["test_results"] is None
+    # Model-level scalars survive.
+    assert model["model"] == "openai/gpt-4.1"
+    assert model["passed"] == 1
+    assert model["failed"] == 1
+    assert body["evaluators"][0]["output_config"] is None
+
+
+def test_benchmark_detail_only_failed_narrows_each_model(client):
+    """`?only_failed=true` narrows each model's test_results to failing cases
+    (`passed is False`), dropping the pass and the still-pending case
+    (`passed is None`), and leaving model-level fields intact."""
+    h = _signup(client)["headers"]
+    agent = _create_agent(client, h)
+    job_id = _seed_benchmark_job(client, h, agent)
+
+    resp = client.get(
+        f"/agent-tests/benchmark/{job_id}", params={"only_failed": "true"}, headers=h
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    model = body["model_results"][0]
+    assert [c["name"] for c in model["test_results"]] == ["tc_fail"]
+    # Model-level fields untouched.
+    assert model["passed"] == 1
+    assert model["total_tests"] == 3
+
+
 def test_agent_tests_link_with_missing(client):
     auth = _signup(client)
     h = auth["headers"]

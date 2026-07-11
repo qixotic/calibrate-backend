@@ -14,6 +14,7 @@ from pagination import (
     OptionalPaginationParams,
     PaginationParams,
     count_and_page,
+    make_projection_params,
     make_search_params,
     make_sort_params,
     page_envelope,
@@ -215,3 +216,114 @@ def test_search_params_matches_any_listed_path():
         {"name": "z", "description": "z"},
     ]
     assert len(Search(q="alpha").apply(items)) == 2
+
+
+# ---------------------------------------------------------------------------
+# make_projection_params (?compact=)
+# ---------------------------------------------------------------------------
+
+
+def test_projection_requires_non_empty_heavy_fields():
+    with pytest.raises(ValueError):
+        make_projection_params(heavy_fields=[])
+
+
+def test_projection_compact_description_is_docs_clean():
+    """The generated `?compact` help text must read cleanly in the public docs:
+    no internal walk markers (`[]`/`*`) and no em-dashes (which the static
+    api-writing-style checker can't see through this runtime string)."""
+    from fastapi import params
+
+    Proj = make_projection_params(
+        heavy_fields=["config", "rows[].annotations.*.reasoning"]
+    )
+    # The Query default lives on the constructor signature's `compact` param.
+    import inspect
+
+    default = inspect.signature(Proj.__init__).parameters["compact"].default
+    desc = default.description if isinstance(default, params.Query) else ""
+    assert "—" not in desc  # no em-dash
+    assert "[]" not in desc and ".*" not in desc  # no internal markers
+    # Readable dotted names survive.
+    assert "`config`" in desc
+    assert "`rows.annotations.reasoning`" in desc
+
+
+def test_projection_noop_when_not_compact():
+    Proj = make_projection_params(heavy_fields=["config"])
+    data = {"uuid": "u1", "config": {"big": "blob"}}
+    # compact defaults to False → untouched.
+    assert Proj(compact=False).apply(data) == {"uuid": "u1", "config": {"big": "blob"}}
+
+
+def test_projection_nulls_top_level_key():
+    Proj = make_projection_params(heavy_fields=["config"])
+    data = {"uuid": "u1", "config": {"big": "blob"}}
+    out = Proj(compact=True).apply(data)
+    # Key stays, value nulled — shape stays response_model-compatible.
+    assert out == {"uuid": "u1", "config": None}
+
+
+def test_projection_nulls_list_item_fields():
+    Proj = make_projection_params(
+        heavy_fields=["results[].output", "results[].judge_results"]
+    )
+    data = {
+        "results": [
+            {"name": "a", "passed": True, "output": {"resp": "x"}, "judge_results": [1]},
+            {"name": "b", "passed": False, "output": {"resp": "y"}, "judge_results": [2]},
+        ]
+    }
+    out = Proj(compact=True).apply(data)
+    assert out["results"] == [
+        {"name": "a", "passed": True, "output": None, "judge_results": None},
+        {"name": "b", "passed": False, "output": None, "judge_results": None},
+    ]
+
+
+def test_projection_nulls_dict_value_wildcard():
+    # `rows[].annotations.*.reasoning` — annotations is a dict keyed by
+    # annotator uuid; null each value's `reasoning` while keeping `value`.
+    Proj = make_projection_params(heavy_fields=["rows[].annotations.*.reasoning"])
+    data = {
+        "rows": [
+            {
+                "item_id": "i1",
+                "annotations": {
+                    "ann-1": {"value": 1, "reasoning": "long text"},
+                    "ann-2": {"value": 0, "reasoning": "more text"},
+                },
+            }
+        ]
+    }
+    out = Proj(compact=True).apply(data)
+    anns = out["rows"][0]["annotations"]
+    assert anns["ann-1"] == {"value": 1, "reasoning": None}
+    assert anns["ann-2"] == {"value": 0, "reasoning": None}
+
+
+def test_projection_nested_list_in_list():
+    Proj = make_projection_params(
+        heavy_fields=["evaluators[].versions[].system_prompt"]
+    )
+    data = {
+        "evaluators": [
+            {"uuid": "e1", "versions": [{"version_number": 1, "system_prompt": "P1"}]},
+        ]
+    }
+    out = Proj(compact=True).apply(data)
+    assert out["evaluators"][0]["versions"][0] == {
+        "version_number": 1,
+        "system_prompt": None,
+    }
+
+
+def test_projection_missing_paths_are_noops():
+    # Paths that don't exist / wrong types must not raise — a projection that
+    # doesn't apply to a given payload silently skips.
+    Proj = make_projection_params(
+        heavy_fields=["config", "results[].output", "rows[].annotations.*.reasoning"]
+    )
+    data = {"uuid": "u1", "results": None, "rows": "not-a-list"}
+    out = Proj(compact=True).apply(data)
+    assert out == {"uuid": "u1", "results": None, "rows": "not-a-list"}

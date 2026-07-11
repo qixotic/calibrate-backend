@@ -16,6 +16,7 @@ from pagination import (
     OptionalPaginationParams,
     PaginatedResponse,
     count_and_page,
+    make_projection_params,
     make_search_params,
     page_envelope,
     paginate,
@@ -2535,6 +2536,17 @@ async def update_test_run_visibility(
     return VisibilityResponse(is_public=body.is_public, share_token=share_token)
 
 
+_RunProjection = make_projection_params(
+    heavy_fields=[
+        "results[].output",
+        "results[].test_case",
+        "results[].judge_results",
+        "results[].reasoning",
+        "evaluators[].output_config",
+    ]
+)
+
+
 @router.get(
     "/run/{task_id}",
     response_model=TestRunStatusResponse,
@@ -2547,6 +2559,11 @@ async def get_agent_test_run_status(
         examples=[_EXAMPLE_TASK_UUID],
     ),
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
+    only_failed: bool = Query(
+        False,
+        description="Return only failing test cases. Omit to return every case",
+    ),
+    projection: _RunProjection = Depends(),
 ):
     """Poll a test run for its status and evaluation results."""
     # Public API (auth via get_org_jwt_or_api_key); ownership enforced below.
@@ -2585,7 +2602,7 @@ async def get_agent_test_run_status(
         evaluator_cache=evaluator_cache,
     )
 
-    return TestRunStatusResponse(
+    response = TestRunStatusResponse(
         task_id=task_id,
         status=status,
         total_tests=results.get("total_tests"),
@@ -2600,6 +2617,14 @@ async def get_agent_test_run_status(
         is_public=bool(job.get("is_public")),
         share_token=job.get("share_token"),
     )
+    data = response.model_dump()
+    if only_failed and isinstance(data.get("results"), list):
+        # `passed is None` is a pending case, not a failure — exclude it so a
+        # mid-run poll doesn't report unfinished cases. Errored cases are False.
+        data["results"] = [
+            r for r in data["results"] if r.get("passed") is False
+        ]
+    return projection.apply(data)
 
 
 # ============ Benchmark API ============
@@ -3348,6 +3373,14 @@ async def update_benchmark_visibility(
     return VisibilityResponse(is_public=body.is_public, share_token=share_token)
 
 
+_BenchmarkProjection = make_projection_params(
+    heavy_fields=[
+        "model_results[].test_results",
+        "evaluators[].output_config",
+    ]
+)
+
+
 @router.get(
     "/benchmark/{task_id}",
     response_model=BenchmarkStatusResponse,
@@ -3360,6 +3393,11 @@ async def get_benchmark_status(
         examples=[_EXAMPLE_TASK_UUID],
     ),
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
+    only_failed: bool = Query(
+        False,
+        description="Return only failing test cases for each model. Omit to return every case",
+    ),
+    projection: _BenchmarkProjection = Depends(),
 ):
     """Get the results of a benchmark run"""
     job = _load_owned_agent_test_job(task_id, ctx)
@@ -3397,7 +3435,7 @@ async def get_benchmark_status(
         evaluator_cache=evaluator_cache,
     )
 
-    return BenchmarkStatusResponse(
+    response = BenchmarkStatusResponse(
         task_id=task_id,
         status=status,
         evaluators=evaluators_block or None,
@@ -3407,6 +3445,17 @@ async def get_benchmark_status(
         is_public=bool(job.get("is_public")),
         share_token=job.get("share_token"),
     )
+    data = response.model_dump()
+    if only_failed and isinstance(data.get("model_results"), list):
+        for model in data["model_results"]:
+            if isinstance(model, dict) and isinstance(
+                model.get("test_results"), list
+            ):
+                # `passed is None` is pending, not a failure; errored is False.
+                model["test_results"] = [
+                    r for r in model["test_results"] if r.get("passed") is False
+                ]
+    return projection.apply(data)
 
 
 @router.delete("/job/{job_uuid}", summary="Delete test job")

@@ -1,0 +1,176 @@
+<!--
+  API docs audit — report template.
+  Copy this file, then:
+   1. Set the <title> and the masthead <h1>/sub text for the audited change.
+   2. Fill the four scorecards (audited / adhere / violate / files).
+   3. For each file, copy a FILE BLOCK; inside it, one METHOD BLOCK per
+      route/model; inside each, one ROW per audited string (PASS or FAIL variant).
+   4. Publish with the Artifact tool (favicon 📋). Keep title + favicon stable
+      across re-runs of the same audit.
+  Self-contained: system fonts only, no external assets. Theme-aware.
+-->
+<title>API docs style audit</title>
+<style>
+  :root {
+    --paper: #f7f6f3; --surface: #ffffff; --ink: #1b1f24; --ink-soft: #4a5057;
+    --ink-faint: #767d85; --line: #e4e2db; --line-strong: #d3d0c7; --accent: #3b4c6b;
+    --accent-soft: #eef1f6; --pass: #2f7d55; --pass-bg: #e7f2ea; --pass-line: #bfdcc9;
+    --fail: #b23b2e; --fail-bg: #fbeae6; --fail-line: #edc5bc; --code-bg: #f0eee8;
+    --code-ink: #2c333b;
+    --shadow: 0 1px 2px rgba(27,31,36,.05), 0 8px 24px rgba(27,31,36,.05);
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14161a; --surface: #1c1f25; --ink: #e9eaec; --ink-soft: #b0b5bc;
+      --ink-faint: #808791; --line: #2b2f37; --line-strong: #3a3f49; --accent: #9db4dc;
+      --accent-soft: #222a38; --pass: #6dc494; --pass-bg: #17271e; --pass-line: #2c4a38;
+      --fail: #ef9483; --fail-bg: #2a1815; --fail-line: #4d2a23; --code-bg: #23262d;
+      --code-ink: #cfd4da; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #f7f6f3; --surface: #ffffff; --ink: #1b1f24; --ink-soft: #4a5057;
+    --ink-faint: #767d85; --line: #e4e2db; --line-strong: #d3d0c7; --accent: #3b4c6b;
+    --accent-soft: #eef1f6; --pass: #2f7d55; --pass-bg: #e7f2ea; --pass-line: #bfdcc9;
+    --fail: #b23b2e; --fail-bg: #fbeae6; --fail-line: #edc5bc; --code-bg: #f0eee8;
+    --code-ink: #2c333b; --shadow: 0 1px 2px rgba(27,31,36,.05), 0 8px 24px rgba(27,31,36,.05);
+  }
+  :root[data-theme="dark"] {
+    --paper: #14161a; --surface: #1c1f25; --ink: #e9eaec; --ink-soft: #b0b5bc;
+    --ink-faint: #808791; --line: #2b2f37; --line-strong: #3a3f49; --accent: #9db4dc;
+    --accent-soft: #222a38; --pass: #6dc494; --pass-bg: #17271e; --pass-line: #2c4a38;
+    --fail: #ef9483; --fail-bg: #2a1815; --fail-line: #4d2a23; --code-bg: #23262d;
+    --code-ink: #cfd4da; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.28);
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); line-height: 1.55; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 48px 24px 80px; }
+
+  header.masthead { border-bottom: 1px solid var(--line-strong); padding-bottom: 24px; margin-bottom: 32px; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin: 0 0 10px; }
+  h1 { font-size: clamp(26px, 4vw, 36px); line-height: 1.12; margin: 0 0 8px; letter-spacing: -.01em; text-wrap: balance; }
+  .sub { color: var(--ink-soft); margin: 0; font-size: 15px; max-width: 62ch; }
+  .ref { font-family: var(--mono); font-size: 12.5px; color: var(--ink-faint); }
+
+  .scorecards { display: flex; flex-wrap: wrap; gap: 12px; margin: 24px 0 4px; }
+  .card { flex: 1 1 130px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .card .num { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .card .lbl { font-size: 12px; color: var(--ink-faint); text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
+  .card.fail .num { color: var(--fail); }
+  .card.pass .num { color: var(--pass); }
+
+  section.file { margin-top: 40px; }
+  .file-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  .file-head h2 { font-family: var(--mono); font-size: 16px; font-weight: 600; margin: 0; color: var(--ink); letter-spacing: -.01em; }
+  .file-head .count { font-size: 12.5px; color: var(--ink-faint); }
+  .file-rule { height: 2px; background: var(--accent); opacity: .8; border-radius: 2px; width: 40px; margin: 8px 0 18px; }
+
+  .method { margin-bottom: 20px; }
+  .method-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 8px 0 10px; }
+  .method-head .mname { font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--accent); }
+  .method-head .route { font-family: var(--mono); font-size: 12.5px; color: var(--ink-faint); }
+  .method-head .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-faint); }
+
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; min-width: 760px; }
+  thead th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-faint); font-weight: 600; padding: 11px 16px; background: var(--accent-soft); border-bottom: 1px solid var(--line); }
+  tbody td { padding: 14px 16px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 14px; }
+  tbody tr:last-child td { border-bottom: none; }
+  .col-target { width: 15%; } .col-text { width: 34%; } .col-verdict { width: 9%; } .col-reason { width: 26%; } .col-fix { width: 16%; }
+
+  .target-name { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--ink); }
+  .target-kind { font-size: 11px; color: var(--ink-faint); text-transform: uppercase; letter-spacing: .05em; margin-top: 3px; }
+
+  code, .doc { font-family: var(--mono); font-size: 12.5px; color: var(--code-ink); }
+  .doc { display: block; background: var(--code-bg); border: 1px solid var(--line); border-radius: 7px; padding: 9px 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .doc.fix { border-color: var(--pass-line); }
+  .doc.fix::before { content: "→ "; color: var(--pass); }
+
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 650; padding: 4px 10px; border-radius: 999px; letter-spacing: .02em; white-space: nowrap; }
+  .pill.pass { color: var(--pass); background: var(--pass-bg); border: 1px solid var(--pass-line); }
+  .pill.fail { color: var(--fail); background: var(--fail-bg); border: 1px solid var(--fail-line); }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  .reason { color: var(--ink-soft); font-size: 13.5px; }
+  .reason b { color: var(--ink); font-weight: 600; }
+  .reason .tag { display: inline-block; font-family: var(--mono); font-size: 11px; color: var(--fail); background: var(--fail-bg); border: 1px solid var(--fail-line); border-radius: 5px; padding: 1px 6px; margin: 2px 4px 2px 0; }
+  .dash { color: var(--ink-faint); }
+
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--ink-faint); }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">API writing-style audit</p>
+    <h1>Branch doc-text conformance report</h1>
+    <p class="sub">Every rendered doc string added or changed on <span class="ref">BRANCH_NAME</span> verified against <span class="ref">.cursor/skills/api-writing-style</span>. Internal helper docstrings and <code>#</code> comments are out of scope.</p>
+    <div class="scorecards">
+      <div class="card"><div class="num">N</div><div class="lbl">Fields audited</div></div>
+      <div class="card pass"><div class="num">N</div><div class="lbl">Adhere</div></div>
+      <div class="card fail"><div class="num">N</div><div class="lbl">Violate</div></div>
+      <div class="card"><div class="num">N</div><div class="lbl">Files</div></div>
+    </div>
+  </header>
+
+  <!-- ==================== FILE BLOCK (repeat per file) ==================== -->
+  <section class="file">
+    <div class="file-head">
+      <h2>src/routers/EXAMPLE.py</h2>
+      <span class="count">N fields · N violations</span>
+    </div>
+    <div class="file-rule"></div>
+
+    <!-- -------- METHOD BLOCK (repeat per route/model in this file) -------- -->
+    <div class="method">
+      <div class="method-head">
+        <span class="mname">function_or_ModelName</span>
+        <span class="route">GET /route/{id}</span>
+        <span class="kind">Public API</span> <!-- omit if JWT-only -->
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th class="col-target">Target</th>
+              <th class="col-text">What is written</th>
+              <th class="col-verdict">Verdict</th>
+              <th class="col-reason">Reasoning</th>
+              <th class="col-fix">Suggested change</th>
+            </tr>
+          </thead>
+          <tbody>
+
+            <!-- ROW: PASS -->
+            <tr>
+              <td class="col-target"><div class="target-name">param_or_field</div><div class="target-kind">query param</div></td>
+              <td class="col-text"><span class="doc">Exact rendered string here</span></td>
+              <td class="col-verdict"><span class="pill pass"><span class="dot"></span>Pass</span></td>
+              <td class="col-reason"><div class="reason">Why it adheres, in one or two plain sentences.</div></td>
+              <td class="col-fix"><span class="dash">—</span></td>
+            </tr>
+
+            <!-- ROW: FAIL -->
+            <tr>
+              <td class="col-target"><div class="target-name">param_or_field</div><div class="target-kind">query param</div></td>
+              <td class="col-text"><span class="doc">Exact rendered string here</span></td>
+              <td class="col-verdict"><span class="pill fail"><span class="dot"></span>Fail</span></td>
+              <td class="col-reason"><div class="reason"><span class="tag">rule name</span> Why it violates, naming the rule.</div></td>
+              <td class="col-fix"><span class="doc fix">Corrected string here</span></td>
+            </tr>
+
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <!-- -------- end METHOD BLOCK -------- -->
+
+  </section>
+  <!-- ==================== end FILE BLOCK ==================== -->
+
+  <footer>
+    Optional one-line summary of the dominant violation class, or a "clean" note.
+  </footer>
+</div>

@@ -15,11 +15,19 @@ from pagination import (
     OptionalPaginationParams,
     PaginatedResponse,
     count_and_page,
+    make_projection_params,
     make_search_params,
     page_envelope,
 )
 
 _EvaluatorSearch = make_search_params(searchable=["name"])
+_EvaluatorDetailProjection = make_projection_params(
+    heavy_fields=[
+        "versions[].system_prompt",
+        "versions[].output_config",
+        "versions[].variables",
+    ]
+)
 from pydantic import BaseModel, Field, model_validator
 
 from auth_utils import get_current_org, get_current_user_id, get_org_jwt_or_api_key, OrgContext
@@ -202,6 +210,15 @@ class EvaluatorVersionResponse(BaseModel):
     created_at: str = Field(description="When the version was created (ISO 8601 UTC)")
 
 
+# Compact-mode shape for GET /evaluators/{uuid}: `system_prompt` is nullable
+# only here so the always-full endpoints reusing the base keep it required.
+# No docstring: Pydantic would publish it as the schema description.
+class EvaluatorVersionCompact(EvaluatorVersionResponse):
+    system_prompt: Optional[str] = Field(
+        None, description="Judge system prompt, with `{{variable}}` placeholders unrendered"
+    )
+
+
 class EvaluatorLiveVersionSummary(BaseModel):
     """Slim view of the live version for list results, carrying only what the list needs."""
 
@@ -277,6 +294,13 @@ class EvaluatorDetailResponse(EvaluatorResponseBase):
     live_version_index: Optional[int] = Field(
         None, description="Array position of the live version within `versions[]`"
     )
+
+
+# Response for GET /evaluators/{uuid}: uses the compact version model so
+# `?compact` can null version fields. The base stays tight for the
+# annotation-task endpoints that reuse it. No docstring: it would be published.
+class EvaluatorDetailResponseCompact(EvaluatorDetailResponse):
+    versions: List[EvaluatorVersionCompact] = Field(description="Full version history, oldest first")
 
 
 class EvaluatorCreateResponse(BaseModel):
@@ -552,30 +576,33 @@ async def list_evaluators(
     )
 
 
-@router.get("/{evaluator_uuid}", response_model=EvaluatorDetailResponse, summary="Get evaluator", tags=["Public API"])
+@router.get("/{evaluator_uuid}", response_model=EvaluatorDetailResponseCompact, summary="Get evaluator", tags=["Public API"])
 async def get_evaluator_endpoint(
     evaluator_uuid: str = Path(
         description="Evaluator to retrieve",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
     ),
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
+    projection: _EvaluatorDetailProjection = Depends(),
 ):
     """Get one evaluator with its full version history"""
     evaluator = _visible_or_404(get_evaluator(evaluator_uuid), ctx.org_uuid)
     base = _evaluator_response(evaluator)
     output_type = evaluator.get("output_type", "binary")
     versions = [
-        EvaluatorVersionResponse(**_version_dict(v, output_type))
+        EvaluatorVersionCompact(**_version_dict(v, output_type))
         for v in get_evaluator_versions(evaluator_uuid)
     ]
     # base carries `live_version` (list shape); drop it here — detail uses
     # `versions[]` + `live_version_id`/`live_version_index` so we don't
     # duplicate the version.
-    return EvaluatorDetailResponse(
+    response = EvaluatorDetailResponseCompact(
         **base.model_dump(exclude={"live_version"}),
         versions=versions,
         live_version_index=_live_version_index(versions, base.live_version_id),
     )
+    # `?compact=true` nulls heavy per-version fields in place; a no-op otherwise.
+    return projection.apply(response.model_dump())
 
 
 @router.put("/{evaluator_uuid}", response_model=EvaluatorResponse, summary="Update evaluator")

@@ -159,3 +159,48 @@ def test_get_evaluator_detail_returns_full_versions(client):
     assert ver["output_config"]["scale"][0]["name"] == "Bad"
     assert [v["name"] for v in ver["variables"]] == ["criteria"]
     assert body["live_version_index"] == 0
+
+
+def test_get_evaluator_detail_default_matches_no_compact(client):
+    """Omitting `compact` must be byte-for-byte identical to `?compact=false`."""
+    h = _signup(client)
+    _, ev_uuid, _ = _create_rating_evaluator(client, h)
+
+    default = client.get(f"/evaluators/{ev_uuid}", headers=h)
+    explicit = client.get(f"/evaluators/{ev_uuid}?compact=false", headers=h)
+    assert default.status_code == 200
+    assert explicit.status_code == 200
+    assert default.json() == explicit.json()
+    # Heavy per-version fields are populated in the default response.
+    ver = default.json()["versions"][0]
+    assert ver["system_prompt"] == "Judge {{criteria}} carefully"
+    assert ver["output_config"] is not None
+    assert ver["variables"] is not None
+
+
+def test_get_evaluator_detail_compact_nulls_heavy_version_fields(client):
+    h = _signup(client)
+    _, ev_uuid, v_uuid = _create_rating_evaluator(client, h)
+
+    resp = client.get(f"/evaluators/{ev_uuid}?compact=true", headers=h)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Top-level evaluator identity is untouched.
+    assert body["uuid"] == ev_uuid
+    assert body["evaluator_type"] == "llm"
+    assert body["data_type"] == "text"
+    assert body["output_type"] == "rating"
+    assert body["live_version_index"] == 0
+
+    versions = body["versions"]
+    assert len(versions) == 1
+    ver = versions[0]
+    # Heavy fields are nulled in place (key kept, value None).
+    assert ver["system_prompt"] is None
+    assert ver["output_config"] is None
+    assert ver["variables"] is None
+    # Lightweight version fields survive.
+    assert ver["uuid"] == v_uuid
+    assert ver["version_number"] == 1
+    assert ver["judge_model"] == "openai/gpt-4"

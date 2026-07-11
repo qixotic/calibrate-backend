@@ -2256,3 +2256,238 @@ def test_summary_item_comments_scoped_to_page(client):
         f"/annotation-tasks/{task_uuid}/summary?limit=1000", headers=h
     ).json()
     assert set(full["item_comments"].keys()) == set(item_ids)
+
+
+# ---------------------------------------------------------------------------
+# Summary: disagreement filter + compact projection
+# ---------------------------------------------------------------------------
+
+
+def _seed_summary_with_agreement(client, h, user_uuid, n_extra_agree=0):
+    """Seed a task with a binary LLM evaluator, two items, one annotator with a
+    comment + per-evaluator annotations, and evaluator runs so that one item's
+    evaluator value AGREES with the human (agreement 1.0) and the other
+    DISAGREES (agreement 0.0). `n_extra_agree` adds that many further AGREEING
+    items (used to push the disagreeing item onto a later page). Returns
+    (task_uuid, item_agree, item_disagree, extra_agree_ids)."""
+    import db as db_mod
+    from annotation_eval_runner import ANNOTATION_EVAL_JOB_TYPE
+
+    llm_ev = _llm_evaluator(client, h)
+    live_version_id = llm_ev["live_version_id"]
+    task_uuid = client.post(
+        "/annotation-tasks",
+        json={
+            "name": f"t-{uuid.uuid4().hex[:6]}",
+            "type": "llm",
+            "evaluator_ids": [llm_ev["uuid"]],
+        },
+        headers=h,
+    ).json()["uuid"]
+    created = client.post(
+        f"/annotation-tasks/{task_uuid}/items",
+        json={
+            "items": [
+                {"payload": {"name": "agree"}},
+                {"payload": {"name": "disagree"}},
+                *[
+                    {"payload": {"name": f"agree-extra-{i}"}}
+                    for i in range(n_extra_agree)
+                ],
+            ]
+        },
+        headers=h,
+    ).json()["item_ids"]
+    item_agree, item_disagree = created[0], created[1]
+    extra_agree_ids = created[2:]
+    agree_ids = [item_agree, *extra_agree_ids]
+
+    annotator = client.post("/annotators", json={"name": "rater"}, headers=h).json()
+    job = client.post(
+        f"/annotation-tasks/{task_uuid}/jobs",
+        json={
+            "annotator_ids": [annotator["uuid"]],
+            "item_ids": created,
+        },
+        headers=h,
+    ).json()["jobs"][0]
+
+    # Human labels True on every item, each with reasoning text.
+    for it in created:
+        assert (
+            client.post(
+                f"/annotation-tasks/{task_uuid}/annotations",
+                json={
+                    "job_id": job["uuid"],
+                    "item_id": it,
+                    "evaluator_id": llm_ev["uuid"],
+                    "value": {"value": True, "reasoning": "human take"},
+                },
+                headers=h,
+            ).status_code
+            == 200
+        )
+    # A free-text comment so `item_comments` is populated (compact nulls it).
+    assert (
+        client.post(
+            f"/annotation-tasks/{task_uuid}/annotations",
+            json={
+                "job_id": job["uuid"],
+                "item_id": item_agree,
+                "value": {"comment": "looks good"},
+            },
+            headers=h,
+        ).status_code
+        == 200
+    )
+
+    # Evaluator runs: match the human (True==True → 1.0) on every agreeing item,
+    # disagree (False!=True → 0.0) on item_disagree. Seeded directly to avoid
+    # spawning calibrate.
+    eval_job = db_mod.create_job(
+        job_type=ANNOTATION_EVAL_JOB_TYPE,
+        org_uuid=db_mod.get_personal_org_for_user(user_uuid)["uuid"],
+        user_id=user_uuid,
+        status="done",
+        details={"task_id": task_uuid},
+    )
+    db_mod.create_evaluator_runs(
+        [
+            *[
+                {
+                    "job_id": eval_job,
+                    "item_id": it,
+                    "evaluator_id": llm_ev["uuid"],
+                    "evaluator_version_id": live_version_id,
+                    "status": "completed",
+                    "value": {"value": True, "reasoning": "eval agree"},
+                }
+                for it in agree_ids
+            ],
+            {
+                "job_id": eval_job,
+                "item_id": item_disagree,
+                "evaluator_id": llm_ev["uuid"],
+                "evaluator_version_id": live_version_id,
+                "status": "completed",
+                "value": {"value": False, "reasoning": "eval disagree"},
+            },
+        ]
+    )
+    return task_uuid, item_agree, item_disagree, extra_agree_ids
+
+
+def test_summary_default_unchanged_by_new_params(client):
+    """Omitting `compact`/`disagreement_only` yields the full, unfiltered shape:
+    both agreeing and disagreeing rows, with payloads, reasoning, rubric bodies
+    and item_comments all present (not nulled)."""
+    auth = _signup(client)
+    h = auth["headers"]
+    task_uuid, item_agree, item_disagree, _ = _seed_summary_with_agreement(client, h, auth["user_uuid"])
+
+    body = client.get(
+        f"/annotation-tasks/{task_uuid}/summary?live_only=true", headers=h
+    ).json()
+    rows_by_item = {r["item_id"]: r for r in body["rows"]}
+    assert set(rows_by_item) == {item_agree, item_disagree}
+    assert rows_by_item[item_agree]["evaluator_agreement"] == 1.0
+    assert rows_by_item[item_disagree]["evaluator_agreement"] == 0.0
+    # Heavy fields are present (the contrast with compact below).
+    assert rows_by_item[item_agree]["payload"] == {"name": "agree"}
+    assert rows_by_item[item_disagree]["evaluator_reasoning"] == "eval disagree"
+    ann_cell = next(iter(rows_by_item[item_agree]["annotations"].values()))
+    assert ann_cell["reasoning"] == "human take"
+    assert body["evaluators"][0]["versions"][0]["output_config"] is not None
+    assert body["item_comments"] != {} and body["item_comments"] is not None
+    assert body["pagination"]["total"] == 2
+
+
+def test_summary_compact_nulls_heavy_fields(client):
+    """`?compact=true` nulls the payload-dominating fields (item payloads,
+    evaluator/annotation reasoning, per-version rubric bodies, item_comments)
+    while keeping the lightweight decision fields (values, agreement, ids)."""
+    auth = _signup(client)
+    h = auth["headers"]
+    task_uuid, item_agree, item_disagree, _ = _seed_summary_with_agreement(client, h, auth["user_uuid"])
+
+    body = client.get(
+        f"/annotation-tasks/{task_uuid}/summary?live_only=true&compact=true",
+        headers=h,
+    ).json()
+    rows_by_item = {r["item_id"]: r for r in body["rows"]}
+    assert set(rows_by_item) == {item_agree, item_disagree}
+    for item_id, row in rows_by_item.items():
+        # Heavy fields nulled but keys retained.
+        assert row["payload"] is None
+        assert row["evaluator_reasoning"] is None
+        for cell in row["annotations"].values():
+            if cell is not None:
+                assert cell["reasoning"] is None
+                assert "value" in cell  # value kept
+        # Lightweight decision fields survive.
+        assert row["item_id"] == item_id
+        assert "evaluator_value" in row
+    assert rows_by_item[item_agree]["evaluator_agreement"] == 1.0
+    assert rows_by_item[item_disagree]["evaluator_agreement"] == 0.0
+    # Evaluator version rubric body nulled; item_comments nulled entirely.
+    assert body["evaluators"][0]["versions"][0]["output_config"] is None
+    assert body["item_comments"] is None
+
+
+def test_summary_disagreement_only_filters_rows(client):
+    """`?disagreement_only=true` keeps only rows where the evaluator disagreed
+    with at least one annotator (agreement present and < 1.0). The filter runs
+    at the ITEM level, so `pagination.total` reflects the disagreeing items."""
+    auth = _signup(client)
+    h = auth["headers"]
+    task_uuid, item_agree, item_disagree, _ = _seed_summary_with_agreement(client, h, auth["user_uuid"])
+
+    body = client.get(
+        f"/annotation-tasks/{task_uuid}/summary?live_only=true&disagreement_only=true",
+        headers=h,
+    ).json()
+    assert len(body["rows"]) == 1
+    only = body["rows"][0]
+    assert only["item_id"] == item_disagree
+    assert only["evaluator_agreement"] is not None
+    assert only["evaluator_agreement"] < 1.0
+    # Total now counts the disagreeing ITEMS (1), not all in-scope items (2),
+    # so a caller can page the full disagreeing set.
+    assert body["pagination"]["total"] == 1
+
+    # Sanity: without the flag both rows come back.
+    full = client.get(
+        f"/annotation-tasks/{task_uuid}/summary?live_only=true", headers=h
+    ).json()
+    assert len(full["rows"]) == 2
+
+
+def test_summary_disagreement_only_survives_pagination(client):
+    """Regression: the disagreement filter must run BEFORE pagination, so a
+    disagreement sitting on a later page is not silently dropped. Here 4
+    agreeing items sort ahead of the single disagreeing one; with `limit=1` the
+    old row-level filter would have returned an empty first page and hidden the
+    disagreement."""
+    auth = _signup(client)
+    h = auth["headers"]
+    task_uuid, item_agree, item_disagree, extra = _seed_summary_with_agreement(
+        client, h, auth["user_uuid"], n_extra_agree=4
+    )
+
+    body = client.get(
+        f"/annotation-tasks/{task_uuid}/summary"
+        "?live_only=true&disagreement_only=true&limit=1&offset=0",
+        headers=h,
+    ).json()
+    # Only one disagreeing item exists, and it lands on the first page despite
+    # the four agreeing items that sort ahead of it without the filter.
+    assert body["pagination"]["total"] == 1
+    assert len(body["rows"]) == 1
+    assert body["rows"][0]["item_id"] == item_disagree
+    # The next page is empty — the disagreeing set is exhausted.
+    page2 = client.get(
+        f"/annotation-tasks/{task_uuid}/summary"
+        "?live_only=true&disagreement_only=true&limit=1&offset=1",
+        headers=h,
+    ).json()
+    assert page2["rows"] == []
