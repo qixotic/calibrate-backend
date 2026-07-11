@@ -4,6 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workflow
 
+- **Start every new task in a fresh worktree when you're on `main`.** Before touching anything, check the current branch. If it's `main`, do NOT work on it directly — create a new git worktree on its own branch for the task and do all the work there. Only skip this if the user has already put you on a task branch/worktree or explicitly says to work on the current branch.
 - **Before any change or new feature, do this first — every time.** Whenever you're asked to make a change, add a feature, or modify anything:
   1. **Review the existing code thoroughly** for code/functionality that already does (or partly does) what's being asked — don't build on an empty assumption.
   2. **Make a plan** that splits the work into independent subtasks, to be executed in parallel by multiple weaker agents wherever the subtasks are disjoint (see the `parallelize` skill).
