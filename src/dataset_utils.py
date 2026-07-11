@@ -107,3 +107,30 @@ def resolve_dataset_inputs(
         dataset_name=dataset_name,
         item_ids=resolved_item_ids,
     )
+
+
+def resolve_eval_rerun_inputs_from_job_details(
+    details: dict,
+    *,
+    org_uuid: str,
+    expected_type: str,
+) -> ResolvedDatasetInputs:
+    """Resolve inputs for an in-place STT/TTS eval retry.
+
+    Dataset-backed jobs re-read live dataset items so post-failure dataset fixes
+    are picked up. Inline-only jobs reuse the stored snapshot.
+    """
+    dataset_id = details.get("dataset_id")
+    if dataset_id:
+        return resolve_dataset_inputs(
+            dataset_id=dataset_id,
+            org_uuid=org_uuid,
+            expected_type=expected_type,
+        )
+    return ResolvedDatasetInputs(
+        texts=details.get("texts") or [],
+        audio_paths=details.get("audio_paths") if expected_type == "stt" else None,
+        dataset_id=None,
+        dataset_name=details.get("dataset_name"),
+        item_ids=details.get("dataset_item_ids"),
+    )

@@ -21,7 +21,7 @@ from db import (
     update_job,
     update_job_visibility,
 )
-from dataset_utils import resolve_dataset_inputs
+from dataset_utils import resolve_dataset_inputs, resolve_eval_rerun_inputs_from_job_details
 from auth_utils import get_current_org, OrgContext
 from llm_judge import build_evaluator_cli_payload
 from utils import (
@@ -152,13 +152,7 @@ def _start_stt_job_from_queue(job: dict) -> bool:
     job_id = job["uuid"]
     details = job.get("details", {})
 
-    # Reconstruct request from job details
-    request = STTEvaluationRequest(
-        audio_paths=details.get("audio_paths", []),
-        texts=details.get("texts", []),
-        providers=details.get("providers", []),
-        language=details.get("language", ""),
-    )
+    request = _stt_request_from_job_details(details)
     s3_bucket = details.get("s3_bucket", "")
 
     # Start background task in a separate thread
@@ -263,6 +257,15 @@ class STTEvaluationRequest(BaseModel):
     evaluator_uuids: Optional[List[str]] = Field(
         None,
         description="Evaluators to score transcriptions. Each must be an `stt` evaluator in your workspace. Omit to use the default STT evaluator",
+    )
+
+
+def _stt_request_from_job_details(details: dict) -> STTEvaluationRequest:
+    return STTEvaluationRequest(
+        audio_paths=details.get("audio_paths", []),
+        texts=details.get("texts", []),
+        providers=details.get("providers", []),
+        language=details.get("language", ""),
     )
 
 
@@ -741,6 +744,92 @@ async def evaluate_stt(
         status=initial_status,
         dataset_id=resolved_dataset_id,
         dataset_name=resolved_dataset_name,
+    )
+
+
+@router.post(
+    "/evaluate/{task_id}/retry",
+    response_model=TaskCreateResponse,
+    summary="Retry STT evaluation",
+)
+async def retry_stt_evaluation(
+    task_id: str = PathParam(
+        description="The STT evaluation to re-run",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    ctx: OrgContext = Depends(get_current_org),
+):
+    """Re-run the same STT evaluation job with its stored providers and evaluators, re-reading the dataset when one is linked"""
+    job = get_job(task_id, org_uuid=ctx.org_uuid)
+    if not job or job.get("type") != "stt-eval":
+        raise HTTPException(status_code=404, detail="Task not found")
+    if job["status"] == TaskStatus.IN_PROGRESS.value:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot retry a job that is still in progress",
+        )
+
+    details = job.get("details") or {}
+    providers = details.get("providers") or []
+    if not providers:
+        raise HTTPException(
+            status_code=400,
+            detail="Original job is missing provider configuration",
+        )
+
+    try:
+        s3_bucket = get_s3_output_config()
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    resolved = resolve_eval_rerun_inputs_from_job_details(
+        details,
+        org_uuid=ctx.org_uuid,
+        expected_type="stt",
+    )
+
+    rerun_details = {
+        "audio_paths": resolved.audio_paths or [],
+        "texts": resolved.texts,
+        "providers": providers,
+        "language": details.get("language", ""),
+        "s3_bucket": s3_bucket,
+        "dataset_id": resolved.dataset_id,
+        "dataset_name": resolved.dataset_name,
+        "dataset_item_ids": resolved.item_ids,
+        "evaluators": details.get("evaluators", []),
+    }
+
+    can_start = can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
+    initial_status = (
+        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
+    )
+
+    update_job(
+        task_id,
+        status=initial_status,
+        results={},
+        details=rerun_details,
+        replace_details=True,
+    )
+
+    request = _stt_request_from_job_details(rerun_details)
+    if can_start:
+        thread = threading.Thread(
+            target=run_evaluation_task,
+            args=(task_id, request, s3_bucket),
+            daemon=True,
+        )
+        thread.start()
+        logger.info(f"Re-started STT evaluation job {task_id}")
+    else:
+        logger.info(f"Re-queued STT evaluation job {task_id}")
+
+    return TaskCreateResponse(
+        task_id=task_id,
+        status=initial_status,
+        dataset_id=rerun_details.get("dataset_id"),
+        dataset_name=rerun_details.get("dataset_name"),
     )
 
 
