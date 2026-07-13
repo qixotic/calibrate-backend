@@ -629,3 +629,35 @@ def test_delete_agent_removes_evaluator_links(client):
     assert client.delete(f"/agents/{agent['uuid']}", headers=h).status_code == 200
     # The agent is gone -> its evaluator listing 404s.
     assert client.get(f"/agents/{agent['uuid']}/evaluators", headers=h).status_code == 404
+
+
+def test_create_agent_code_samples_match_examples(app):
+    """POST /agents ships x-codeSamples generated from the request examples.
+
+    Guards the one-source-of-truth contract: each named request example must
+    appear as a full-body cURL snippet (Mintlify's schema-generated panel would
+    otherwise show only `name`), and the snippet body must equal the example.
+    """
+    import json
+
+    from routers.agents import _CREATE_AGENT_EXAMPLES
+
+    op = app.openapi()["paths"]["/agents"]["post"]
+    samples = op["x-codeSamples"]
+    assert {s["label"] for s in samples} == {
+        ex["summary"] for ex in _CREATE_AGENT_EXAMPLES.values()
+    }
+    by_label = {s["label"]: s for s in samples}
+    for ex in _CREATE_AGENT_EXAMPLES.values():
+        sample = by_label[ex["summary"]]
+        assert sample["lang"] == "curl"
+        # Full example body is embedded verbatim (pretty-printed for readability),
+        # not a required-fields subset.
+        assert json.dumps(ex["value"], indent=2) in sample["source"]
+
+
+def test_public_spec_preserves_create_agent_code_samples(app):
+    import main
+
+    op = main._build_public_openapi()["paths"]["/agents"]["post"]
+    assert len(op["x-codeSamples"]) == 2

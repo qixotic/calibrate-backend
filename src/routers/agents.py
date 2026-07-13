@@ -1,5 +1,6 @@
 import copy
 import ipaddress
+import json
 import logging
 import socket
 from datetime import datetime, timezone
@@ -344,6 +345,33 @@ _CREATE_AGENT_EXAMPLES = {
 }
 
 
+def _curl_code_samples(examples: Dict[str, Any], path: str) -> List[Dict[str, str]]:
+    """Render each named request example as a copy-ready cURL snippet.
+
+    Mintlify's code-sample panel is otherwise schema-generated and collapses to
+    the required fields only (just `name` here, since `type` defaults and
+    `config` is optional), so the copyable body never shows the real `config`
+    shape. `x-codeSamples` overrides that panel with these verbatim snippets.
+    Built FROM `examples` so the sample bodies can't drift from the request-body
+    dropdown — one source of truth.
+    """
+    base_url = env_str("PUBLIC_API_BASE_URL", "http://localhost:8000").rstrip("/")
+    return [
+        {
+            "lang": "curl",
+            "label": ex["summary"],
+            "source": (
+                "curl --request POST \\\n"
+                f"  --url {base_url}{path} \\\n"
+                "  --header 'Content-Type: application/json' \\\n"
+                "  --header 'X-API-Key: <api-key>' \\\n"
+                f"  --data '{json.dumps(ex['value'], indent=2)}'"
+            ),
+        }
+        for ex in examples.values()
+    ]
+
+
 class AgentUpdate(BaseModel):
     name: Optional[str] = Field(
         None, description="New agent name. Omit to leave the name unchanged"
@@ -641,6 +669,7 @@ async def resolve_agent_names(
     response_model=AgentCreateResponse,
     tags=["Public API"],
     summary="Create agent",
+    openapi_extra={"x-codeSamples": _curl_code_samples(_CREATE_AGENT_EXAMPLES, "/agents")},
 )
 async def create_agent_endpoint(
     agent: AgentCreate = Body(openapi_examples=_CREATE_AGENT_EXAMPLES),
