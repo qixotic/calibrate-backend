@@ -27,7 +27,7 @@ FAKE_COST = 0.001
 FAKE_TOKENS = 42
 FAKE_WER = 0.0
 FAKE_TTFB = 0.5
-# Sarvam judge bundle (only when `--sarvam-judges` is passed to `stt`).
+# Sarvam judge bundle (included by default; suppressed by `--skip-sarvam`).
 FAKE_SARVAM_LLM_WER = 0.0
 FAKE_SARVAM_LLM_CER = 0.0
 # Every evaluator verdict is a PASS; every rating is scale_max.
@@ -36,7 +36,7 @@ FAKE_SARVAM_LLM_CER = 0.0
 # --- Argument parsing -------------------------------------------------------
 # Flags that take no value (their presence is the signal). Everything else that
 # starts with "-" consumes the following non-dash tokens as its value(s).
-_BOOL_FLAGS = {"--eval-only", "--skip-verify", "--sarvam-judges"}
+_BOOL_FLAGS = {"--eval-only", "--skip-verify", "--skip-sarvam"}
 
 
 def _parse_args(argv: List[str]) -> tuple[str, Dict[str, List[str]]]:
@@ -334,8 +334,8 @@ def _evaluator_row_cols(
     return cols, values
 
 
-# Extra scalar metrics + per-row columns the real CLI writes under
-# `--sarvam-judges`. Mirrors `_score_and_write_results` in calibrate-agent.
+# Extra scalar metrics + per-row columns the real CLI writes for the Sarvam
+# judge bundle (on by default). Mirrors `_score_and_write_results` in calibrate-agent.
 _SARVAM_METRICS = {"sarvam_llm_wer": FAKE_SARVAM_LLM_WER, "sarvam_llm_cer": FAKE_SARVAM_LLM_CER}
 _SARVAM_ROW_COLS = ["sarvam_llm_wer", "sarvam_llm_cer", "sarvam_llm_wer_reasoning"]
 _SARVAM_ROW_VALUES = {
@@ -361,7 +361,7 @@ def _cmd_stt(opts: Dict[str, List[str]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     providers = _many(opts, "-p", "--provider", "--providers") or ["openai"]
     evaluators = _evaluators_from_config(_load_json(_first(opts, "--config")))
-    sarvam = "--sarvam-judges" in opts
+    sarvam = "--skip-sarvam" not in opts
 
     input_dir = _first(opts, "-i", "--input")
     utterances = _read_id_text_csv(Path(input_dir) / "stt.csv") if input_dir else []
@@ -537,7 +537,7 @@ def _cmd_annotation_stt_or_general(opts: Dict[str, List[str]]) -> None:
 
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
         # Sarvam judges are an STT-eval-only feature; the annotation eval-only
-        # and `general` flows never pass `--sarvam-judges`.
+        # and `general` flows never include the Sarvam bundle.
         json.dump(_stt_metrics(evaluators, sarvam=False), f)
     _write_config_json(output_dir, evaluators)
 

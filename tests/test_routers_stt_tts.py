@@ -221,6 +221,31 @@ def test_stt_evaluate_local_storage_without_bucket(client, monkeypatch, tmp_path
     assert resp.json()["status"] == "queued"
 
 
+def test_stt_evaluate_no_evaluators_snapshots_empty(client, monkeypatch):
+    """Omitting evaluator_uuids runs transcription metrics only — no default judge."""
+    import db
+
+    auth = _signup(client)
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch("routers.stt.can_start_job", return_value=False), patch(
+        "threading.Thread"
+    ):
+        resp = client.post(
+            "/stt/evaluate",
+            json={
+                "providers": ["openai"],
+                "language": "en",
+                "audio_paths": ["s3://b/k.wav"],
+                "texts": ["hi"],
+            },
+            headers=auth["headers"],
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    job = db.get_job(task_id)
+    assert job["details"]["evaluators"] == []
+
+
 def test_stt_evaluate_invalid_evaluator(client, monkeypatch):
     auth = _signup(client)
     monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")

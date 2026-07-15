@@ -60,34 +60,21 @@ EVAL_JOB_TYPES = ["stt-eval", "tts-eval", "annotation-eval"]
 def _resolve_evaluators_for_job(
     uuids: Optional[List[str]],
     org_uuid: str,
-    default_slug: str,
     expected_evaluator_type: str,
 ) -> List[dict]:
     """Resolve evaluator UUIDs into a list of fully-hydrated dicts ready to serialize
     into the calibrate CLI config.
 
-    - Falls back to the default-slug evaluator when no UUIDs are provided.
+    - Returns an empty list when no UUIDs are provided: the run then skips the
+      LLM judge entirely (no evaluator config reaches the calibrate CLI).
     - Pins each evaluator to its current live version at submission time.
     - Enforces `evaluator.evaluator_type == expected_evaluator_type`. 400 on mismatch.
     """
-    from db import get_evaluator_by_slug  # local import to avoid circular
-
     resolved: List[dict] = []
     effective_refs: List[dict] = [
         {"evaluator_uuid": uid, "version_uuid": None, "variable_values": None}
         for uid in (uuids or [])
     ]
-
-    if not effective_refs:
-        default = get_evaluator_by_slug(default_slug)
-        if default and default.get("live_version_id"):
-            effective_refs = [
-                {
-                    "evaluator_uuid": default["uuid"],
-                    "version_uuid": default["live_version_id"],
-                    "variable_values": None,
-                }
-            ]
 
     for ref in effective_refs:
         evaluator = get_evaluator(ref["evaluator_uuid"])
@@ -256,7 +243,7 @@ class STTEvaluationRequest(BaseModel):
     language: str = Field(description='Spoken language for the audio, e.g. `"english"` or `"hindi"`')
     evaluator_uuids: Optional[List[str]] = Field(
         None,
-        description="Evaluators to score transcriptions. Each must be an `stt` evaluator in your workspace. Omit to use the default STT evaluator",
+        description="Evaluators to score transcriptions. Each must be an `stt` evaluator in your workspace. Omit to run transcription metrics only, with no LLM judge",
     )
     sarvam_judges: bool = Field(
         True,
@@ -409,10 +396,11 @@ def run_evaluation_task(
                 job_details = (get_job(task_id) or {}).get("details", {}) or {}
 
                 # Sarvam judge bundle is a metrics-axis toggle independent of the
-                # evaluator list. Default on; snapshotted into details at submit
-                # time so a queued/retried run remembers its mode.
-                if job_details.get("sarvam_judges", True):
-                    eval_cmd.append("--sarvam-judges")
+                # evaluator list. The CLI includes it by default; pass
+                # --skip-sarvam only to opt out. Snapshotted into details at
+                # submit time so a queued/retried run remembers its mode.
+                if not job_details.get("sarvam_judges", True):
+                    eval_cmd.append("--skip-sarvam")
 
                 raw_evaluators = job_details.get("evaluators") or []
                 if raw_evaluators:
@@ -718,7 +706,6 @@ async def evaluate_stt(
     resolved_evaluators = _resolve_evaluators_for_job(
         uuids=request.evaluator_uuids,
         org_uuid=ctx.org_uuid,
-        default_slug="default-stt-transcription",
         expected_evaluator_type="stt",
     )
 
