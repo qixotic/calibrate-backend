@@ -27,13 +27,16 @@ FAKE_COST = 0.001
 FAKE_TOKENS = 42
 FAKE_WER = 0.0
 FAKE_TTFB = 0.5
+# Sarvam judge bundle (only when `--sarvam-judges` is passed to `stt`).
+FAKE_SARVAM_LLM_WER = 0.0
+FAKE_SARVAM_LLM_CER = 0.0
 # Every evaluator verdict is a PASS; every rating is scale_max.
 
 
 # --- Argument parsing -------------------------------------------------------
 # Flags that take no value (their presence is the signal). Everything else that
 # starts with "-" consumes the following non-dash tokens as its value(s).
-_BOOL_FLAGS = {"--eval-only", "--skip-verify"}
+_BOOL_FLAGS = {"--eval-only", "--skip-verify", "--sarvam-judges"}
 
 
 def _parse_args(argv: List[str]) -> tuple[str, Dict[str, List[str]]]:
@@ -331,8 +334,21 @@ def _evaluator_row_cols(
     return cols, values
 
 
-def _stt_metrics(evaluators: List[Dict[str, Any]]) -> Dict[str, Any]:
+# Extra scalar metrics + per-row columns the real CLI writes under
+# `--sarvam-judges`. Mirrors `_score_and_write_results` in calibrate-agent.
+_SARVAM_METRICS = {"sarvam_llm_wer": FAKE_SARVAM_LLM_WER, "sarvam_llm_cer": FAKE_SARVAM_LLM_CER}
+_SARVAM_ROW_COLS = ["sarvam_llm_wer", "sarvam_llm_cer", "sarvam_llm_wer_reasoning"]
+_SARVAM_ROW_VALUES = {
+    "sarvam_llm_wer": str(FAKE_SARVAM_LLM_WER),
+    "sarvam_llm_cer": str(FAKE_SARVAM_LLM_CER),
+    "sarvam_llm_wer_reasoning": "[]",
+}
+
+
+def _stt_metrics(evaluators: List[Dict[str, Any]], sarvam: bool) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {"wer": FAKE_WER}
+    if sarvam:
+        metrics.update(_SARVAM_METRICS)
     for ev in evaluators:
         name = ev.get("name")
         if name:
@@ -345,6 +361,7 @@ def _cmd_stt(opts: Dict[str, List[str]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     providers = _many(opts, "-p", "--provider", "--providers") or ["openai"]
     evaluators = _evaluators_from_config(_load_json(_first(opts, "--config")))
+    sarvam = "--sarvam-judges" in opts
 
     input_dir = _first(opts, "-i", "--input")
     utterances = _read_id_text_csv(Path(input_dir) / "stt.csv") if input_dir else []
@@ -352,19 +369,23 @@ def _cmd_stt(opts: Dict[str, List[str]]) -> None:
         utterances = [{"id": "audio_1", "text": "x"}]
 
     ev_cols, ev_values = _evaluator_row_cols(evaluators)
+    extra_cols = _SARVAM_ROW_COLS if sarvam else []
+    extra_values = _SARVAM_ROW_VALUES if sarvam else {}
     for provider in providers:
         sub = output_dir / f"{provider}_results"
         sub.mkdir(parents=True, exist_ok=True)
         with open(sub / "results.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["id", "gt", "pred"] + ev_cols)
+            writer.writerow(["id", "gt", "pred"] + ev_cols + extra_cols)
             for utt in utterances:
                 text = utt.get("text", "")
                 writer.writerow(
-                    [utt.get("id"), text, text] + [ev_values[c] for c in ev_cols]
+                    [utt.get("id"), text, text]
+                    + [ev_values[c] for c in ev_cols]
+                    + [extra_values[c] for c in extra_cols]
                 )
         with open(sub / "metrics.json", "w", encoding="utf-8") as f:
-            json.dump(_stt_metrics(evaluators), f)
+            json.dump(_stt_metrics(evaluators, sarvam), f)
 
     _write_config_json(output_dir, evaluators)
 
@@ -515,7 +536,9 @@ def _cmd_annotation_stt_or_general(opts: Dict[str, List[str]]) -> None:
             )
 
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump(_stt_metrics(evaluators), f)
+        # Sarvam judges are an STT-eval-only feature; the annotation eval-only
+        # and `general` flows never pass `--sarvam-judges`.
+        json.dump(_stt_metrics(evaluators, sarvam=False), f)
     _write_config_json(output_dir, evaluators)
 
 

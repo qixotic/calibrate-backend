@@ -196,9 +196,52 @@ def test_run_stt_evaluation_task_end_to_end_with_fake_cli():
 
     job = db.get_job(job_uuid)
     assert job["status"] == "done", job.get("results")
-    providers = {r["provider"] for r in job["results"]["provider_results"]}
+    provider_results = job["results"]["provider_results"]
+    providers = {r["provider"] for r in provider_results}
     assert providers == {"deepgram", "openai"}
-    assert all(r["success"] for r in job["results"]["provider_results"])
+    assert all(r["success"] for r in provider_results)
+    # sarvam_judges defaults on, so the LLM-WER/CER scalars ride along.
+    assert all("sarvam_llm_wer" in r["metrics"] for r in provider_results)
+    assert all("sarvam_llm_cer" in r["metrics"] for r in provider_results)
+
+
+def test_run_stt_evaluation_task_omits_sarvam_judges_when_disabled():
+    from routers.stt import run_evaluation_task, STTEvaluationRequest
+
+    job_uuid = _make_eval_job(
+        "stt-eval",
+        {
+            "audio_paths": ["s3://bucket/key.wav"],
+            "texts": ["hi"],
+            "providers": ["openai"],
+            "language": "en",
+            "s3_bucket": "bucket",
+            "evaluators": [],
+            "sarvam_judges": False,
+        },
+    )
+
+    with patch.dict(os.environ, {"FAKE_AI_PROVIDERS": "1"}), patch(
+        "routers.stt.get_s3_client", return_value=MagicMock()
+    ), patch("routers.stt.download_file_from_s3"), patch(
+        "routers.stt.upload_file_to_s3"
+    ), patch("routers.stt.upload_top_level_files_to_s3"), patch(
+        "routers.stt.upload_directory_tree_to_s3"
+    ), patch("routers.stt.try_start_queued_job"), patch("routers.stt.time.sleep"):
+        request = STTEvaluationRequest(
+            audio_paths=["s3://bucket/key.wav"],
+            texts=["hi"],
+            providers=["openai"],
+            language="en",
+            sarvam_judges=False,
+        )
+        run_evaluation_task(job_uuid, request, "bucket")
+
+    job = db.get_job(job_uuid)
+    assert job["status"] == "done", job.get("results")
+    provider_results = job["results"]["provider_results"]
+    assert all("sarvam_llm_wer" not in r["metrics"] for r in provider_results)
+    assert all("sarvam_llm_cer" not in r["metrics"] for r in provider_results)
 
 
 def test_run_tts_evaluation_task_end_to_end_with_fake_cli():

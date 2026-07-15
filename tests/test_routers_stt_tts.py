@@ -119,6 +119,40 @@ def test_stt_evaluate_queued_path(client, monkeypatch):
         assert got.json()["status"] == "queued"
 
 
+@pytest.mark.parametrize(
+    "payload_extra, expected",
+    [({}, True), ({"sarvam_judges": True}, True), ({"sarvam_judges": False}, False)],
+)
+def test_stt_evaluate_snapshots_sarvam_judges(
+    client, monkeypatch, payload_extra, expected
+):
+    """The sarvam_judges toggle (default True) is stored in job details so the
+    runner and retry path remember the run's mode."""
+    import db as db_mod
+
+    auth = _signup(client)
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch("routers.stt.can_start_job", return_value=False), patch(
+        "threading.Thread"
+    ):
+        resp = client.post(
+            "/stt/evaluate",
+            json={
+                "providers": ["openai"],
+                "language": "en",
+                "audio_paths": ["s3://b/k.wav"],
+                "texts": ["hello"],
+                **payload_extra,
+            },
+            headers=auth["headers"],
+        )
+        assert resp.status_code == 200
+        task_id = resp.json()["task_id"]
+
+    job = db_mod.get_job(task_id)
+    assert job["details"]["sarvam_judges"] is expected
+
+
 def test_stt_evaluate_inflight_path(client, monkeypatch):
     auth = _signup(client)
     monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")

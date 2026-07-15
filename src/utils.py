@@ -1352,6 +1352,8 @@ _NUMERIC_ROW_KEYS = frozenset(
     {
         "wer",
         "cer",
+        "sarvam_llm_wer",
+        "sarvam_llm_cer",
         "string_similarity",
         "similarity",
         "processing_time",

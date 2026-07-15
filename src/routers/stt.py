@@ -258,6 +258,10 @@ class STTEvaluationRequest(BaseModel):
         None,
         description="Evaluators to score transcriptions. Each must be an `stt` evaluator in your workspace. Omit to use the default STT evaluator",
     )
+    sarvam_judges: bool = Field(
+        True,
+        description="Run the Sarvam LLM judge bundle alongside the always-computed WER and CER: intent, entity, and forgiving LLM-WER and LLM-CER scores. Adds an extra judge call for each transcribed row",
+    )
 
 
 def _stt_request_from_job_details(details: dict) -> STTEvaluationRequest:
@@ -266,6 +270,7 @@ def _stt_request_from_job_details(details: dict) -> STTEvaluationRequest:
         texts=details.get("texts", []),
         providers=details.get("providers", []),
         language=details.get("language", ""),
+        sarvam_judges=details.get("sarvam_judges", True),
     )
 
 
@@ -402,6 +407,13 @@ def run_evaluation_task(
 
                 # Calibrate: --config <path> with {evaluators: [...]}
                 job_details = (get_job(task_id) or {}).get("details", {}) or {}
+
+                # Sarvam judge bundle is a metrics-axis toggle independent of the
+                # evaluator list. Default on; snapshotted into details at submit
+                # time so a queued/retried run remembers its mode.
+                if job_details.get("sarvam_judges", True):
+                    eval_cmd.append("--sarvam-judges")
+
                 raw_evaluators = job_details.get("evaluators") or []
                 if raw_evaluators:
                     # Re-hydrate to each evaluator's CURRENT live version at run
@@ -730,6 +742,7 @@ async def evaluate_stt(
             "dataset_name": resolved_dataset_name,
             "dataset_item_ids": dataset_item_ids,
             "evaluators": resolved_evaluators,
+            "sarvam_judges": request.sarvam_judges,
         },
         results=None,
     )
@@ -805,6 +818,7 @@ async def retry_stt_evaluation(
         "dataset_name": resolved.dataset_name,
         "dataset_item_ids": resolved.item_ids,
         "evaluators": details.get("evaluators", []),
+        "sarvam_judges": details.get("sarvam_judges", True),
     }
 
     can_start = can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
