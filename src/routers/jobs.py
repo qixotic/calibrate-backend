@@ -1,17 +1,25 @@
-from typing import List, Optional, Any, Dict
+from typing import List, Optional
 from enum import Enum
 
 from fastapi import APIRouter, Query, Depends, HTTPException, Path
 from pydantic import BaseModel, Field
 
 from db import (
-    get_all_jobs,
+    get_all_jobs_summary,
     get_job,
     delete_job,
     bulk_delete_finished_jobs,
     get_active_dataset_ids,
 )
 from auth_utils import get_current_org, OrgContext
+from pagination import (
+    OptionalPaginationParams,
+    PaginatedResponse,
+    count_and_page,
+    page_envelope,
+    make_sort_params,
+    make_search_params,
+)
 from utils import (
     TaskStatus,
     EvalJobType,
@@ -49,18 +57,15 @@ class JobListItem(BaseModel):
         None,
         description="Source dataset name",
     )
-    details: Optional[Dict[str, Any]] = Field(
-        None, description="Job configuration and runtime metadata"
+    providers: List[str] = Field(
+        description="Speech providers compared in this run"
     )
-    results: Optional[Dict[str, Any]] = Field(
-        None, description="Job output payload"
+    language: Optional[str] = Field(
+        None, description="Spoken language of the evaluated audio"
     )
+    sample_count: int = Field(description="Number of samples evaluated in this run")
     created_at: str = Field(description="When the job was created (ISO 8601 UTC)")
     updated_at: str = Field(description="When the job was last updated (ISO 8601 UTC)")
-
-
-class JobsListResponse(BaseModel):
-    jobs: List[JobListItem] = Field(description="Jobs, newest first")
 
 
 # Map user-friendly job type to actual job type in database
@@ -69,47 +74,43 @@ JOB_TYPE_MAP = {
     JobType.TTS: "tts-eval",
 }
 
+_JobsSort = make_sort_params(
+    sortable=["created_at", "updated_at"], default="created_at"
+)
+_JobsSearch = make_search_params(searchable=["dataset_name"])
 
-@router.get("", response_model=JobsListResponse, summary="List jobs")
+
+@router.get(
+    "", response_model=PaginatedResponse[JobListItem], summary="List jobs"
+)
 async def list_jobs(
     job_type: Optional[JobType] = Query(
         None, description="Filter jobs by type. Omit for all types"
     ),
+    search: _JobsSearch = Depends(),
+    sort: _JobsSort = Depends(),
+    pagination: OptionalPaginationParams = Depends(),
     ctx: OrgContext = Depends(get_current_org),
 ):
     """List jobs, newest first"""
     db_job_type = JOB_TYPE_MAP.get(job_type) if job_type else None
 
-    jobs = get_all_jobs(org_uuid=ctx.org_uuid, job_type=db_job_type)
+    jobs = get_all_jobs_summary(org_uuid=ctx.org_uuid, job_type=db_job_type)
 
-    all_dataset_ids = [
-        (job.get("details") or {}).get("dataset_id")
-        for job in jobs
-    ]
     active_dataset_ids = get_active_dataset_ids(
-        [did for did in all_dataset_ids if did]
+        [job["dataset_id"] for job in jobs if job.get("dataset_id")]
     )
-
-    job_items = []
     for job in jobs:
-        details = job.get("details") or {}
-        dataset_id = details.get("dataset_id")
-        dataset_active = dataset_id in active_dataset_ids if dataset_id else False
-        job_items.append(
-            JobListItem(
-                uuid=job["uuid"],
-                type=job["type"],
-                status=job["status"],
-                dataset_id=dataset_id if dataset_active else None,
-                dataset_name=details.get("dataset_name") if dataset_active else None,
-                details=job.get("details"),
-                results=job.get("results"),
-                created_at=job["created_at"],
-                updated_at=job["updated_at"],
-            )
-        )
+        if job.get("dataset_id") not in active_dataset_ids:
+            job["dataset_id"] = None
+            job["dataset_name"] = None
 
-    return JobsListResponse(jobs=job_items)
+    jobs = search.apply(jobs)
+    jobs = sort.apply(jobs)
+    page, total = count_and_page(jobs, pagination)
+
+    job_items = [JobListItem(**job) for job in page]
+    return page_envelope(job_items, total, pagination)
 
 
 class BulkDeleteJobsRequest(BaseModel):

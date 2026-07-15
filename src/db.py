@@ -6160,6 +6160,66 @@ def get_all_jobs(org_uuid: str, job_type: Optional[str] = None) -> List[Dict[str
         return [_parse_job_row(row) for row in rows]
 
 
+def get_all_jobs_summary(
+    org_uuid: str, job_type: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Lightweight per-job headers for the jobs-list endpoint.
+
+    Deliberately never reads the heavy `results` column nor materializes the
+    large `details` sub-fields (evaluators/audio_paths/texts) — it pulls only
+    the few header fields via `json_extract`, so a list over many completed
+    STT/TTS eval jobs stays cheap. Full detail is fetched per job by the
+    detail endpoints. `providers` is decoded from its stored JSON array;
+    `sample_count` is the row count derived from `details.texts`.
+    """
+    select = (
+        "SELECT uuid, type, status, created_at, updated_at, "
+        "json_extract(details, '$.dataset_id') AS dataset_id, "
+        "json_extract(details, '$.dataset_name') AS dataset_name, "
+        "json_extract(details, '$.language') AS language, "
+        "json_extract(details, '$.providers') AS providers, "
+        "json_array_length(details, '$.texts') AS sample_count "
+        "FROM jobs WHERE org_uuid = ? AND deleted_at IS NULL"
+    )
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if job_type:
+            cursor.execute(
+                select + " AND type = ? ORDER BY created_at DESC",
+                (org_uuid, job_type),
+            )
+        else:
+            cursor.execute(
+                select + " ORDER BY created_at DESC",
+                (org_uuid,),
+            )
+        rows = cursor.fetchall()
+
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        row = dict(row)
+        providers_raw = row.get("providers")
+        try:
+            providers = json.loads(providers_raw) if providers_raw else []
+        except (json.JSONDecodeError, TypeError):
+            providers = []
+        result.append(
+            {
+                "uuid": row["uuid"],
+                "type": row["type"],
+                "status": row["status"],
+                "dataset_id": row.get("dataset_id"),
+                "dataset_name": row.get("dataset_name"),
+                "language": row.get("language"),
+                "providers": providers if isinstance(providers, list) else [],
+                "sample_count": row.get("sample_count") or 0,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+    return result
+
+
 def get_pending_jobs() -> List[Dict[str, Any]]:
     """Get all jobs with status 'in_progress' (for recovery on restart)."""
     with get_db_connection() as conn:

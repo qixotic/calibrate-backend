@@ -1502,23 +1502,54 @@ def test_jobs_router(client):
     auth = _auth(client)
     h = auth["headers"]
 
-    # Create a job directly in the DB so we have one to look up
+    # Create a job directly in the DB so we have one to look up. The list
+    # endpoint returns a slim header derived from `details` (providers,
+    # language, sample_count from len(texts)) and never ships the heavy
+    # results/details blobs.
     user_org = db_mod.get_personal_org_for_user(auth["user_uuid"])
     j_uuid = db_mod.create_job(
         job_type="stt-eval",
         org_uuid=user_org["uuid"],
         user_id=auth["user_uuid"],
         status="in_progress",
-        details={"x": 1},
+        details={
+            "providers": ["deepgram", "openai"],
+            "language": "english",
+            "texts": ["a", "b", "c"],
+            "audio_paths": ["s3://b/1", "s3://b/2", "s3://b/3"],
+            "evaluators": [{"uuid": "x", "system_prompt": "big blob"}],
+        },
+        results={"provider_results": [{"provider": "deepgram", "results": [1, 2, 3]}]},
     )
     listing = client.get("/jobs", headers=h)
     assert listing.status_code == 200
-    jobs = listing.json()["jobs"]
-    assert any(j["uuid"] == j_uuid for j in jobs)
+    body = listing.json()
+    # Paginated envelope, not the old {"jobs": [...]}.
+    assert set(body) == {"items", "total", "limit", "offset"}
+    assert body["total"] >= 1
+    # Pagination is optional: omitting limit returns the full list (limit=null),
+    # so an account's whole job history stays visible without paging.
+    assert body["limit"] is None
+    assert len(body["items"]) == body["total"]
+    item = next(j for j in body["items"] if j["uuid"] == j_uuid)
+    # Slim header fields, all top-level.
+    assert item["providers"] == ["deepgram", "openai"]
+    assert item["language"] == "english"
+    assert item["sample_count"] == 3
+    assert item["type"] == "stt-eval"
+    # Heavy blobs are gone from the list response.
+    assert "details" not in item
+    assert "results" not in item
 
     # Filtered list (stt)
     listing_stt = client.get("/jobs", params={"job_type": "stt"}, headers=h)
     assert listing_stt.status_code == 200
+    assert any(j["uuid"] == j_uuid for j in listing_stt.json()["items"])
+
+    # Pagination window is honored.
+    paged = client.get("/jobs", params={"limit": 1, "offset": 0}, headers=h)
+    assert paged.status_code == 200
+    assert len(paged.json()["items"]) == 1
 
     # Delete the job
     deleted = client.delete(f"/jobs/{j_uuid}", headers=h)
