@@ -401,10 +401,10 @@ def run_evaluation_task(
 
                 # Sarvam judge bundle is a metrics-axis toggle independent of the
                 # evaluator list. The CLI includes it by default; pass
-                # --skip-sarvam only to opt out. Snapshotted into details at
+                # --skip-llm-judges only to opt out. Snapshotted into details at
                 # submit time so a queued/retried run remembers its mode.
                 if not job_details.get("sarvam_judges", True):
-                    eval_cmd.append("--skip-sarvam")
+                    eval_cmd.append("--skip-llm-judges")
 
                 raw_evaluators = job_details.get("evaluators") or []
                 if raw_evaluators:

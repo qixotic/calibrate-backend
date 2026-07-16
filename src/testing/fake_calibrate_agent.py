@@ -27,7 +27,7 @@ FAKE_COST = 0.001
 FAKE_TOKENS = 42
 FAKE_WER = 0.0
 FAKE_TTFB = 0.5
-# Sarvam judge bundle (included by default; suppressed by `--skip-sarvam`).
+# Sarvam judge bundle (included by default; suppressed by `--skip-llm-judges`).
 FAKE_SARVAM_LLM_WER = 0.0
 FAKE_SARVAM_LLM_CER = 0.0
 # Every evaluator verdict is a PASS; every rating is scale_max.
@@ -36,7 +36,7 @@ FAKE_SARVAM_LLM_CER = 0.0
 # --- Argument parsing -------------------------------------------------------
 # Flags that take no value (their presence is the signal). Everything else that
 # starts with "-" consumes the following non-dash tokens as its value(s).
-_BOOL_FLAGS = {"--eval-only", "--skip-verify", "--skip-sarvam"}
+_BOOL_FLAGS = {"--eval-only", "--skip-verify", "--skip-llm-judges"}
 
 
 def _parse_args(argv: List[str]) -> tuple[str, Dict[str, List[str]]]:
@@ -361,7 +361,7 @@ def _cmd_stt(opts: Dict[str, List[str]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     providers = _many(opts, "-p", "--provider", "--providers") or ["openai"]
     evaluators = _evaluators_from_config(_load_json(_first(opts, "--config")))
-    sarvam = "--skip-sarvam" not in opts
+    sarvam = "--skip-llm-judges" not in opts
 
     input_dir = _first(opts, "-i", "--input")
     utterances = _read_id_text_csv(Path(input_dir) / "stt.csv") if input_dir else []
