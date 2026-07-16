@@ -149,6 +149,14 @@ On each publish, generated output overwrites `calibrate-cli` except:
 - `README.md`
 - `.speakeasyignore` (if present)
 
+### Post-generation CLI patches
+
+Speakeasy output is `// DO NOT EDIT` and `sync-client-repo.sh` does `rsync --delete`, so hand-edits in `calibrate-cli` never survive. Behavior tweaks live in this repo as idempotent, guarded patch scripts run in `publish-cli` **after** `speakeasy run` and **before** sync (a missing anchor fails the job with `::warning::` rather than shipping a silent regression):
+
+- `patch-goreleaser-config.sh` — GoReleaser >=2.17 Homebrew `token` field compat.
+- `patch-cli-auth-commands.sh` — hoist `login`/`logout` to root, hide the legacy `auth` group.
+- `patch-cli-server-url.sh` — make `--server-url` a persistable global param (flag > env `CALIBRATE_SERVER_URL` > config), stored by `calibrate configure` and shown in `calibrate whoami`. Speakeasy generates it flag-only, so self-hosted users would otherwise pass it on every call. Each script has a matching `tests/test_*_patch.py` that patches a copy of the sibling repo and (for server-url) compiles it with `go build`.
+
 ## One-time: MCP (`calibrate-mcp`)
 
 Speakeasy **`mcp-typescript`** generates a standalone MCP server from the same public OpenAPI spec + overlay as the CLI. Generate + sync run in `publish-sdk.yml` (`publish-mcp` job).

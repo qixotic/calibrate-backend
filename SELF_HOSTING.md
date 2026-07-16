@@ -549,3 +549,13 @@ Watch the run. If SSH connects and `docker compose up -d` succeeds, you're set �
 
 - **Firewall**: port 22 must be open to the GitHub Actions runner. Either keep `default-allow-ssh` as-is (0.0.0.0/0) or restrict to GitHub's runner IP ranges (changes periodically — keep an eye on [GitHub's meta endpoint](https://api.github.com/meta)).
 - **Compose project name**: the workflow uses `docker compose -p pense-production` for project isolation. If you started the container manually with a different project name, the workflow will spin up a parallel container instead of replacing yours — stop the old one with `docker compose down` once the workflow is green.
+
+## Point the Calibrate CLI at your instance
+
+The `calibrate` CLI defaults to the hosted backend. To use it against your self-hosted instance, set the server URL **once** — it persists to `~/.config/calibrate/config.yaml` next to your API key:
+
+```
+calibrate configure --no-interactive --server-url https://calibrate-backend.<yourdomain.com>
+```
+
+Interactive `calibrate configure` also prompts for it. Verify with `calibrate whoami` (shows the resolved URL and its source). Resolution is flag > env > config, so you can still override per-call with `--server-url …` or `export CALIBRATE_SERVER_URL=https://…`. Create the API key under Workspace settings → API keys on your instance.
