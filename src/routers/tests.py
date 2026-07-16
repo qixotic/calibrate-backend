@@ -15,7 +15,7 @@ from db import (
     create_test,
     ensure_name_unique,
     get_test,
-    get_all_tests,
+    get_all_tests_summary,
     update_test,
     delete_test,
     bulk_create_tests,
@@ -566,7 +566,7 @@ async def list_tests(
     # Optional `?q=` name search + `?limit=&offset=` paging. Returns the
     # `{items, total, limit, offset}` envelope; the slim list transform runs
     # only on the returned page.
-    tests = get_all_tests(org_uuid=ctx.org_uuid)
+    tests = get_all_tests_summary(org_uuid=ctx.org_uuid)
     tests = search.apply(tests)
     page, total = count_and_page(tests, pagination)
     return page_envelope([to_test_list_response(t) for t in page], total, pagination)

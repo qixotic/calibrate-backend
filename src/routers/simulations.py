@@ -41,6 +41,7 @@ from db import (
     update_simulation_job,
     update_simulation_job_visibility,
     get_simulation_jobs_for_simulation,
+    get_simulation_jobs_summary,
     delete_simulation_job,
 )
 from llm_judge import build_evaluator_cli_payload
@@ -959,8 +960,8 @@ async def get_simulation_runs(
     if not simulation or simulation.get("org_uuid") != ctx.org_uuid:
         raise HTTPException(status_code=404, detail="Simulation not found")
 
-    # Get all jobs for this simulation
-    jobs = get_simulation_jobs_for_simulation(simulation_uuid)
+    # Get all jobs for this simulation (slim run-list headers only)
+    jobs = get_simulation_jobs_summary(simulation_uuid)
 
     # Sort by created_at ASC to calculate run index (Run 1 is the oldest)
     sorted_by_created = sorted(jobs, key=lambda j: j.get("created_at", ""))

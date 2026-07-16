@@ -274,8 +274,8 @@ def test_tests_crud_and_bulk(user):
     assert db.get_test(t_uuid)["config"] == {"k": "v"}
     assert db.update_test(t_uuid, name=_u("renamed"), type="llm", config={"k": "v2"})
     assert db.update_test(t_uuid) is False
-    assert any(t["uuid"] == t_uuid for t in db.get_all_tests(org_uuid=user["org_uuid"]))
-    assert any(t["uuid"] == t_uuid for t in db.get_all_tests())
+    assert any(t["uuid"] == t_uuid for t in db.get_all_tests_summary(org_uuid=user["org_uuid"]))
+    assert any(t["uuid"] == t_uuid for t in db.get_all_tests_summary())
 
     with pytest.raises(ValueError):
         db.create_test(name=_u("no-owner-test"), type="llm", org_uuid=None)
@@ -1739,20 +1739,20 @@ def test_agent_test_jobs(user):
     )
     assert db.get_agent_test_job(j_uuid)["details"] == {"x": 1}
     assert any(
-        j["uuid"] == j_uuid for j in db.get_agent_test_jobs_for_agent(agent_uuid)
+        j["uuid"] == j_uuid for j in db.get_agent_test_jobs_for_agent_summary(agent_uuid)
     )
     assert any(
         j["uuid"] == j_uuid
-        for j in db.get_agent_test_jobs_for_agent(agent_uuid, job_type="llm-unit-test")
+        for j in db.get_agent_test_jobs_for_agent_summary(agent_uuid, job_type="llm-unit-test")
     )
     assert any(j["uuid"] == j_uuid for j in db.get_all_agent_test_jobs())
     assert any(
         j["uuid"] == j_uuid for j in db.get_all_agent_test_jobs(job_type="llm-unit-test")
     )
-    assert any(j["uuid"] == j_uuid for j in db.get_agent_test_jobs_for_org(user["org_uuid"]))
+    assert any(j["uuid"] == j_uuid for j in db.get_agent_test_jobs_for_org_summary(user["org_uuid"]))
     assert any(
         j["uuid"] == j_uuid
-        for j in db.get_agent_test_jobs_for_org(user["org_uuid"], job_type="llm-unit-test")
+        for j in db.get_agent_test_jobs_for_org_summary(user["org_uuid"], job_type="llm-unit-test")
     )
 
     queued_uuid = db.create_agent_test_job(
@@ -2423,3 +2423,235 @@ def test_dedupe_active_dataset_names_ignores_soft_deleted():
     _insert_ds(conn, "Y", "orgA", deleted="2020-01-01")
 
     assert db._dedupe_active_dataset_names(cur) == 0
+
+
+# ---------------------------------------------------------------------------
+# Slim run-list job summaries (never read `details`, drop heavy `results` subtrees)
+# ---------------------------------------------------------------------------
+
+
+def _heavy_unit_results():
+    return {
+        "total_tests": 2,
+        "passed": 1,
+        "failed": 1,
+        "latency_ms": {"p50": 12.0, "p95": 30.0, "count": 2},
+        "cost": {"mean": 0.01, "count": 2},
+        "total_tokens": {"mean": 42, "count": 2},
+        "error": None,
+        "test_results": [
+            {
+                "name": "case-a",
+                "passed": True,
+                # Heavy per-case detail that must NOT survive into the summary.
+                "output": {"response": "X" * 500, "cost": 0.01},
+                "judge_results": {"quality": {"reasoning": "Y" * 500}},
+                "reasoning": "Z" * 500,
+                "test_case": {"name": "ignored-when-name-present", "history": [1, 2]},
+            },
+            # No top-level name -> falls back to test_case.name.
+            {"passed": False, "test_case": {"name": "case-b"}},
+        ],
+    }
+
+
+def _heavy_benchmark_results():
+    return {
+        "error": None,
+        "model_results": [
+            {
+                "model": "openai/gpt-4.1",
+                "success": True,
+                "message": "ok",
+                "total_tests": 2,
+                "passed": 2,
+                "failed": 0,
+                # Heavy nested per-case detail that must be dropped.
+                "test_results": [{"output": "H" * 500} for _ in range(3)],
+            }
+        ],
+    }
+
+
+def test_agent_test_jobs_summary_slims_results_and_omits_details(user):
+    agent_uuid = db.create_agent(
+        name=_u("a-runs"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    heavy_details = {"config": {"blob": "D" * 1000}}
+    unit_uuid = db.create_agent_test_job(
+        agent_uuid, "llm-unit-test", status="done",
+        details=heavy_details, results=_heavy_unit_results(),
+    )
+    bench_uuid = db.create_agent_test_job(
+        agent_uuid, "llm-benchmark", status="done",
+        details=heavy_details, results=_heavy_benchmark_results(),
+    )
+
+    rows = db.get_agent_test_jobs_for_agent_summary(agent_uuid)
+    by_uuid = {r["uuid"]: r for r in rows}
+    assert set(by_uuid) == {unit_uuid, bench_uuid}
+
+    unit = by_uuid[unit_uuid]
+    # `details` is never read into the summary.
+    assert "details" not in unit or unit.get("details") is None
+    res = unit["results"]
+    # Scalar aggregates are extracted verbatim (dict aggregates round-trip).
+    assert res["total_tests"] == 2
+    assert res["passed"] == 1
+    assert res["failed"] == 1
+    assert res["latency_ms"] == {"p50": 12.0, "p95": 30.0, "count": 2}
+    assert res["cost"] == {"mean": 0.01, "count": 2}
+    assert res["total_tokens"] == {"mean": 42, "count": 2}
+    # test_results are slimmed to {name, passed} only — heavy keys gone,
+    # and the missing top-level name falls back to test_case.name.
+    assert [(c["name"], bool(c["passed"])) for c in res["test_results"]] == [
+        ("case-a", True),
+        ("case-b", False),
+    ]
+    for case in res["test_results"]:
+        assert set(case) == {"name", "passed"}
+
+    bench = by_uuid[bench_uuid]
+    mr = bench["results"]["model_results"]
+    assert len(mr) == 1
+    assert set(mr[0]) == {"model", "success", "message", "total_tests", "passed", "failed"}
+    assert mr[0]["model"] == "openai/gpt-4.1"
+    assert "test_results" not in mr[0]
+
+
+def test_agent_test_jobs_summary_filters_by_type_and_orders(user):
+    agent_uuid = db.create_agent(
+        name=_u("a-runs2"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    u1 = db.create_agent_test_job(agent_uuid, "llm-unit-test", status="done")
+    b1 = db.create_agent_test_job(agent_uuid, "llm-benchmark", status="done")
+
+    only_unit = db.get_agent_test_jobs_for_agent_summary(agent_uuid, job_type="llm-unit-test")
+    assert [r["uuid"] for r in only_unit] == [u1]
+
+    both = db.get_agent_test_jobs_for_agent_summary(agent_uuid)
+    # Newest-first (b1 created after u1).
+    assert [r["uuid"] for r in both] == [b1, u1]
+    # Null-results job yields empty slim arrays, not an error.
+    assert both[0]["results"]["test_results"] in (None, [])
+
+
+def test_agent_test_jobs_summary_skips_non_object_result_rows(user):
+    # Non-object array elements would make json_extract raise malformed-JSON;
+    # the `je.type = 'object'` guard skips them (mirrors the old isinstance check).
+    agent_uuid = db.create_agent(
+        name=_u("a-junk"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    results = {
+        "test_results": ["not-a-dict", None, 5, {"name": "real", "passed": True}],
+        "model_results": ["junk", {"model": "gpt", "passed": 1}],
+    }
+    job_uuid = db.create_agent_test_job(
+        agent_uuid, "llm-unit-test", status="done", results=results
+    )
+    row = next(
+        r for r in db.get_agent_test_jobs_for_agent_summary(agent_uuid)
+        if r["uuid"] == job_uuid
+    )
+    assert [c["name"] for c in row["results"]["test_results"]] == ["real"]
+    assert [m["model"] for m in row["results"]["model_results"]] == ["gpt"]
+
+
+def test_agent_test_jobs_for_org_summary_joins_agent_name(user):
+    agent_uuid = db.create_agent(
+        name=_u("a-org"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    job_uuid = db.create_agent_test_job(
+        agent_uuid, "llm-unit-test", status="done", results=_heavy_unit_results()
+    )
+    rows = db.get_agent_test_jobs_for_org_summary(user["org_uuid"])
+    row = next(r for r in rows if r["uuid"] == job_uuid)
+    assert row["agent_id"] == agent_uuid
+    assert row["agent_name"]  # populated from the joined agent
+    assert row["results"]["total_tests"] == 2
+
+
+def test_tests_summary_extracts_only_description(user):
+    agent_uuid = db.create_agent(
+        name=_u("a-tl"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    heavy_config = {
+        "description": "short desc",
+        # Heavy blocks the slim projection must never read.
+        "history": [{"role": "user", "content": "H" * 1000}],
+        "evaluation": {"criteria": "E" * 1000},
+        "settings": {"temperature": 0.7},
+    }
+    test_uuid = db.create_test(
+        name=_u("t-heavy"), type="response", config=heavy_config,
+        user_id=user["uuid"], org_uuid=user["org_uuid"],
+    )
+    db.add_test_to_agent(agent_uuid, test_uuid)
+
+    for rows in (
+        db.get_all_tests_summary(org_uuid=user["org_uuid"]),
+        db.get_tests_for_agent_summary(agent_uuid),
+    ):
+        row = next(r for r in rows if r["uuid"] == test_uuid)
+        assert row["name"]
+        assert row["type"] == "response"
+        # Only the description survives; heavy blocks are absent.
+        assert row["config"] == {"description": "short desc"}
+
+
+def test_tests_summary_handles_missing_description(user):
+    test_uuid = db.create_test(
+        name=_u("t-nodesc"), type="response", config={"history": []},
+        user_id=user["uuid"], org_uuid=user["org_uuid"],
+    )
+    row = next(
+        r for r in db.get_all_tests_summary(org_uuid=user["org_uuid"])
+        if r["uuid"] == test_uuid
+    )
+    assert row["config"] == {"description": None}
+
+
+def test_new_indexes_exist():
+    with db.get_db_connection() as conn:
+        names = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+    expected = {
+        "idx_annotation_items_task",
+        "idx_evaluator_runs_job",
+        "idx_dataset_items_dataset",
+        "idx_jobs_status_type_created",
+        "idx_agent_test_jobs_agent_created",
+        "idx_agent_test_jobs_status",
+        "idx_agent_test_jobs_share",
+        "idx_simulation_jobs_sim_created",
+        "idx_simulation_jobs_status",
+        "idx_simulation_jobs_share",
+        "idx_annotation_jobs_task",
+        "idx_annotation_jobs_annotator",
+    }
+    assert expected <= names
+
+
+def test_simulation_jobs_summary_returns_headers_only(user):
+    agent_uuid = db.create_agent(
+        name=_u("a-simrun"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    sim_uuid = db.create_simulation(
+        name=_u("sim-run"), agent_id=agent_uuid,
+        user_id=user["uuid"], org_uuid=user["org_uuid"],
+    )
+    heavy = {"transcript": [{"role": "user", "content": "H" * 1000}]}
+    job_uuid = db.create_simulation_job(
+        sim_uuid, "text", status="done",
+        details={"config": "D" * 1000}, results=heavy,
+    )
+    rows = db.get_simulation_jobs_summary(sim_uuid)
+    row = next(r for r in rows if r["uuid"] == job_uuid)
+    assert set(row) >= {"uuid", "status", "type", "created_at", "updated_at"}
+    # Neither heavy blob is fetched.
+    assert "results" not in row
+    assert "details" not in row

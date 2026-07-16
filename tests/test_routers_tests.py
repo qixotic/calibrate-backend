@@ -113,6 +113,105 @@ def test_list_tests_returns_trimmed_shape(client):
     assert item["type"] == "response"
 
 
+def test_list_tests_never_ships_heavy_config_blocks(client):
+    """The slim list summary json_extracts only `config.description`; the heavy
+    `config.history`/`evaluation`/`settings` blocks (conversation transcripts,
+    judge config) must never reach the wire. Sentinel strings stuffed into those
+    blocks must be absent from the whole `GET /tests` response body."""
+    import json as _json
+
+    jwt = _signup(client)
+    key = _raw_key(client, jwt)
+    hist_sentinel = f"HIST-{uuid.uuid4().hex}"
+    eval_sentinel = f"EVAL-{uuid.uuid4().hex}"
+    settings_sentinel = f"SET-{uuid.uuid4().hex}"
+    name = f"t-heavy-{uuid.uuid4().hex[:6]}"
+    created = client.post(
+        "/tests",
+        json={
+            "name": name,
+            "type": "response",
+            "config": {
+                "description": "keep me",
+                "history": [{"role": "user", "content": hist_sentinel}],
+                "evaluation": {"type": "response", "note": eval_sentinel},
+                "settings": {"language": settings_sentinel},
+            },
+        },
+        headers={"X-API-Key": key},
+    )
+    assert created.status_code == 200, created.text
+    t_uuid = created.json()["uuid"]
+
+    r = client.get("/tests", headers={"X-API-Key": key})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"items", "total", "limit", "offset"}
+    item = next(t for t in body["items"] if t["uuid"] == t_uuid)
+    assert item["name"] == name
+    assert item["type"] == "response"
+    assert item["config"] == {"description": "keep me"}
+    assert set(item["config"]) == {"description"}
+
+    dumped = _json.dumps(body)
+    assert hist_sentinel not in dumped
+    assert eval_sentinel not in dumped
+    assert settings_sentinel not in dumped
+
+
+def test_list_tests_null_description(client):
+    """A test with no `config.description` still lists 200 with description=null."""
+    jwt = _signup(client)
+    key = _raw_key(client, jwt)
+    name = f"t-nodesc-{uuid.uuid4().hex[:6]}"
+    created = client.post(
+        "/tests",
+        json={
+            "name": name,
+            "type": "response",
+            "config": {"history": [{"role": "user", "content": "hi"}]},
+        },
+        headers={"X-API-Key": key},
+    )
+    assert created.status_code == 200, created.text
+    t_uuid = created.json()["uuid"]
+
+    r = client.get("/tests", headers={"X-API-Key": key})
+    assert r.status_code == 200, r.text
+    item = next(t for t in r.json()["items"] if t["uuid"] == t_uuid)
+    assert item["config"] == {"description": None}
+
+
+def test_list_tests_q_search_and_pagination(client):
+    """`?q=` filters list items by name; `?limit=/?offset=` slice the envelope
+    while `total` stays the pre-slice count of the filtered set."""
+    jwt = _signup(client)
+    key = _raw_key(client, jwt)
+    tag = uuid.uuid4().hex[:8]
+    names = [f"srch-{tag}-{i}" for i in range(3)]
+    for n in names:
+        _create_test(client, {"X-API-Key": key}, name=n)
+    # A decoy that must not match the search tag.
+    _create_test(client, {"X-API-Key": key}, name=f"other-{uuid.uuid4().hex[:6]}")
+
+    hit = client.get("/tests", params={"q": tag}, headers={"X-API-Key": key})
+    assert hit.status_code == 200, hit.text
+    body = hit.json()
+    assert body["total"] == 3
+    assert {t["name"] for t in body["items"]} == set(names)
+
+    page = client.get(
+        "/tests", params={"q": tag, "limit": 2, "offset": 0}, headers={"X-API-Key": key}
+    ).json()
+    assert page["total"] == 3
+    assert len(page["items"]) == 2
+    page2 = client.get(
+        "/tests", params={"q": tag, "limit": 2, "offset": 2}, headers={"X-API-Key": key}
+    ).json()
+    assert page2["total"] == 3
+    assert len(page2["items"]) == 1
+
+
 def test_get_test_with_api_key(client):
     """GET /tests/{uuid} accepts an X-API-Key and returns the full test shape."""
     jwt = _signup(client)

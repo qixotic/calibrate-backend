@@ -1504,6 +1504,43 @@ def init_db():
             "ON jobs(org_uuid, created_at) WHERE deleted_at IS NULL"
         )
 
+        # Covering indexes for the hot parent-FK / queue / share-token lookups
+        # that previously full-scanned. Composite `(fk, deleted_at)` serves both
+        # the common `WHERE fk = ? AND deleted_at IS NULL` reads and the rarer
+        # include-deleted variants; the job tables have no `deleted_at`.
+        for index_sql in (
+            # Child rows read by parent FK on every list/results/agreement path.
+            "CREATE INDEX IF NOT EXISTS idx_annotation_items_task "
+            "ON annotation_items(task_id, deleted_at)",
+            "CREATE INDEX IF NOT EXISTS idx_evaluator_runs_job "
+            "ON evaluator_runs(job_id, deleted_at)",
+            "CREATE INDEX IF NOT EXISTS idx_dataset_items_dataset "
+            "ON dataset_items(dataset_id, deleted_at)",
+            # Queue poller: WHERE status = ? [AND type IN (...)] ORDER BY created_at.
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_type_created "
+            "ON jobs(status, type, created_at)",
+            # Agent-test job reads: per-agent run list, queue capacity, public share.
+            "CREATE INDEX IF NOT EXISTS idx_agent_test_jobs_agent_created "
+            "ON agent_test_jobs(agent_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_test_jobs_status "
+            "ON agent_test_jobs(status)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_test_jobs_share "
+            "ON agent_test_jobs(share_token)",
+            # Simulation job reads: per-simulation run list, queue capacity, share.
+            "CREATE INDEX IF NOT EXISTS idx_simulation_jobs_sim_created "
+            "ON simulation_jobs(simulation_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_simulation_jobs_status "
+            "ON simulation_jobs(status)",
+            "CREATE INDEX IF NOT EXISTS idx_simulation_jobs_share "
+            "ON simulation_jobs(share_token)",
+            # Annotation jobs read by task (list/agreement) and by annotator.
+            "CREATE INDEX IF NOT EXISTS idx_annotation_jobs_task "
+            "ON annotation_jobs(task_id, deleted_at)",
+            "CREATE INDEX IF NOT EXISTS idx_annotation_jobs_annotator "
+            "ON annotation_jobs(annotator_id, deleted_at)",
+        ):
+            cursor.execute(index_sql)
+
         # Backfill the denormalized jobs-list header columns from `details` for
         # rows predating them. One-time + gated: never re-runs (so a later
         # hand-edit of a column is never clobbered) and idempotent if a crash
@@ -4402,21 +4439,66 @@ def get_test(test_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_tests(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all tests, optionally filtered by org_uuid."""
+# Slim projection for the tests-LIST endpoints (`to_test_list_response`). Pulls
+# only `config.description` via `json_extract` instead of parsing the whole
+# `config` blob (which holds conversation `history` transcripts + `evaluation` /
+# `settings`) for every row. Shaped as `config={"description": ...}` so
+# `to_test_list_response` consumes it unchanged.
+def _row_to_test_summary(row: sqlite3.Row) -> Dict[str, Any]:
+    row = dict(row)
+    return {
+        "uuid": row["uuid"],
+        "name": row["name"],
+        "type": row["type"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "config": {"description": row.get("description")},
+    }
+
+
+# `t.`-qualified so the same projection works with the `agent_tests` JOIN
+# (both tables carry `created_at`).
+_TEST_SUMMARY_COLUMNS = (
+    "t.uuid, t.name, t.type, t.created_at, t.updated_at, "
+    "json_extract(t.config, '$.description') AS description"
+)
+
+
+def get_all_tests_summary(org_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Slim tests-list headers (see `_row_to_test_summary`). Never parses the
+    full `config`. Newest-created first."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if org_uuid:
             cursor.execute(
-                "SELECT * FROM tests WHERE deleted_at IS NULL AND org_uuid = ? ORDER BY created_at DESC",
+                f"SELECT {_TEST_SUMMARY_COLUMNS} FROM tests t "
+                "WHERE t.deleted_at IS NULL AND t.org_uuid = ? ORDER BY t.created_at DESC",
                 (org_uuid,),
             )
         else:
             cursor.execute(
-                "SELECT * FROM tests WHERE deleted_at IS NULL ORDER BY created_at DESC"
+                f"SELECT {_TEST_SUMMARY_COLUMNS} FROM tests t "
+                "WHERE t.deleted_at IS NULL ORDER BY t.created_at DESC"
             )
-        rows = cursor.fetchall()
-        return [_parse_test_row(row) for row in rows]
+        return [_row_to_test_summary(row) for row in cursor.fetchall()]
+
+
+def get_tests_for_agent_summary(agent_id: str) -> List[Dict[str, Any]]:
+    """Slim tests-list headers for one agent's linked tests (see
+    `_row_to_test_summary`). Never parses the full `config`. Ordering matches
+    `get_tests_for_agent`."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT {_TEST_SUMMARY_COLUMNS} FROM tests t
+            INNER JOIN agent_tests at ON t.uuid = at.test_id
+            WHERE at.agent_id = ? AND at.deleted_at IS NULL AND t.deleted_at IS NULL
+            ORDER BY at.created_at DESC
+            """,
+            (agent_id,),
+        )
+        return [_row_to_test_summary(row) for row in cursor.fetchall()]
 
 
 def update_test(
@@ -6665,26 +6747,6 @@ def get_agent_test_job(job_uuid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_agent_test_jobs_for_agent(
-    agent_id: str, job_type: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """Get all agent test jobs for a specific agent, optionally filtered by type."""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        if job_type:
-            cursor.execute(
-                "SELECT * FROM agent_test_jobs WHERE agent_id = ? AND type = ? ORDER BY created_at DESC, id DESC",
-                (agent_id, job_type),
-            )
-        else:
-            cursor.execute(
-                "SELECT * FROM agent_test_jobs WHERE agent_id = ? ORDER BY created_at DESC, id DESC",
-                (agent_id,),
-            )
-        rows = cursor.fetchall()
-        return [_parse_agent_test_job_row(row) for row in rows]
-
-
 def get_all_agent_test_jobs(job_type: Optional[str] = None) -> List[Dict[str, Any]]:
     """Get all agent test jobs, optionally filtered by type."""
     with get_db_connection() as conn:
@@ -6702,41 +6764,134 @@ def get_all_agent_test_jobs(job_type: Optional[str] = None) -> List[Dict[str, An
         return [_parse_agent_test_job_row(row) for row in rows]
 
 
-def get_agent_test_jobs_for_org(
-    org_uuid: str, job_type: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """Get all agent test jobs belonging to an org (across all its agents).
+# Per-row projection for the run-LIST endpoints. Pulls only the header columns
+# plus the scalar aggregates and the two slim per-row arrays out of the heavy
+# `results` blob, and never reads `details` at all — the run-list index needs
+# neither the full `details` nor the bulky `results` sub-trees (agent outputs,
+# judge reasoning, test-case bodies, per-model `test_results`, leaderboard).
+# The slim `test_results`/`model_results` arrays are rebuilt inside SQLite via
+# `json_each` so only the trimmed rows cross into Python. Kept aligned with the
+# fields `_build_agent_test_run_item_fields` reads in routers/agent_tests.py.
+_AGENT_TEST_JOB_SUMMARY_COLUMNS = """
+        atj.uuid, atj.type, atj.status, atj.agent_id,
+        atj.is_public, atj.share_token, atj.created_at, atj.updated_at, atj.id,
+        json_extract(atj.results, '$.total_tests') AS total_tests,
+        json_extract(atj.results, '$.passed') AS passed,
+        json_extract(atj.results, '$.failed') AS failed,
+        json_extract(atj.results, '$.latency_ms') AS latency_ms,
+        json_extract(atj.results, '$.cost') AS cost,
+        json_extract(atj.results, '$.total_tokens') AS total_tokens,
+        json_extract(atj.results, '$.error') AS error,
+        (SELECT json_group_array(json_object(
+            'name', COALESCE(json_extract(je.value, '$.name'),
+                             json_extract(je.value, '$.test_case.name')),
+            'passed', json_extract(je.value, '$.passed')
+         )) FROM json_each(COALESCE(atj.results, '{}'), '$.test_results') je
+         WHERE je.type = 'object'
+        ) AS test_results,
+        (SELECT json_group_array(json_object(
+            'model', json_extract(je.value, '$.model'),
+            'success', json_extract(je.value, '$.success'),
+            'message', json_extract(je.value, '$.message'),
+            'total_tests', json_extract(je.value, '$.total_tests'),
+            'passed', json_extract(je.value, '$.passed'),
+            'failed', json_extract(je.value, '$.failed')
+         )) FROM json_each(COALESCE(atj.results, '{}'), '$.model_results') je
+         WHERE je.type = 'object'
+        ) AS model_results
+"""
 
-    Joins agent_test_jobs with agents so that each returned dict includes
-    ``agent_name`` and ``agent_id`` alongside the normal job fields.
-    Results are ordered newest-updated-first.
-    """
+
+def _row_to_agent_test_job_summary(row: sqlite3.Row) -> Dict[str, Any]:
+    """Shape a slim agent-test-job row into the same dict the run-list routers
+    consume: header fields plus a reduced `results` sub-dict (no `details`)."""
+    row = dict(row)
+
+    def _loads(value: Any) -> Any:
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+
+    return {
+        "uuid": row["uuid"],
+        "type": row["type"],
+        "status": row["status"],
+        "agent_id": row.get("agent_id"),
+        "agent_name": row.get("agent_name"),
+        "is_public": row.get("is_public"),
+        "share_token": row.get("share_token"),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "id": row.get("id"),
+        "results": {
+            "total_tests": row.get("total_tests"),
+            "passed": row.get("passed"),
+            "failed": row.get("failed"),
+            "latency_ms": _loads(row.get("latency_ms")),
+            "cost": _loads(row.get("cost")),
+            "total_tokens": _loads(row.get("total_tokens")),
+            "error": row.get("error"),
+            "test_results": _loads(row.get("test_results")),
+            "model_results": _loads(row.get("model_results")),
+        },
+    }
+
+
+def get_agent_test_jobs_for_agent_summary(
+    agent_id: str, job_type: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Slim run-list headers for one agent's test jobs (see
+    `_AGENT_TEST_JOB_SUMMARY_COLUMNS`). Never reads `details` nor the heavy
+    `results` sub-trees. Newest-created first (ties broken by `id`)."""
+    select = (
+        f"SELECT {_AGENT_TEST_JOB_SUMMARY_COLUMNS} FROM agent_test_jobs atj "
+        "WHERE atj.agent_id = ?"
+    )
     with get_db_connection() as conn:
         cursor = conn.cursor()
         if job_type:
             cursor.execute(
-                """
-                SELECT atj.*, a.name AS agent_name, a.uuid AS agent_id
-                FROM agent_test_jobs atj
-                JOIN agents a ON atj.agent_id = a.uuid
-                WHERE a.org_uuid = ? AND a.deleted_at IS NULL AND atj.type = ?
-                ORDER BY atj.updated_at DESC, atj.id DESC
-                """,
+                select + " AND atj.type = ? ORDER BY atj.created_at DESC, atj.id DESC",
+                (agent_id, job_type),
+            )
+        else:
+            cursor.execute(
+                select + " ORDER BY atj.created_at DESC, atj.id DESC",
+                (agent_id,),
+            )
+        rows = cursor.fetchall()
+        return [_row_to_agent_test_job_summary(row) for row in rows]
+
+
+def get_agent_test_jobs_for_org_summary(
+    org_uuid: str, job_type: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Slim run-list headers for an org's test jobs across all its agents, with
+    `agent_name`/`agent_id` from the joined agent. Never reads `details` nor the
+    heavy `results` sub-trees. Newest-updated first (ties broken by `id`)."""
+    select = (
+        f"SELECT {_AGENT_TEST_JOB_SUMMARY_COLUMNS}, a.name AS agent_name "
+        "FROM agent_test_jobs atj "
+        "JOIN agents a ON atj.agent_id = a.uuid "
+        "WHERE a.org_uuid = ? AND a.deleted_at IS NULL"
+    )
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if job_type:
+            cursor.execute(
+                select + " AND atj.type = ? ORDER BY atj.updated_at DESC, atj.id DESC",
                 (org_uuid, job_type),
             )
         else:
             cursor.execute(
-                """
-                SELECT atj.*, a.name AS agent_name, a.uuid AS agent_id
-                FROM agent_test_jobs atj
-                JOIN agents a ON atj.agent_id = a.uuid
-                WHERE a.org_uuid = ? AND a.deleted_at IS NULL
-                ORDER BY atj.updated_at DESC, atj.id DESC
-                """,
+                select + " ORDER BY atj.updated_at DESC, atj.id DESC",
                 (org_uuid,),
             )
         rows = cursor.fetchall()
-        return [_parse_agent_test_job_row(row) for row in rows]
+        return [_row_to_agent_test_job_summary(row) for row in rows]
 
 
 def get_pending_agent_test_jobs() -> List[Dict[str, Any]]:
@@ -6984,6 +7139,33 @@ def get_simulation_jobs_for_simulation(
             )
         rows = cursor.fetchall()
         return [_parse_simulation_job_row(row) for row in rows]
+
+
+def get_simulation_jobs_summary(
+    simulation_id: str, job_type: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Slim run-list headers for a simulation's jobs. The run-list needs only
+    `uuid/status/type/created_at/updated_at`, so this never reads the heavy
+    `details` (config) nor `results` (full transcript + judge output) blobs.
+    Ordering matches `get_simulation_jobs_for_simulation`."""
+    select = (
+        "SELECT uuid, status, type, created_at, updated_at, id "
+        "FROM simulation_jobs WHERE simulation_id = ?"
+    )
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if job_type:
+            cursor.execute(
+                select + " AND type = ? ORDER BY created_at DESC",
+                (simulation_id, job_type),
+            )
+        else:
+            cursor.execute(
+                select + " ORDER BY created_at DESC",
+                (simulation_id,),
+            )
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
 
 
 def get_all_simulation_jobs(job_type: Optional[str] = None) -> List[Dict[str, Any]]:

@@ -243,6 +243,83 @@ def test_agent_tests_list_returns_trimmed_shape(client):
     assert "evaluation" not in (item.get("config") or {})
 
 
+def test_agent_tests_list_never_ships_heavy_config_blocks(client):
+    """The per-agent tests list uses the slim summary (json_extract of
+    `config.description` only). A linked test carrying heavy
+    `history`/`evaluation`/`settings` blocks stuffed with sentinels must expose
+    none of them through `GET /agent-tests/agent/{uuid}/tests`."""
+    import json as _json
+
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    hist_sentinel = f"HIST-{uuid.uuid4().hex}"
+    eval_sentinel = f"EVAL-{uuid.uuid4().hex}"
+    settings_sentinel = f"SET-{uuid.uuid4().hex}"
+    name = f"t-heavy-{uuid.uuid4().hex[:6]}"
+    test = client.post(
+        "/tests",
+        json={
+            "name": name,
+            "type": "response",
+            "config": {
+                "description": "keep me",
+                "history": [{"role": "user", "content": hist_sentinel}],
+                "evaluation": {"type": "response", "note": eval_sentinel},
+                "settings": {"language": settings_sentinel},
+            },
+        },
+        headers=h,
+    ).json()
+    client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test["uuid"]]},
+        headers=h,
+    )
+
+    r = client.get(f"/agent-tests/agent/{agent['uuid']}/tests", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"items", "total", "limit", "offset"}
+    item = next(t for t in body["items"] if t["uuid"] == test["uuid"])
+    assert item["name"] == name
+    assert item["type"] == "response"
+    assert item["config"] == {"description": "keep me"}
+    assert "evaluators" not in item
+
+    dumped = _json.dumps(body)
+    assert hist_sentinel not in dumped
+    assert eval_sentinel not in dumped
+    assert settings_sentinel not in dumped
+
+
+def test_agent_tests_list_null_description(client):
+    """A linked test with no `config.description` still lists 200 with
+    description=null through the per-agent tests endpoint."""
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    test = client.post(
+        "/tests",
+        json={
+            "name": f"t-nodesc-{uuid.uuid4().hex[:6]}",
+            "type": "response",
+            "config": {"history": [{"role": "user", "content": "hi"}]},
+        },
+        headers=h,
+    ).json()
+    client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test["uuid"]]},
+        headers=h,
+    )
+
+    r = client.get(f"/agent-tests/agent/{agent['uuid']}/tests", headers=h)
+    assert r.status_code == 200, r.text
+    item = next(t for t in r.json()["items"] if t["uuid"] == test["uuid"])
+    assert item["config"] == {"description": None}
+
+
 def test_agent_runs_list_surfaces_perf_aggregates(client):
     """A completed unit-test run surfaces run-level latency/cost/total_tokens
     aggregates through the agent runs-list endpoint. The list is a lightweight
@@ -300,8 +377,10 @@ def test_agent_runs_list_surfaces_perf_aggregates(client):
 
 def test_agent_runs_list_slims_benchmark_model_results(client):
     """A benchmark run in the runs-list drops each model's heavy nested
-    `test_results`/`evaluator_summary`, keeping only flat scalar summaries. Also
-    exercises the empty/non-dict guards in `_slim_test_results`."""
+    `test_results`/`evaluator_summary`, keeping only flat scalar summaries. The
+    empty/non-dict-row guards live in `_slim_*` and are unit-tested separately
+    (`test_slim_run_list_helpers_guard_edge_cases`); the SQL-side summary path
+    only ever sees calibrate's dict rows, so this integration case seeds those."""
     from db import create_agent_test_job, update_agent_test_job
 
     h = _signup(client)["headers"]
@@ -312,11 +391,9 @@ def test_agent_runs_list_slims_benchmark_model_results(client):
         job_id,
         status="done",
         results={
-            # Junk non-dict rows must be skipped, not crash.
-            "test_results": ["not-a-dict", None],
+            # No `test_results` block on a benchmark run → collapses to None.
             "leaderboard_summary": [{"model": "openai/gpt-4.1", "rank": 1}],
             "model_results": [
-                "not-a-dict",  # non-dict guard
                 {
                     "model": "openai/gpt-4.1",
                     "success": True,
@@ -338,7 +415,7 @@ def test_agent_runs_list_slims_benchmark_model_results(client):
     resp = client.get(f"/agent-tests/agent/{agent['uuid']}/runs", headers=h)
     assert resp.status_code == 200
     run = resp.json()["items"][0]
-    # Non-dict test_results rows are skipped → empty list collapses to None.
+    # A benchmark run has no unit-test `test_results` → the slim rows are None.
     assert run["results"] is None
     # Model row is slimmed to flat scalars; heavy nested fields are gone.
     assert run["model_results"] == [
@@ -384,8 +461,8 @@ def test_agent_runs_list_filters_and_pagination(client):
         status="in_progress",
         results={
             "model_results": [
-                {"model": "openai/gpt-4.1", "success": True, "passed": 2, "failed": 0},
-                {"model": "openai/gpt-4o", "success": True, "passed": 1, "failed": 1},
+                {"model": "openai/gpt-4.1", "success": True, "message": "ok", "passed": 2, "failed": 0},
+                {"model": "openai/gpt-4o", "success": True, "message": "ok", "passed": 1, "failed": 1},
             ]
         },
     )
@@ -1571,6 +1648,251 @@ def test_run_tests_batch_all_agents(client, monkeypatch):
     other_data = other_resp.json()
     assert other_data["runs"] == []
     assert other_data["skipped"] == []
+
+
+# ---------------------------------------------------------------------------
+# Run-list endpoints read slim DB summaries — heavy detail must never leak
+# ---------------------------------------------------------------------------
+
+
+_HEAVY_OUTPUT_MARK = "HEAVY-OUTPUT-SENTINEL-XZ1"
+_HEAVY_JUDGE_MARK = "HEAVY-JUDGE-SENTINEL-XZ2"
+_HEAVY_REASONING_MARK = "HEAVY-REASONING-SENTINEL-XZ3"
+_HEAVY_DETAILS_MARK = "HEAVY-DETAILS-SENTINEL-XZ4"
+_HEAVY_TESTCASE_MARK = "HEAVY-TESTCASE-SENTINEL-XZ5"
+_HEAVY_LEADERBOARD_MARK = "HEAVY-LEADERBOARD-SENTINEL-XZ6"
+
+_ALL_HEAVY_MARKS = (
+    _HEAVY_OUTPUT_MARK,
+    _HEAVY_JUDGE_MARK,
+    _HEAVY_REASONING_MARK,
+    _HEAVY_DETAILS_MARK,
+    _HEAVY_TESTCASE_MARK,
+    _HEAVY_LEADERBOARD_MARK,
+)
+
+
+def _seed_heavy_unit_run(agent_uuid):
+    """Seed a done unit-test run whose stored `results` + `details` are stuffed
+    with heavy per-case sub-trees and unique sentinel strings, so a leak of any
+    heavy field is detectable by scanning the serialized response."""
+    from db import create_agent_test_job, update_agent_test_job
+
+    job_id = create_agent_test_job(
+        agent_id=agent_uuid,
+        job_type="llm-unit-test",
+        details={"calibrate_config": {"note": _HEAVY_DETAILS_MARK}},
+    )
+    update_agent_test_job(
+        job_id,
+        status="done",
+        results={
+            "total_tests": 2,
+            "passed": 1,
+            "failed": 1,
+            "latency_ms": {"p50": 12.0, "p95": 12.0, "p99": 12.0, "count": 2},
+            "test_results": [
+                {
+                    "name": "case_named",
+                    "passed": True,
+                    "output": {"response": _HEAVY_OUTPUT_MARK, "tool_calls": None},
+                    "test_case": {"name": "case_named", "history": [_HEAVY_TESTCASE_MARK]},
+                    "reasoning": _HEAVY_REASONING_MARK,
+                    "judge_results": [
+                        {"evaluator_uuid": NONEXISTENT_UUID, "reasoning": _HEAVY_JUDGE_MARK}
+                    ],
+                },
+                {
+                    # No top-level name → the flat `name` falls back to test_case.name.
+                    "passed": False,
+                    "output": {"response": _HEAVY_OUTPUT_MARK, "tool_calls": None},
+                    "test_case": {"name": "case_from_test_case", "history": [_HEAVY_TESTCASE_MARK]},
+                    "reasoning": _HEAVY_REASONING_MARK,
+                    "judge_results": [
+                        {"evaluator_uuid": NONEXISTENT_UUID, "reasoning": _HEAVY_JUDGE_MARK}
+                    ],
+                },
+            ],
+        },
+    )
+    return job_id
+
+
+def _seed_heavy_benchmark_run(agent_uuid):
+    """Seed a done benchmark run with heavy nested per-model `test_results` +
+    leaderboard + a heavy `details` blob."""
+    from db import create_agent_test_job, update_agent_test_job
+
+    job_id = create_agent_test_job(
+        agent_id=agent_uuid,
+        job_type="llm-benchmark",
+        details={"calibrate_config": {"note": _HEAVY_DETAILS_MARK}},
+    )
+    update_agent_test_job(
+        job_id,
+        status="done",
+        results={
+            "leaderboard_summary": [{"model": "openai/gpt-4.1", "note": _HEAVY_LEADERBOARD_MARK}],
+            "model_results": [
+                {
+                    "model": "openai/gpt-4.1",
+                    "success": True,
+                    "message": "ok",
+                    "total_tests": 2,
+                    "passed": 1,
+                    "failed": 1,
+                    "test_results": [
+                        {
+                            "name": "case_named",
+                            "passed": True,
+                            "output": {"response": _HEAVY_OUTPUT_MARK},
+                            "test_case": {"name": "case_named", "history": [_HEAVY_TESTCASE_MARK]},
+                            "reasoning": _HEAVY_REASONING_MARK,
+                            "judge_results": [{"reasoning": _HEAVY_JUDGE_MARK}],
+                        }
+                    ],
+                    "evaluator_summary": [{"name": "correctness", "note": _HEAVY_LEADERBOARD_MARK}],
+                }
+            ],
+        },
+    )
+    return job_id
+
+
+def _assert_no_heavy_leak(run_item):
+    """No heavy sentinel appears anywhere in the serialized run-list item, and no
+    per-case/per-model object carries a heavy key."""
+    import json
+
+    blob = json.dumps(run_item)
+    for mark in _ALL_HEAVY_MARKS:
+        assert mark not in blob, f"heavy sentinel {mark} leaked into run-list item"
+    assert "details" not in run_item
+    for case in run_item.get("results") or []:
+        assert set(case) <= {"name", "passed"}
+        for heavy in ("output", "judge_results", "reasoning", "test_case"):
+            assert heavy not in case
+    for model in run_item.get("model_results") or []:
+        assert "test_results" not in model
+        assert "evaluator_summary" not in model
+    assert "leaderboard_summary" not in run_item
+
+
+def test_agent_runs_list_hides_heavy_detail_both_endpoints(client):
+    """Both run-list endpoints read the slim DB summary: the per-agent and global
+    lists surface aggregates + slim `{name, passed}` rows and slim model scalars,
+    but never the heavy per-case/per-model sub-trees or the `details` blob. The
+    `test_case.name` fallback surfaces a name for a case with no top-level name."""
+    h = _signup(client)["headers"]
+    agent_name = f"a-heavy-{uuid.uuid4().hex[:6]}"
+    agent = _create_agent(client, h, name=agent_name)
+
+    unit_id = _seed_heavy_unit_run(agent["uuid"])
+    bench_id = _seed_heavy_benchmark_run(agent["uuid"])
+
+    # Per-agent endpoint.
+    resp = client.get(f"/agent-tests/agent/{agent['uuid']}/runs", headers=h)
+    assert resp.status_code == 200
+    items = {r["uuid"]: r for r in resp.json()["items"]}
+    assert set(items) == {unit_id, bench_id}
+
+    unit = items[unit_id]
+    assert unit["type"] == "llm-unit-test"
+    assert unit["status"] == "done"
+    assert unit["name"] == "Run 1"
+    assert (unit["total_tests"], unit["passed"], unit["failed"]) == (2, 1, 1)
+    assert unit["latency_ms"] == {"p50": 12.0, "p95": 12.0, "p99": 12.0, "count": 2}
+    # Slim rows: name + passed only; the second case's name comes from test_case.name.
+    assert unit["results"] == [
+        {"name": "case_named", "passed": True},
+        {"name": "case_from_test_case", "passed": False},
+    ]
+    _assert_no_heavy_leak(unit)
+
+    bench = items[bench_id]
+    assert bench["type"] == "llm-benchmark"
+    assert bench["name"] == "Benchmark 1"
+    assert bench["model_results"] == [
+        {
+            "model": "openai/gpt-4.1",
+            "success": True,
+            "message": "ok",
+            "total_tests": 2,
+            "passed": 1,
+            "failed": 1,
+        }
+    ]
+    _assert_no_heavy_leak(bench)
+
+    # Global endpoint returns the same slim shape.
+    gresp = client.get("/agent-tests/runs", headers=h)
+    assert gresp.status_code == 200
+    gitems = {r["uuid"]: r for r in gresp.json()["items"]}
+    assert {unit_id, bench_id} <= set(gitems)
+    for jid in (unit_id, bench_id):
+        item = gitems[jid]
+        # Global items also carry agent_id/agent_name and stay heavy-free.
+        assert item["agent_id"] == agent["uuid"]
+        assert item["agent_name"] == agent_name
+        _assert_no_heavy_leak(item)
+    assert gitems[unit_id]["results"] == [
+        {"name": "case_named", "passed": True},
+        {"name": "case_from_test_case", "passed": False},
+    ]
+
+
+def test_agent_runs_list_filters_and_pagination_with_heavy_jobs(client):
+    """Filters (`type`/`status`/`has_failures`) and paging (`limit`/`offset`) work
+    over heavy-seeded jobs on both endpoints, still returning the slim envelope."""
+    from db import create_agent_test_job, update_agent_test_job
+
+    h = _signup(client)["headers"]
+    agent = _create_agent(client, h)
+    au = agent["uuid"]
+
+    unit_pass = create_agent_test_job(agent_id=au, job_type="llm-unit-test")
+    update_agent_test_job(
+        unit_pass, status="done", results={"total_tests": 1, "passed": 1, "failed": 0}
+    )
+    unit_id = _seed_heavy_unit_run(au)  # done, has failures
+    bench_prog = create_agent_test_job(agent_id=au, job_type="llm-benchmark")
+    update_agent_test_job(bench_prog, status="in_progress", results={"model_results": []})
+
+    def _agent(**params):
+        r = client.get(f"/agent-tests/agent/{au}/runs", params=params, headers=h)
+        assert r.status_code == 200
+        return r.json()
+
+    # type filter.
+    assert {x["uuid"] for x in _agent(type="llm-benchmark")["items"]} == {bench_prog}
+    # status filter.
+    assert {x["uuid"] for x in _agent(status="in_progress")["items"]} == {bench_prog}
+    assert {x["uuid"] for x in _agent(status="done")["items"]} == {unit_pass, unit_id}
+    # has_failures — only the heavy unit run has a failing case; the clean unit
+    # run and the empty in-progress benchmark are both failure-free.
+    assert {x["uuid"] for x in _agent(has_failures=True)["items"]} == {unit_id}
+    assert {x["uuid"] for x in _agent(has_failures=False)["items"]} == {
+        unit_pass,
+        bench_prog,
+    }
+    # Pagination: total is the pre-slice filtered count; page is sliced.
+    p1 = _agent(status="done", limit=1, offset=0)
+    p2 = _agent(status="done", limit=1, offset=1)
+    assert len(p1["items"]) == 1 and p1["total"] == 2
+    assert len(p2["items"]) == 1
+    assert p1["items"][0]["uuid"] != p2["items"][0]["uuid"]
+
+    # Global endpoint: same filters, scoped to this workspace's three jobs.
+    mine = {unit_pass, unit_id, bench_prog}
+
+    def _global(**params):
+        r = client.get("/agent-tests/runs", params=params, headers=h)
+        assert r.status_code == 200
+        return {x["uuid"] for x in r.json()["items"]} & mine
+
+    assert _global(type="llm-benchmark") == {bench_prog}
+    assert _global(status="done") == {unit_pass, unit_id}
+    assert _global(has_failures=True) == {unit_id}
 
 
 # ---------------------------------------------------------------------------

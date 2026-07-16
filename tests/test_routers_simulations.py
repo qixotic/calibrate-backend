@@ -473,6 +473,102 @@ def test_run_simulation_queued_path(client, monkeypatch):
     assert client.delete("/simulations/run/missing", headers=h).status_code == 404
 
 
+def _set_job_timestamps(job_uuid, created_at, updated_at):
+    import db
+
+    with db.get_db_connection() as conn:
+        conn.execute(
+            "UPDATE simulation_jobs SET created_at = ?, updated_at = ? WHERE uuid = ?",
+            (created_at, updated_at, job_uuid),
+        )
+        conn.commit()
+
+
+def test_simulation_runs_slim_ordering_and_naming(client):
+    """Runs list numbers by creation order (Run 1 = oldest) yet returns
+    most-recently-updated first, so the two orderings can diverge."""
+    import db
+
+    auth = _signup(client)
+    h = auth["headers"]
+    sim_uuid = client.post(
+        "/simulations", json={"name": f"sim-{uuid.uuid4().hex[:6]}"}, headers=h
+    ).json()["uuid"]
+
+    # Created oldest→newest: A, B, C. Updated so C is freshest, then A, then B.
+    job_a = db.create_simulation_job(sim_uuid, "text", status="done")
+    job_b = db.create_simulation_job(sim_uuid, "voice", status="failed")
+    job_c = db.create_simulation_job(sim_uuid, "text", status="in_progress")
+    _set_job_timestamps(job_a, "2024-01-01 00:00:00", "2024-01-02 00:00:00")
+    _set_job_timestamps(job_b, "2024-01-01 00:00:01", "2024-01-01 12:00:00")
+    _set_job_timestamps(job_c, "2024-01-01 00:00:02", "2024-01-03 00:00:00")
+
+    resp = client.get(f"/simulations/{sim_uuid}/runs", headers=h)
+    assert resp.status_code == 200
+    runs = resp.json()["runs"]
+    assert len(runs) == 3
+
+    by_uuid = {r["uuid"]: r for r in runs}
+    # Names follow creation order regardless of position in the list.
+    assert by_uuid[job_a]["name"] == "Run 1"
+    assert by_uuid[job_b]["name"] == "Run 2"
+    assert by_uuid[job_c]["name"] == "Run 3"
+
+    # List order is most-recently-updated first: C, A, B.
+    assert [r["uuid"] for r in runs] == [job_c, job_a, job_b]
+    assert [r["name"] for r in runs] == ["Run 3", "Run 1", "Run 2"]
+
+    assert by_uuid[job_a]["status"] == "done"
+    assert by_uuid[job_a]["type"] == "text"
+    assert by_uuid[job_b]["status"] == "failed"
+    assert by_uuid[job_b]["type"] == "voice"
+    assert by_uuid[job_c]["status"] == "in_progress"
+    assert by_uuid[job_c]["updated_at"] == "2024-01-03 00:00:00"
+
+    # Slim contract: exactly these keys, no heavy blobs.
+    for r in runs:
+        assert set(r.keys()) == {"uuid", "name", "status", "type", "updated_at"}
+        assert "results" not in r
+        assert "details" not in r
+
+
+def test_simulation_runs_does_not_ship_heavy_blobs(client):
+    """The slim summary path must never serialize a job's transcript results
+    or config details into the list response."""
+    import db
+
+    auth = _signup(client)
+    h = auth["headers"]
+    sim_uuid = client.post(
+        "/simulations", json={"name": f"sim-{uuid.uuid4().hex[:6]}"}, headers=h
+    ).json()["uuid"]
+
+    transcript_sentinel = "HEAVY_TRANSCRIPT_SENTINEL_" + uuid.uuid4().hex
+    config_sentinel = "HEAVY_CONFIG_SENTINEL_" + uuid.uuid4().hex
+    heavy_results = {
+        "conversation": [
+            {"role": "user", "content": transcript_sentinel} for _ in range(50)
+        ],
+        "judge_output": {"reasoning": transcript_sentinel},
+    }
+    heavy_details = {
+        "config": {"system_prompt": config_sentinel, "pid": 1234},
+        "blob": [config_sentinel] * 50,
+    }
+    for _ in range(3):
+        db.create_simulation_job(
+            sim_uuid, "text", status="done",
+            details=heavy_details, results=heavy_results,
+        )
+
+    resp = client.get(f"/simulations/{sim_uuid}/runs", headers=h)
+    assert resp.status_code == 200
+    body = resp.text
+    assert transcript_sentinel not in body
+    assert config_sentinel not in body
+    assert len(resp.json()["runs"]) == 3
+
+
 def test_run_simulation_voice_connection_blocked(client, monkeypatch):
     """An agent_url-mode (connection) agent cannot run voice sims."""
     auth = _signup(client)
