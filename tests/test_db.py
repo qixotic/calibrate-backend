@@ -2201,6 +2201,12 @@ def test_annotation_pipeline(user):
     assert db.get_annotations_for_org(
         user["org_uuid"], since="2000-01-01 00:00:00", until="2999-01-01 00:00:00"
     )
+    # Page-scoped bulk fetch matches the single-task fetch for this task.
+    tasks_anns = db.get_annotations_for_tasks([task_uuid])
+    assert tasks_anns
+    assert all(a["task_id"] == task_uuid for a in tasks_anns)
+    assert len(tasks_anns) == len(db.get_annotations_for_task(task_uuid))
+    assert db.get_annotations_for_tasks([]) == []
     overlap = db.get_annotations_for_annotator_overlap_slots(user["org_uuid"], restored)
     assert isinstance(overlap, list)
 
@@ -2221,7 +2227,14 @@ def test_annotation_pipeline(user):
     assert len(run_ids) == 1
     assert db.get_evaluator_runs_for_job(job_uuid)
     assert db.get_evaluator_runs_for_task(task_uuid)
-    assert db.get_evaluator_runs_for_org(user["org_uuid"])
+    org_runs = db.get_evaluator_runs_for_org(user["org_uuid"])
+    assert org_runs
+    assert all(r["task_id"] == task_uuid for r in org_runs)
+    tasks_runs = db.get_evaluator_runs_for_tasks([task_uuid])
+    assert tasks_runs
+    assert all(r["task_id"] == task_uuid for r in tasks_runs)
+    assert len(tasks_runs) == len(db.get_evaluator_runs_for_task(task_uuid))
+    assert db.get_evaluator_runs_for_tasks([]) == []
     assert db.get_evaluator_runs_for_evaluator_org_scoped(
         seeded["uuid"], user["org_uuid"]
     )

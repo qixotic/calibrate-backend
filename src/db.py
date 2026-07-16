@@ -8866,7 +8866,7 @@ def get_evaluator_runs_for_org(org_uuid: str) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT er.*
+            SELECT er.*, ai.task_id AS task_id
               FROM evaluator_runs er
               JOIN annotation_items ai ON ai.uuid = er.item_id
               JOIN annotation_tasks t ON t.uuid = ai.task_id
@@ -8877,6 +8877,32 @@ def get_evaluator_runs_for_org(org_uuid: str) -> List[Dict[str, Any]]:
              ORDER BY er.id ASC
             """,
             (org_uuid,),
+        )
+        return [_parse_evaluator_run_row(r) for r in cursor.fetchall()]
+
+
+def get_evaluator_runs_for_tasks(task_ids: List[str]) -> List[Dict[str, Any]]:
+    """All non-deleted evaluator_runs for any item in the given tasks, each row
+    carrying its `task_id` for bucketing. Batched form of
+    ``get_evaluator_runs_for_task`` for list endpoints that need runs across a
+    page of tasks without a per-task N+1; same filters, so per-task results are
+    identical."""
+    if not task_ids:
+        return []
+    placeholders = ",".join("?" for _ in task_ids)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT er.*, ai.task_id AS task_id
+              FROM evaluator_runs er
+              JOIN annotation_items ai ON ai.uuid = er.item_id
+             WHERE ai.task_id IN ({placeholders})
+               AND er.deleted_at IS NULL
+               AND ai.deleted_at IS NULL
+             ORDER BY er.id ASC
+            """,
+            tuple(task_ids),
         )
         return [_parse_evaluator_run_row(r) for r in cursor.fetchall()]
 
@@ -9305,6 +9331,34 @@ def get_annotations_for_org(
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(query, params)
+        return [_parse_annotation_row(r) for r in cursor.fetchall()]
+
+
+def get_annotations_for_tasks(task_ids: List[str]) -> List[Dict[str, Any]]:
+    """All annotations across NON-DELETED items in the given tasks, each row
+    carrying its `task_id`. Batched form of ``get_annotations_for_task`` for
+    list endpoints computing per-task agreement across a page without a
+    per-task N+1. Annotations on soft-deleted items or jobs are excluded, so
+    per-task results match ``get_annotations_for_task``'s default."""
+    if not task_ids:
+        return []
+    placeholders = ",".join("?" for _ in task_ids)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT a.*, j.annotator_id AS annotator_id, j.task_id AS task_id
+              FROM annotations a
+              JOIN annotation_jobs j ON j.uuid = a.job_id
+              JOIN annotation_items ai ON ai.uuid = a.item_id
+             WHERE j.task_id IN ({placeholders})
+               AND a.deleted_at IS NULL
+               AND j.deleted_at IS NULL
+               AND ai.deleted_at IS NULL
+             ORDER BY a.updated_at ASC
+            """,
+            tuple(task_ids),
+        )
         return [_parse_annotation_row(r) for r in cursor.fetchall()]
 
 

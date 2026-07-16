@@ -16,6 +16,7 @@ from annotation_metrics import (
     build_buckets,
     evaluator_human_pair_agreement,
     filter_runs_to_live_versions,
+    has_any_comparable_pair,
     per_item_agreement,
     trend_series,
     trend_series_evaluator_breakdown,
@@ -146,6 +147,49 @@ def test_aggregate_human_evaluator_agreement_empty():
     agree, pairs = aggregate_human_evaluator_agreement(annotations, runs, "e1")
     # Latest evaluator value is False; human said True → disagreement
     assert agree == 0.0 and pairs == 1
+
+
+def test_has_any_comparable_pair_human_human():
+    annotations = [
+        {"item_id": "i1", "evaluator_id": "e1", "annotator_id": "a", "value": {"value": True}},
+        {"item_id": "i1", "evaluator_id": "e1", "annotator_id": "b", "value": {"value": False}},
+    ]
+    assert has_any_comparable_pair(annotations, [], ["e1"]) is True
+
+
+def test_has_any_comparable_pair_human_evaluator():
+    annotations = [
+        {"item_id": "i1", "evaluator_id": "e1", "annotator_id": "a", "value": {"value": True}},
+    ]
+    runs = [
+        {"item_id": "i1", "evaluator_id": "e1", "value": {"value": True}, "created_at": "2024-01-01 00:00:00"},
+    ]
+    assert has_any_comparable_pair(annotations, runs, ["e1"]) is True
+
+
+def test_has_any_comparable_pair_none():
+    # Single annotation, no evaluator run → no pair
+    annotations = [
+        {"item_id": "i1", "evaluator_id": "e1", "annotator_id": "a", "value": {"value": True}},
+    ]
+    assert has_any_comparable_pair(annotations, [], ["e1"]) is False
+    # Empty inputs
+    assert has_any_comparable_pair([], [], []) is False
+    assert has_any_comparable_pair([], [], ["e1"]) is False
+
+
+def test_has_any_comparable_pair_accepts_iterables():
+    # Generators are consumed multiple times internally — must be materialized.
+    annotations = [
+        {"item_id": "i1", "evaluator_id": "e1", "annotator_id": "a", "value": {"value": True}},
+    ]
+    runs = [
+        {"item_id": "i1", "evaluator_id": "e1", "value": {"value": True}, "created_at": "2024-01-01 00:00:00"},
+    ]
+    ann_gen = (a for a in annotations)
+    run_gen = (r for r in runs)
+    ev_gen = (e for e in ["e1"])
+    assert has_any_comparable_pair(ann_gen, run_gen, ev_gen) is True
 
 
 def test_per_item_agreement_shape():

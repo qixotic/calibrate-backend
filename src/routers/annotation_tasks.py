@@ -56,6 +56,8 @@ from db import (
     get_evaluator_runs_for_job,
     get_evaluator_runs_for_item,
     get_evaluator_runs_for_task,
+    get_evaluator_runs_for_tasks,
+    get_annotations_for_tasks,
     clear_evaluator_runs_for_job,
 )
 from annotation_eval_runner import (
@@ -302,6 +304,7 @@ from annotation_metrics import (
     aggregate_human_evaluator_agreement,
     evaluator_human_pair_agreement,
     per_item_agreement,
+    has_any_comparable_pair,
     trend_series,
     trend_series_human_evaluator,
     filter_runs_to_live_versions,
@@ -313,6 +316,18 @@ from annotation_metrics import (
 
 def _live_version_map(evaluators: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
     return {e["uuid"]: e.get("live_version_id") for e in evaluators}
+
+
+def _runs_at_live_versions(
+    runs: List[Dict[str, Any]], evaluators: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Keep only runs at each linked evaluator's live version.
+
+    Single definition of the live-version filter shared by the `/agreement`
+    endpoint and the list endpoint's `has_agreement` flag, so the two can't
+    drift on what counts as agreement.
+    """
+    return filter_runs_to_live_versions(runs, _live_version_map(evaluators))
 
 
 # Re-exported for tests; canonical home is llm_judge so agent-tests/STT/TTS can
@@ -390,6 +405,10 @@ class AnnotationTaskResponse(BaseModel):
     )
     item_count: Optional[int] = Field(
         None, description="Number of items in the task"
+    )
+    has_agreement: bool = Field(
+        default=False,
+        description="Whether the task has at least one comparable human-vs-human or human-vs-evaluator pair, computed over all time",
     )
     # Inlined on the single-task fetch only; the list endpoint leaves these
     # empty (use the dedicated /items and /jobs endpoints for those views).
@@ -504,11 +523,25 @@ async def list_annotation_tasks(
     # Fetch all linked evaluators for the PAGE in ONE query, then bucket by task
     # uuid — avoids a per-task N+1 (mirrors the pre-fetch/bucket pattern used in
     # `get_annotation_task_endpoint`), and only over the rows actually returned.
-    evaluators_by_task = get_evaluators_for_annotation_tasks(
-        [task["uuid"] for task in page]
-    )
+    page_task_ids = [task["uuid"] for task in page]
+    evaluators_by_task = get_evaluators_for_annotation_tasks(page_task_ids)
+    # All-time `has_agreement` flag, computed for the page in two reads scoped
+    # to the page's tasks (no per-task N+1, no whole-org scan).
+    annotations_by_task: Dict[str, List[Dict[str, Any]]] = {}
+    for ann in get_annotations_for_tasks(page_task_ids):
+        annotations_by_task.setdefault(ann.get("task_id"), []).append(ann)
+    runs_by_task: Dict[str, List[Dict[str, Any]]] = {}
+    for run in get_evaluator_runs_for_tasks(page_task_ids):
+        runs_by_task.setdefault(run.get("task_id"), []).append(run)
     for task in page:
-        task["evaluators"] = evaluators_by_task.get(task["uuid"], [])
+        linked = evaluators_by_task.get(task["uuid"], [])
+        task["evaluators"] = linked
+        runs = _runs_at_live_versions(runs_by_task.get(task["uuid"], []), linked)
+        task["has_agreement"] = has_any_comparable_pair(
+            annotations_by_task.get(task["uuid"], []),
+            runs,
+            [e["uuid"] for e in linked],
+        )
     return page_envelope(page, total, pagination)
 
 
@@ -549,6 +582,13 @@ async def get_annotation_task_endpoint(
             runs_by_item.get(item["uuid"], []),
             evaluator_ids,
         )
+    # Same all-time flag the list endpoint sets, so the detail view agrees.
+    # Aggregated agreement filters runs to each evaluator's live version.
+    task["has_agreement"] = has_any_comparable_pair(
+        all_annotations,
+        _runs_at_live_versions(all_runs, evaluators),
+        evaluator_ids,
+    )
     # TTS items store audio as an S3 key; sign it so the Items tab can play it.
     presign_annotation_items_audio(items, task.get("type"))
     task["items"] = items
@@ -2535,9 +2575,7 @@ async def task_agreement(
     _ensure_owned_task(task_uuid, ctx.org_uuid)
     annotations = get_annotations_for_task(task_uuid)
     linked = get_evaluators_for_annotation_task(task_uuid)
-    runs = filter_runs_to_live_versions(
-        get_evaluator_runs_for_task(task_uuid), _live_version_map(linked)
-    )
+    runs = _runs_at_live_versions(get_evaluator_runs_for_task(task_uuid), linked)
 
     hh_current, hh_pairs = aggregate_agreement(annotations)
     hh_series = trend_series(annotations, bucket=bucket, days=days)

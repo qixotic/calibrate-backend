@@ -332,6 +332,26 @@ def aggregate_human_evaluator_agreement(
     return (_round_agreement(total_weighted / total_pairs), total_pairs)
 
 
+def has_any_comparable_pair(
+    annotations: Iterable[Dict[str, Any]],
+    evaluator_runs: Iterable[Dict[str, Any]],
+    evaluator_ids: Iterable[str],
+) -> bool:
+    """True if any agreement pair exists: a shared slot with ≥2 human
+    annotators (human-vs-human), or a slot where a human and one of the given
+    evaluators both judged (human-vs-evaluator). False otherwise."""
+    annotations_list = list(annotations)
+    runs_list = list(evaluator_runs)
+    if aggregate_agreement(annotations_list)[1] > 0:
+        return True
+    for ev_id in evaluator_ids:
+        if aggregate_human_evaluator_agreement(
+            annotations_list, runs_list, ev_id
+        )[1] > 0:
+            return True
+    return False
+
+
 def per_item_agreement(
     annotations_for_item: Iterable[Dict[str, Any]],
     evaluator_runs_for_item: Iterable[Dict[str, Any]],
