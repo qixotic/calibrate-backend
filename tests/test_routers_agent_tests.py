@@ -592,6 +592,7 @@ def _seed_run_job(client, h, agent):
         agent_id=agent["uuid"],
         job_type="llm-unit-test",
         details={
+            "test_uuids": ["tc_pass", "tc_fail", "tc_pending"],
             "evaluators_by_test_id": {
                 "tc_pass": [
                     {
@@ -665,6 +666,7 @@ def test_run_detail_default_is_full(client):
     resp = client.get(f"/agent-tests/run/{job_id}", headers=h)
     assert resp.status_code == 200
     body = resp.json()
+    assert body["test_uuids"] == ["tc_pass", "tc_fail", "tc_pending"]
     assert len(body["results"]) == 3
     case = body["results"][0]
     assert case["output"] is not None
@@ -727,6 +729,7 @@ def _seed_benchmark_job(client, h, agent):
         agent_id=agent["uuid"],
         job_type="llm-benchmark",
         details={
+            "test_uuids": ["tc_pass", "tc_fail", "tc_pending"],
             "evaluators_by_test_id": {
                 "tc_pass": [
                     {
@@ -791,6 +794,7 @@ def test_benchmark_detail_default_is_full(client):
     resp = client.get(f"/agent-tests/benchmark/{job_id}", headers=h)
     assert resp.status_code == 200
     body = resp.json()
+    assert body["test_uuids"] == ["tc_pass", "tc_fail", "tc_pending"]
     model = body["model_results"][0]
     assert len(model["test_results"]) == 3
     assert body["evaluators"][0]["output_config"] is not None

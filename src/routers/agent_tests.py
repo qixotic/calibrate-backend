@@ -453,6 +453,10 @@ class TestRunStatusResponse(BaseModel):
         examples=[_EXAMPLE_TASK_UUID],
     )
     status: TaskStatus = Field(description=_TASK_STATUS_DESCRIPTION)
+    test_uuids: Optional[List[str]] = Field(
+        None,
+        description="IDs of the tests this run executed, in run order",
+    )
     total_tests: Optional[int] = Field(
         None, description="Total number of test cases"
     )
@@ -2610,6 +2614,7 @@ async def get_agent_test_run_status(
     response = TestRunStatusResponse(
         task_id=task_id,
         status=status,
+        test_uuids=details.get("test_uuids") or None,
         total_tests=results.get("total_tests"),
         passed=results.get("passed"),
         failed=results.get("failed"),
@@ -2697,6 +2702,10 @@ class BenchmarkStatusResponse(BaseModel):
         examples=[_EXAMPLE_TASK_UUID],
     )
     status: TaskStatus = Field(description=_TASK_STATUS_DESCRIPTION)
+    test_uuids: Optional[List[str]] = Field(
+        None,
+        description="IDs of the tests this benchmark executed, in run order",
+    )
     evaluators: Optional[List[TestRunEvaluator]] = Field(
         None,
         description="The evaluators used in this run. Each verdict in `judge_results` links to one of these by `evaluator_uuid`",
@@ -3443,6 +3452,7 @@ async def get_benchmark_status(
     response = BenchmarkStatusResponse(
         task_id=task_id,
         status=status,
+        test_uuids=details.get("test_uuids") or None,
         evaluators=evaluators_block or None,
         model_results=results.get("model_results"),
         leaderboard_summary=results.get("leaderboard_summary"),
