@@ -26,6 +26,7 @@ os.environ.setdefault("S3_OUTPUT_BUCKET", "test-bucket")
 os.environ.setdefault("MAX_CONCURRENT_JOBS", "1")
 os.environ.setdefault("MAX_CONCURRENT_JOBS_PER_ORG", "1")
 os.environ.setdefault("DEFAULT_MAX_ROWS_PER_EVAL", "20")
+os.environ.setdefault("DEFAULT_MAX_TRACES", "50000")
 os.environ.setdefault("SUPERADMIN_EMAIL", "admin@example.com")
 # Pin docs creds so a developer's local src/.env (which overrides via load_dotenv)
 # doesn't change the basic-auth check that test_docs_endpoints_require_basic_auth

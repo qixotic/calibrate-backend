@@ -1938,6 +1938,62 @@ def test_org_limits_router(client, monkeypatch):
     assert client.delete(f"/org-limits/{user_org_uuid}", headers=h).status_code == 404
 
 
+def test_org_limits_max_traces(client, monkeypatch):
+    import auth_utils
+    import db as db_mod
+    from routers import org_limits as org_limits_mod
+
+    auth = _auth(client)
+    h = auth["headers"]
+    user_org_uuid = db_mod.get_personal_org_for_user(auth["user_uuid"])["uuid"]
+
+    # No org_limits row: the env-default fallback applies.
+    default = client.get("/org-limits/me/max-traces", headers=h)
+    assert default.status_code == 200
+    assert default.json() == {"max_traces": org_limits_mod.DEFAULT_MAX_TRACES}
+
+    monkeypatch.setattr(auth_utils, "SUPERADMIN_EMAIL", auth["email"])
+
+    # A limits row without max_traces still falls back to the default.
+    create = client.post(
+        "/org-limits",
+        json={"org_uuid": user_org_uuid, "limits": {"max_rows_per_eval": 50}},
+        headers=h,
+    )
+    assert create.status_code == 200
+    still_default = client.get("/org-limits/me/max-traces", headers=h)
+    assert still_default.json() == {"max_traces": org_limits_mod.DEFAULT_MAX_TRACES}
+
+    # Setting max_traces takes effect for the workspace.
+    upd = client.put(
+        f"/org-limits/{user_org_uuid}",
+        json={"limits": {"max_rows_per_eval": 50, "max_traces": 123}},
+        headers=h,
+    )
+    assert upd.status_code == 200
+    assert upd.json()["limits"]["max_traces"] == 123
+    assert client.get("/org-limits/me/max-traces", headers=h).json() == {
+        "max_traces": 123
+    }
+    assert org_limits_mod.get_max_traces_for_org(user_org_uuid) == 123
+
+    # max_traces has its own bounds (gt=0, le=1_000_000) — values above
+    # max_rows_per_eval's le=10000 cap must be accepted.
+    ok_large = client.put(
+        f"/org-limits/{user_org_uuid}",
+        json={"limits": {"max_rows_per_eval": 50, "max_traces": 500_000}},
+        headers=h,
+    )
+    assert ok_large.status_code == 200
+    for bad_value in (0, 1_000_001):
+        bad = client.put(
+            f"/org-limits/{user_org_uuid}",
+            json={"limits": {"max_rows_per_eval": 50, "max_traces": bad_value}},
+            headers=h,
+        )
+        assert bad.status_code == 422
+
+
 def test_org_limits_get_superadmin_bypasses_membership(client, monkeypatch):
     """GET /org-limits/{org_uuid} allows superadmin even when they're not a
     member of the target org."""

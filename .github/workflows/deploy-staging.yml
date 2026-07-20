@@ -137,6 +137,7 @@ jobs:
             export MAX_CONCURRENT_JOBS="${{ secrets.MAX_CONCURRENT_JOBS }}"
             export MAX_CONCURRENT_JOBS_PER_ORG="${{ secrets.MAX_CONCURRENT_JOBS_PER_ORG }}"
             export DEFAULT_MAX_ROWS_PER_EVAL="${{ secrets.DEFAULT_MAX_ROWS_PER_EVAL }}"
+            export DEFAULT_MAX_TRACES="${{ secrets.DEFAULT_MAX_TRACES }}"
             export CALIBRATE_TEST_PARALLEL="${{ secrets.CALIBRATE_TEST_PARALLEL }}"
             export CALIBRATE_SIMULATION_PARALLEL="${{ secrets.CALIBRATE_SIMULATION_PARALLEL }}"
             export SUPERADMIN_EMAIL="${{ secrets.SUPERADMIN_EMAIL }}"
