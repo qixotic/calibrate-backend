@@ -29,6 +29,13 @@ MAX_METADATA_ENTRIES = 100
 
 _EXAMPLE_TRACE_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
+_TRACE_UUID_DESCRIPTION = "Unique ID for the trace"
+
+_Q_DESCRIPTION = (
+    "Case-insensitive substring search on `message_id`, `conversation_id`, "
+    "and message content"
+)
+
 
 class TraceTurn(BaseModel):
     # Extra keys (OpenAI `tool_calls`, `tool_call_id`, `name`, ...) are stored
@@ -126,7 +133,7 @@ class TraceIngestResponse(BaseModel):
     uuid: str = Field(
         min_length=36,
         max_length=36,
-        description="Unique ID for the stored trace",
+        description=_TRACE_UUID_DESCRIPTION,
         examples=[_EXAMPLE_TRACE_UUID],
     )
     message_id: str = Field(description="Your ID for the trace's last user message")
@@ -143,7 +150,7 @@ class TraceSummary(BaseModel):
     uuid: str = Field(
         min_length=36,
         max_length=36,
-        description="Unique ID for the trace",
+        description=_TRACE_UUID_DESCRIPTION,
         examples=[_EXAMPLE_TRACE_UUID],
     )
     message_id: str = Field(description="Your ID for the trace's last user message")
@@ -172,7 +179,7 @@ class TraceResponse(BaseModel):
     uuid: str = Field(
         min_length=36,
         max_length=36,
-        description="Unique ID for the trace",
+        description=_TRACE_UUID_DESCRIPTION,
         examples=[_EXAMPLE_TRACE_UUID],
     )
     message_id: str = Field(description="Your ID for the trace's last user message")
@@ -203,7 +210,7 @@ class BulkDeleteTracesRequest(BaseModel):
     )
     q: Optional[str] = Field(
         None,
-        description="Case-insensitive substring filter on message IDs, conversation IDs, and message content, applied when `select_all` is true",
+        description=_Q_DESCRIPTION + ". Applied when `select_all` is true",
     )
     conversation_id: Optional[str] = Field(
         None,
@@ -214,11 +221,6 @@ class BulkDeleteTracesRequest(BaseModel):
 class BulkDeleteTracesResponse(BaseModel):
     deleted: int = Field(description="Number of traces deleted")
 
-
-_QUERY_Q_DESCRIPTION = (
-    "Case-insensitive substring search on `message_id`, `conversation_id`, "
-    "and message content. Blank is a no-op"
-)
 
 _PREVIEW_CHARS = 160
 
@@ -264,7 +266,7 @@ def _ingest_response(row: Dict[str, Any], created: bool) -> Dict[str, Any]:
     }
 
 
-@router.post("", response_model=TraceIngestResponse, summary="Ingest trace")
+@router.post("", response_model=TraceIngestResponse, summary="Create trace")
 async def ingest_trace(
     payload: TraceIngest, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
 ):
@@ -307,7 +309,7 @@ async def ingest_trace(
 async def list_traces_endpoint(
     ctx: OrgContext = Depends(get_current_org),
     pagination: PaginationParams = Depends(),
-    q: Optional[str] = Query(None, description=_QUERY_Q_DESCRIPTION),
+    q: Optional[str] = Query(None, description=_Q_DESCRIPTION + ". Blank is a no-op"),
     conversation_id: Optional[str] = Query(
         None, description="Return only traces from this conversation"
     ),
