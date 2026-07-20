@@ -114,6 +114,7 @@ jobs:
             export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
             export AWS_REGION="${{ secrets.AWS_REGION }}"
             export DB_ROOT_DIR="${{ secrets.DB_ROOT_DIR }}"
+            export TRACES_DATABASE_URL="${{ secrets.TRACES_DATABASE_URL }}"
             export APP_FOLDER_PATH="${{ secrets.APP_FOLDER_PATH }}"
             export DEFAULT_USER_EMAIL="${{ secrets.DEFAULT_USER_EMAIL }}"
             export DEFAULT_USER_FIRST_NAME="${{ secrets.DEFAULT_USER_FIRST_NAME }}"

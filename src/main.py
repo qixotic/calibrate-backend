@@ -35,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from db import init_db, NameAlreadyExistsError
 from auth_utils import get_current_user_id
+from traces.migrate import run_traces_migrations
 from routers.auth import router as auth_router
 from routers.agents import router as agents_router
 from routers.tools import router as tools_router
@@ -80,6 +81,7 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
     # Startup: Initialize database and recover in_progress jobs
     init_db()
+    run_traces_migrations()
     logger.info("Checking for in_progress jobs to recover...")
     recover_pending_jobs()
     provider_status_task = asyncio.create_task(provider_status_monitor.refresh_loop())
