@@ -187,3 +187,170 @@ def test_ingest_cap_returns_429_but_keeps_retries_idempotent(client, monkeypatch
     retry = client.post("/traces", json=_payload(first_mid), headers=h)
     assert retry.status_code == 200
     assert retry.json()["created"] is False
+
+
+# ---------------------------------------------------------------------------
+# List / detail / bulk delete (curation surface, JWT-only)
+# ---------------------------------------------------------------------------
+
+
+def test_curation_endpoints_are_jwt_only(client):
+    h = _signup(client)
+    key_headers = _api_key_headers(client, h)
+
+    assert client.get("/traces").status_code in (401, 403)
+    assert client.get("/traces", headers=key_headers).status_code in (401, 403)
+    assert (
+        client.post(
+            "/traces/bulk-delete", json={"select_all": True}, headers=key_headers
+        ).status_code
+        in (401, 403)
+    )
+
+
+def test_list_and_detail_roundtrip(client):
+    h = _signup(client)
+
+    mid_a = _mid()
+    client.post(
+        "/traces", json=_payload(mid_a, conversation_id="conv-a"), headers=h
+    )
+    mid_b = _mid()
+    openai_extras = [
+        {"role": "user", "content": "check the POLIO schedule"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_schedule", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "content": "{\"weeks\": 14}", "tool_call_id": "call_1"},
+        {"role": "user", "content": "and in months?"},
+    ]
+    created_b = client.post(
+        "/traces",
+        json=_payload(mid_b, conversation_id="conv-b", input=openai_extras),
+        headers=h,
+    ).json()
+
+    listed = client.get("/traces", headers=h)
+    assert listed.status_code == 200
+    body = listed.json()
+    assert set(body) == {"items", "total", "limit", "offset"}
+    assert body["total"] == 2 and body["limit"] == 50 and body["offset"] == 0
+    # Newest first.
+    assert [item["message_id"] for item in body["items"]] == [mid_b, mid_a]
+    summary_b = body["items"][0]
+    assert summary_b["turn_count"] == 4
+    assert summary_b["tool_call_count"] == 1
+    assert summary_b["metadata_count"] == 1
+    assert summary_b["input_preview"] == "and in months?"
+    assert summary_b["response_preview"].startswith("Aapki beti")
+
+    detail = client.get(f"/traces/{created_b['uuid']}", headers=h)
+    assert detail.status_code == 200
+    full = detail.json()
+    assert full["conversation_id"] == "conv-b"
+    # OpenAI-format extras on history turns survive storage verbatim.
+    assert full["input"][1]["tool_calls"][0]["function"]["name"] == "get_schedule"
+    assert full["input"][2]["tool_call_id"] == "call_1"
+    assert full["output"]["tool_calls"][0] == {
+        "tool": "get_schedule",
+        "arguments": {"child_age_weeks": 14},
+    }
+    assert full["metadata"] == [{"key": "gen_ai.request.model", "value": "gpt-4"}]
+
+    assert (
+        client.get(
+            "/traces/00000000-0000-4000-8000-000000000001", headers=h
+        ).status_code
+        == 404
+    )
+    # Another workspace can't read this trace.
+    other = _signup(client)
+    assert (
+        client.get(f"/traces/{created_b['uuid']}", headers=other).status_code == 404
+    )
+
+
+def test_list_search_filter_and_pagination(client):
+    h = _signup(client)
+    mid_polio = _mid()
+    client.post(
+        "/traces",
+        json=_payload(
+            mid_polio,
+            conversation_id="conv-x",
+            input=[{"role": "user", "content": "Tell me about POLIO boosters"}],
+        ),
+        headers=h,
+    )
+    client.post(
+        "/traces", json=_payload(_mid(), conversation_id="conv-y"), headers=h
+    )
+    client.post(
+        "/traces", json=_payload(_mid(), conversation_id="conv-y"), headers=h
+    )
+
+    hits = client.get("/traces", params={"q": "polio"}, headers=h).json()
+    assert hits["total"] == 1
+    assert hits["items"][0]["message_id"] == mid_polio
+
+    conv = client.get(
+        "/traces", params={"conversation_id": "conv-y"}, headers=h
+    ).json()
+    assert conv["total"] == 2
+
+    page = client.get(
+        "/traces", params={"limit": 1, "offset": 1}, headers=h
+    ).json()
+    assert page["total"] == 3
+    assert len(page["items"]) == 1
+    assert page["limit"] == 1 and page["offset"] == 1
+
+
+def test_bulk_delete_router_contract(client):
+    h = _signup(client)
+    mid_keep = _mid()
+    kept = client.post(
+        "/traces", json=_payload(mid_keep, conversation_id="conv-keep"), headers=h
+    ).json()
+    mid_gone = _mid()
+    client.post(
+        "/traces", json=_payload(mid_gone, conversation_id="conv-gone"), headers=h
+    )
+    client.post(
+        "/traces", json=_payload(_mid(), conversation_id="conv-gone"), headers=h
+    )
+
+    # Neither ids nor select_all is a 400.
+    assert (
+        client.post("/traces/bulk-delete", json={}, headers=h).status_code == 400
+    )
+
+    # select_all with a conversation filter deletes exactly that set.
+    filtered = client.post(
+        "/traces/bulk-delete",
+        json={"select_all": True, "conversation_id": "conv-gone"},
+        headers=h,
+    )
+    assert filtered.status_code == 200
+    assert filtered.json() == {"deleted": 2}
+    assert client.get("/traces", headers=h).json()["total"] == 1
+
+    # Deleting frees the message_id: the same ID re-ingests as a new trace.
+    by_ids = client.post(
+        "/traces/bulk-delete", json={"trace_ids": [kept["uuid"]]}, headers=h
+    )
+    assert by_ids.status_code == 200 and by_ids.json() == {"deleted": 1}
+    assert client.get(f"/traces/{kept['uuid']}", headers=h).status_code == 404
+
+    reingested = client.post("/traces", json=_payload(mid_keep), headers=h)
+    assert reingested.status_code == 200
+    assert reingested.json()["created"] is True
+    assert reingested.json()["uuid"] != kept["uuid"]
