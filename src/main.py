@@ -57,6 +57,7 @@ from routers.annotators import router as annotators_router
 from routers.annotation_agreement import router as annotation_agreement_router
 from routers.organizations import router as organizations_router
 from routers.api_keys import router as api_keys_router
+from routers.traces import router as traces_router
 from utils import (
     LOCAL_ARTIFACTS_URL_PREFIX,
     generate_presigned_upload_url,
@@ -431,6 +432,7 @@ app.include_router(annotators_router)
 app.include_router(annotation_agreement_router)
 app.include_router(organizations_router)
 app.include_router(api_keys_router)
+app.include_router(traces_router)
 # Public (no-auth) sharing endpoints — must be registered without any auth dependency
 app.include_router(public_router)
 
