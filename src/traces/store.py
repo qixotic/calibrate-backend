@@ -156,6 +156,42 @@ def list_traces(
         return [_to_dict(r) for r in rows], total
 
 
+def select_traces(
+    org_uuid: str,
+    *,
+    trace_ids: Optional[List[str]] = None,
+    select_all: bool = False,
+    q: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Return the full trace dicts a bulk action targets (same selection contract
+    as `soft_delete_traces`), for callers that need the bodies rather than just a
+    delete count (e.g. converting traces to tests).
+
+    `select_all=True` returns every live trace matching `q`/`conversation_id`
+    newest-first (pass `limit` to bound a large match); otherwise the given
+    `trace_ids` in request order (missing/foreign ids skipped).
+    """
+    with traces_session() as s:
+        if select_all:
+            stmt = (
+                select(Trace)
+                .where(*_filters(org_uuid, q, conversation_id))
+                .order_by(Trace.created_at.desc(), Trace.id.desc())
+            )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            return [_to_dict(r) for r in s.scalars(stmt).all()]
+        if not trace_ids:
+            return []
+        rows = s.scalars(
+            select(Trace).where(*_live(org_uuid), Trace.uuid.in_(trace_ids))
+        ).all()
+        by_uuid = {r.uuid: r for r in rows}
+        return [_to_dict(by_uuid[tid]) for tid in trace_ids if tid in by_uuid]
+
+
 def soft_delete_traces(
     org_uuid: str,
     *,

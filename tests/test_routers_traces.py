@@ -354,3 +354,217 @@ def test_bulk_delete_router_contract(client):
     assert reingested.status_code == 200
     assert reingested.json()["created"] is True
     assert reingested.json()["uuid"] != kept["uuid"]
+
+
+# ---------------------------------------------------------------------------
+# Convert traces -> tests (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _create_llm_evaluator(client, h):
+    """Create an llm evaluator (36-char uuid); returns its uuid."""
+    created = client.post(
+        "/evaluators",
+        json={
+            "name": f"ev-{uuid.uuid4()}",
+            "description": "d",
+            "evaluator_type": "llm",
+            "data_type": "text",
+            "kind": "single",
+            "output_type": "binary",
+            "version": {
+                "judge_model": "openai/gpt-4",
+                "system_prompt": "Judge {{criteria}}",
+                "variables": [{"name": "criteria"}],
+            },
+        },
+        headers=h,
+    )
+    assert created.status_code == 200, created.text
+    return created.json()["uuid"]
+
+
+def _create_agent(client, h):
+    return client.post(
+        "/agents",
+        json={"name": f"a-{uuid.uuid4().hex[:6]}", "type": "agent"},
+        headers=h,
+    ).json()
+
+
+def test_convert_requires_scope(client):
+    h = _signup(client)
+    res = client.post("/traces/convert-to-tests", json={"type": "response"}, headers=h)
+    assert res.status_code == 400
+
+
+def test_convert_is_jwt_only(client):
+    h = _signup(client)
+    key_headers = _api_key_headers(client, h)
+    res = client.post(
+        "/traces/convert-to-tests",
+        json={"trace_ids": ["x"], "type": "response"},
+        headers=key_headers,
+    )
+    assert res.status_code in (401, 403)
+
+
+def test_convert_response_requires_evaluator(client):
+    h = _signup(client)
+    mid = _mid()
+    trace = client.post("/traces", json=_payload(mid), headers=h).json()
+    res = client.post(
+        "/traces/convert-to-tests",
+        json={"trace_ids": [trace["uuid"]], "type": "response"},
+        headers=h,
+    )
+    assert res.status_code == 400
+
+
+def test_convert_response_creates_tests_links_evaluator_and_agent(client):
+    h = _signup(client)
+    ev_uuid = _create_llm_evaluator(client, h)
+    agent = _create_agent(client, h)
+
+    mid = _mid()
+    trace = client.post("/traces", json=_payload(mid), headers=h).json()
+
+    res = client.post(
+        "/traces/convert-to-tests",
+        json={
+            "trace_ids": [trace["uuid"]],
+            "type": "response",
+            "evaluators": [
+                {"evaluator_uuid": ev_uuid, "variable_values": {"criteria": "be nice"}}
+            ],
+            "agent_uuids": [agent["uuid"]],
+        },
+        headers=h,
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["created"] == 1
+    test_uuid = body["test_uuids"][0]
+
+    # The created test: type response, history copied verbatim from trace input,
+    # output discarded (no tool_calls in evaluation), evaluator linked.
+    detail = client.get(f"/tests/{test_uuid}", headers=h).json()
+    assert detail["type"] == "response"
+    assert detail["name"] == mid
+    assert detail["config"]["history"] == _payload(mid)["input"]
+    assert detail["config"]["evaluation"] == {"type": "response"}
+    assert [e["uuid"] for e in detail["evaluators"]] == [ev_uuid]
+
+    # Linked to the agent.
+    linked = client.get(f"/agent-tests/agent/{agent['uuid']}/tests", headers=h).json()
+    linked_uuids = [t["uuid"] for t in linked["items"]]
+    assert test_uuid in linked_uuids
+
+
+def test_convert_tool_call_copies_recorded_calls(client):
+    h = _signup(client)
+    mid = _mid()
+    trace = client.post("/traces", json=_payload(mid), headers=h).json()
+
+    res = client.post(
+        "/traces/convert-to-tests",
+        json={
+            "trace_ids": [trace["uuid"]],
+            "type": "tool_call",
+            "accept_any_arguments": False,
+        },
+        headers=h,
+    )
+    assert res.status_code == 200, res.text
+    test_uuid = res.json()["test_uuids"][0]
+
+    detail = client.get(f"/tests/{test_uuid}", headers=h).json()
+    assert detail["type"] == "tool_call"
+    tool_calls = detail["config"]["evaluation"]["tool_calls"]
+    # The recorded {tool, arguments} become the expected assertion; the raw
+    # argument values pass straight through (legacy exact match).
+    assert tool_calls == [
+        {
+            "tool": "get_schedule",
+            "arguments": {"child_age_weeks": 14},
+            "accept_any_arguments": False,
+        }
+    ]
+
+
+def test_convert_tool_call_rejects_traces_without_tool_calls(client):
+    h = _signup(client)
+    mid = _mid()
+    # Response-only trace: no tool_calls to assert.
+    trace = client.post(
+        "/traces",
+        json=_payload(mid, output={"response": "just text", "tool_calls": None}),
+        headers=h,
+    ).json()
+    res = client.post(
+        "/traces/convert-to-tests",
+        json={"trace_ids": [trace["uuid"]], "type": "tool_call"},
+        headers=h,
+    )
+    assert res.status_code == 400
+    assert mid in res.json()["detail"]["message_ids"]
+
+
+def test_convert_select_all_with_conversation_filter(client):
+    h = _signup(client)
+    ev_uuid = _create_llm_evaluator(client, h)
+    conv = f"cc-{uuid.uuid4().hex[:8]}"
+    client.post("/traces", json=_payload(_mid(), conversation_id=conv), headers=h)
+    client.post("/traces", json=_payload(_mid(), conversation_id=conv), headers=h)
+    client.post("/traces", json=_payload(_mid(), conversation_id="other"), headers=h)
+
+    res = client.post(
+        "/traces/convert-to-tests",
+        json={
+            "select_all": True,
+            "conversation_id": conv,
+            "type": "response",
+            "evaluators": [{"evaluator_uuid": ev_uuid}],
+        },
+        headers=h,
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["created"] == 2
+
+
+def test_convert_dedupes_names_on_repeat(client):
+    h = _signup(client)
+    ev_uuid = _create_llm_evaluator(client, h)
+    mid = _mid()
+    trace = client.post("/traces", json=_payload(mid), headers=h).json()
+    body = {
+        "trace_ids": [trace["uuid"]],
+        "type": "response",
+        "evaluators": [{"evaluator_uuid": ev_uuid}],
+    }
+    first = client.post("/traces/convert-to-tests", json=body, headers=h)
+    second = client.post("/traces/convert-to-tests", json=body, headers=h)
+    assert first.status_code == 200 and second.status_code == 200
+
+    first_detail = client.get(f"/tests/{first.json()['test_uuids'][0]}", headers=h).json()
+    second_detail = client.get(
+        f"/tests/{second.json()['test_uuids'][0]}", headers=h
+    ).json()
+    assert first_detail["name"] == mid
+    # Re-converting the same trace does not 400 on the name clash; it suffixes.
+    assert second_detail["name"] == f"{mid} (2)"
+
+
+def test_convert_no_matching_traces_404(client):
+    h = _signup(client)
+    ev_uuid = _create_llm_evaluator(client, h)
+    res = client.post(
+        "/traces/convert-to-tests",
+        json={
+            "trace_ids": ["00000000-0000-4000-8000-000000000009"],
+            "type": "response",
+            "evaluators": [{"evaluator_uuid": ev_uuid}],
+        },
+        headers=h,
+    )
+    assert res.status_code == 404

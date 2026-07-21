@@ -236,6 +236,18 @@ Production traces are the platform's one **machine-paced** write path (customer 
 - **Contract mirrors test creation** (see `routers/traces.py`): `input` is `tests.config.history` verbatim, and `output.tool_calls` uses the flat `{tool, arguments}` expected-tool-call shape (not OpenAI's nested `function` form) so curated traces can later convert to `response`/`tool_call` tests without transformation.
 - **Cap**: `POST /traces` rejects new rows with **429** (body carries current count, cap, remediation) once the org's live count reaches `max_traces` (`org_limits`, `DEFAULT_MAX_TRACES` fallback, member-readable via `GET /org-limits/me/max-traces`). The idempotency lookup runs **before** the cap check so production retries never 429 at the limit. Cross-database note: the cap reads limits from `pense.db` and counts in the traces store — not transactional, by design (the cap is a guardrail, not an invariant).
 
+### Convert traces to tests
+
+`POST /traces/convert-to-tests` (JWT only, `routers/traces.py`) is the curation payoff: selected traces become `tests` rows that plug into the existing run/benchmark machinery unchanged (and, as with any test, run results can then be sent for human labelling). It's the second cross-database operation (reads the traces store, writes `pense.db`) and, like the cap, is not transactional — it's re-runnable by design (see name dedup below).
+
+- **Selection** reuses the annotation-style bulk contract via `traces_store.select_traces(...)` (the read-bodies sibling of `soft_delete_traces`): `{trace_ids}` in request order, or `{select_all, q?, conversation_id?}`. `select_all` is bounded — the store fetches `MAX_CONVERT_BATCH + 1` (500) and the router 400s a wider match with a "narrow the filter" hint rather than mass-creating; an empty match is 404.
+- **Assembly mirrors `bulk_upload_tests`** (`evaluation` dict → `config` → `bulk_create_tests` → `set_test_evaluators` → `add_test_to_agent`), but is its **own** endpoint, not a client call to `POST /tests/bulk`: the bulk `ChatMessage` model rejects `system` turns (trace `input` routinely has them), `select_all` covers traces the client never fetched, and it's JWT-only. Per created test: `config.history = trace.input` **verbatim** (no transform — the ingest contract already stores OpenAI history).
+- **`type="response"`**: `evaluation = {"type": "response"}`; the recorded `output` is **discarded** (the test re-runs the agent). **Requires ≥1 evaluator** (400 otherwise) validated by the reused `routers/tests._validate_evaluators` (workspace-visible, `evaluator_type=llm`) — a converted response test has no legacy `criteria` fallback judge. Evaluators are linked live (unpinned) via `set_test_evaluators`, same as `POST /tests`.
+- **`type="tool_call"`**: `evaluation = {"type": "tool_call", "tool_calls": [{tool, arguments, accept_any_arguments}]}` copied straight from `output.tool_calls` — the recorded raw `arguments` pass through as **legacy exact-match** assertions (calibrate/the FE treat a plain literal arg value as `{match_type: exact}`; see `AddTestDialog.parseArgMatch`). **Semantics flip**: the production call becomes the expected assertion, so only convert curated-good traces. Every selected trace must carry non-empty `output.tool_calls` or the whole request 400s listing the offending `message_ids`. `accept_any_arguments` (name-only match) applies to all created tests. No evaluators.
+- **Name dedup**: each test name is the trace's `message_id`, made unique against existing workspace test names (and within the batch) by appending ` (2)`, ` (3)`, … (`_dedupe_test_names`) — so re-converting the same trace yields a new suffixed test instead of a 400.
+- **Optional `agent_uuids`**: validated up front (404 on cross-org), then every created test is linked to each agent (`add_test_to_agent`), so converted tests are runnable immediately.
+- **Provenance deferred**: `_build_calibrate_config` passes the whole `config` dict through to the calibrate CLI, so trace-source keys are **not** stamped into `config` in the MVP (avoids sending unknown keys to the external CLI). Revisit only after confirming calibrate ignores them.
+
 ---
 
 ## API Architecture
@@ -289,6 +301,7 @@ The JWT token contains the user's UUID and is validated on every protected endpo
 - `GET /traces?limit=&offset=&q=&conversation_id=` - Paginated slim `TraceSummary` list in the shared `PaginatedResponse` envelope. JWT only. Search/filter/count run in SQL in the traces store — never route this through `pagination.py`'s post-fetch `.apply()` helpers.
 - `GET /traces/{trace_uuid}` - Full `input`/`output`/`metadata`. JWT only.
 - `POST /traces/bulk-delete` - `{trace_ids | select_all, q?, conversation_id?}` (annotation-style bulk contract). Soft delete; frees capacity and message IDs. JWT only — destructive, must never join the key-authed surface.
+- `POST /traces/convert-to-tests` - Create `tests` rows from selected traces (`{trace_ids | select_all, q?, conversation_id?, type, evaluators?, agent_uuids?, accept_any_arguments?}`). JWT only, not tagged `Public API`. See **Convert traces to tests** below.
 
 See **Traces Store (separate database)** above for storage, migrations, and portability rules.
 

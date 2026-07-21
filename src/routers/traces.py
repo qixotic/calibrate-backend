@@ -10,15 +10,30 @@ fields: customers integrate against this shape, and every field deepens the
 eventual OTel-gateway migration.
 """
 
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from auth_utils import OrgContext, get_current_org, get_org_jwt_or_api_key
+from db import (
+    add_test_to_agent,
+    bulk_create_tests,
+    get_agent,
+    get_all_tests_summary,
+    set_test_evaluators,
+)
 from pagination import PaginatedResponse, PaginationParams, page_envelope
 from routers.org_limits import get_max_traces_for_org
+
+# Reuse the test router's evaluator ref + validation so converted tests accept
+# exactly what POST /tests does (workspace-visible, evaluator_type matches).
+from routers.tests import EvaluatorRef, _validate_evaluators
 from traces import store as traces_store
+from utils import EXAMPLE_TEST_UUID
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/traces", tags=["traces"])
 
@@ -26,6 +41,9 @@ MAX_INPUT_TURNS = 500
 MAX_TURN_CONTENT_CHARS = 50_000
 MAX_TOOL_CALLS = 50
 MAX_METADATA_ENTRIES = 100
+# One conversion request creates at most this many tests; a wider select_all
+# match 400s with a "narrow the filter" hint rather than mass-creating.
+MAX_CONVERT_BATCH = 500
 
 _EXAMPLE_TRACE_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
@@ -351,6 +369,192 @@ async def bulk_delete_traces(
         conversation_id=payload.conversation_id,
     )
     return {"deleted": deleted}
+
+
+_CONVERT_TYPE_DESCRIPTION = (
+    "What the created tests judge:\n\n"
+    "- `response`: judge the agent's regenerated reply against the linked evaluators\n"
+    "- `tool_call`: diff the agent's regenerated tool calls against the ones the trace recorded"
+)
+
+
+class ConvertTracesToTestsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    trace_ids: Optional[List[str]] = Field(
+        None,
+        description="IDs of the traces to convert. **Required when `select_all` is false.** Ignored otherwise",
+    )
+    select_all: bool = Field(
+        False,
+        description="Convert every trace matching `q` and `conversation_id` instead of an explicit ID list",
+    )
+    q: Optional[str] = Field(
+        None,
+        description=_Q_DESCRIPTION + ". Applied when `select_all` is true",
+    )
+    conversation_id: Optional[str] = Field(
+        None,
+        description="Limit `select_all` to traces from this conversation",
+    )
+    type: Literal["response", "tool_call"] = Field(description=_CONVERT_TYPE_DESCRIPTION)
+    evaluators: Optional[List[EvaluatorRef]] = Field(
+        None,
+        description="Evaluators to link to each created test. **Required for `response`**, unused for `tool_call`",
+    )
+    agent_uuids: Optional[List[str]] = Field(
+        None,
+        description="IDs of agents to link every created test to. Omit to link none",
+    )
+    accept_any_arguments: bool = Field(
+        False,
+        description="For `tool_call`, match only the tool name and ignore the arguments the trace recorded",
+    )
+
+
+class ConvertTracesToTestsResponse(BaseModel):
+    created: int = Field(description="Number of tests created")
+    test_uuids: List[str] = Field(
+        description="IDs of the created tests, in creation order",
+        examples=[[EXAMPLE_TEST_UUID]],
+    )
+
+
+def _dedupe_test_names(candidates: List[str], taken: set) -> List[str]:
+    """Make each candidate test name unique against `taken` (existing workspace
+    test names, mutated as names are claimed) by appending ` (2)`, ` (3)`, …
+    Converting the same traces twice yields new names rather than a 400."""
+    out: List[str] = []
+    for base in candidates:
+        name = base
+        n = 2
+        while name in taken:
+            name = f"{base} ({n})"
+            n += 1
+        taken.add(name)
+        out.append(name)
+    return out
+
+
+@router.post(
+    "/convert-to-tests",
+    response_model=ConvertTracesToTestsResponse,
+    summary="Convert traces to tests",
+)
+async def convert_traces_to_tests(
+    payload: ConvertTracesToTestsRequest, ctx: OrgContext = Depends(get_current_org)
+):
+    """Turn production traces into regression tests you can run and benchmark"""
+    if not payload.select_all and not payload.trace_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="trace_ids must be non-empty when select_all is false",
+        )
+
+    if payload.agent_uuids:
+        for agent_uuid in payload.agent_uuids:
+            agent = get_agent(agent_uuid)
+            if not agent or agent.get("org_uuid") != ctx.org_uuid:
+                raise HTTPException(
+                    status_code=404, detail=f"Agent {agent_uuid} not found"
+                )
+
+    # A converted response test re-runs the agent and judges the fresh reply, so
+    # it has no fallback judge — require at least one (llm) evaluator up front.
+    resolved_refs: Optional[List[Dict[str, Any]]] = None
+    if payload.type == "response":
+        if not payload.evaluators:
+            raise HTTPException(
+                status_code=400,
+                detail="response tests require at least one evaluator",
+            )
+        resolved_refs = _validate_evaluators(
+            payload.evaluators, ctx.org_uuid, "response"
+        )
+
+    traces = traces_store.select_traces(
+        ctx.org_uuid,
+        trace_ids=payload.trace_ids,
+        select_all=payload.select_all,
+        q=payload.q,
+        conversation_id=payload.conversation_id,
+        limit=MAX_CONVERT_BATCH + 1 if payload.select_all else None,
+    )
+    if not traces:
+        raise HTTPException(status_code=404, detail="No matching traces found")
+    if len(traces) > MAX_CONVERT_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Too many traces selected (limit {MAX_CONVERT_BATCH}). "
+                "Narrow the search or conversation filter and try again."
+            ),
+        )
+
+    # tool_call tests assert the recorded calls, so every trace must have some.
+    if payload.type == "tool_call":
+        missing = [
+            t["message_id"]
+            for t in traces
+            if not (t.get("output") or {}).get("tool_calls")
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Some traces have no tool calls to convert to a tool_call test",
+                    "message_ids": missing,
+                },
+            )
+
+    existing_names = {t["name"] for t in get_all_tests_summary(org_uuid=ctx.org_uuid)}
+    names = _dedupe_test_names([t["message_id"] for t in traces], existing_names)
+
+    db_tests: List[Dict[str, Any]] = []
+    for trace, name in zip(traces, names):
+        evaluation: Dict[str, Any] = {"type": payload.type}
+        if payload.type == "tool_call":
+            evaluation["tool_calls"] = [
+                {
+                    "tool": tc["tool"],
+                    "arguments": tc.get("arguments"),
+                    "accept_any_arguments": payload.accept_any_arguments,
+                }
+                for tc in (trace["output"].get("tool_calls") or [])
+            ]
+        db_tests.append(
+            {
+                "name": name,
+                "type": payload.type,
+                # `input` is already OpenAI history; `output` is discarded for
+                # response tests (the agent is re-run) and captured as the
+                # expected assertion for tool_call tests above.
+                "config": {"history": trace["input"], "evaluation": evaluation},
+            }
+        )
+
+    try:
+        uuids = bulk_create_tests(
+            tests=db_tests, org_uuid=ctx.org_uuid, user_id=ctx.user_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if resolved_refs:
+        for test_uuid in uuids:
+            set_test_evaluators(test_uuid, resolved_refs)
+
+    if payload.agent_uuids:
+        for agent_uuid in payload.agent_uuids:
+            for test_uuid in uuids:
+                try:
+                    add_test_to_agent(agent_uuid, test_uuid)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to link test {test_uuid} to agent {agent_uuid}: {e}"
+                    )
+
+    return {"created": len(uuids), "test_uuids": uuids}
 
 
 @router.get("/{trace_uuid}", response_model=TraceResponse, summary="Get trace")
