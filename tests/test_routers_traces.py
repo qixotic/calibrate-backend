@@ -278,6 +278,39 @@ def test_list_and_detail_roundtrip(client):
     )
 
 
+def test_output_with_multiple_tool_calls_roundtrips(client):
+    # A Responses turn can emit several tool calls (parallel, or accumulated
+    # across round-trips) alongside its reply, so output.tool_calls is a list:
+    # every entry, in order, must survive the count and the detail body.
+    h = _signup(client)
+    mid = _mid()
+    output = {
+        "response": "You're booked for Thursday at 4:30 PM.",
+        "tool_calls": [
+            {"tool": "check_availability", "arguments": {"date": "Thursday"}},
+            {
+                "tool": "book_appointment",
+                "arguments": {
+                    "patient_name": "Sam",
+                    "date": "Thursday",
+                    "time_slot": "4:30 PM",
+                },
+            },
+        ],
+    }
+    created = client.post("/traces", json=_payload(mid, output=output), headers=h)
+    assert created.status_code == 200, created.text
+    assert created.json()["created"] is True
+
+    summary = client.get("/traces", headers=h).json()["items"][0]
+    assert summary["tool_call_count"] == 2
+    assert summary["response_preview"].startswith("You're booked")
+
+    full = client.get(f"/traces/{created.json()['uuid']}", headers=h).json()
+    assert full["output"]["tool_calls"] == output["tool_calls"]
+    assert full["output"]["response"] == output["response"]
+
+
 def test_list_search_filter_and_pagination(client):
     h = _signup(client)
     mid_polio = _mid()
