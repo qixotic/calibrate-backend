@@ -69,7 +69,7 @@ class PersonaCreateResponse(BaseModel):
 
 
 @router.post("", response_model=PersonaCreateResponse, summary="Create persona")
-async def create_persona_endpoint(
+def create_persona_endpoint(
     persona: PersonaCreate, ctx: OrgContext = Depends(get_current_org)
 ):
     """Create a new persona"""
@@ -87,14 +87,14 @@ async def create_persona_endpoint(
 
 
 @router.get("", response_model=List[PersonaResponse], summary="List personas")
-async def list_personas(ctx: OrgContext = Depends(get_current_org)):
+def list_personas(ctx: OrgContext = Depends(get_current_org)):
     """List your personas"""
     personas = get_all_personas(org_uuid=ctx.org_uuid)
     return personas
 
 
 @router.get("/{persona_uuid}", response_model=PersonaResponse, summary="Get persona")
-async def get_persona_endpoint(
+def get_persona_endpoint(
     persona_uuid: str = Path(
         description="The persona to retrieve",
         examples=[_EXAMPLE_ID],
@@ -109,7 +109,7 @@ async def get_persona_endpoint(
 
 
 @router.put("/{persona_uuid}", response_model=PersonaResponse, summary="Update persona")
-async def update_persona_endpoint(
+def update_persona_endpoint(
     persona: PersonaUpdate,
     persona_uuid: str = Path(
         description="The persona to update",
@@ -144,7 +144,7 @@ async def update_persona_endpoint(
 
 
 @router.delete("/{persona_uuid}", summary="Delete persona")
-async def delete_persona_endpoint(
+def delete_persona_endpoint(
     persona_uuid: str = Path(
         description="The persona to delete",
         examples=[_EXAMPLE_ID],

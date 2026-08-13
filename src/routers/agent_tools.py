@@ -125,7 +125,7 @@ def _require_owned_tool(tool_uuid: str, org_uuid: str) -> Dict[str, Any]:
 @router.post(
     "", response_model=AgentToolsCreateResponse, summary="Link tools to agent"
 )
-async def create_agent_tool_links(
+def create_agent_tool_links(
     agent_tools: AgentToolsCreate,
     ctx: OrgContext = Depends(get_current_org),
 ):
@@ -156,7 +156,7 @@ async def create_agent_tool_links(
 @router.get(
     "", response_model=List[AgentToolResponse], summary="List agent-tool links"
 )
-async def list_agent_tools(ctx: OrgContext = Depends(get_current_org)):
+def list_agent_tools(ctx: OrgContext = Depends(get_current_org)):
     """List which tools are linked to which agents"""
     return get_all_agent_tools(org_uuid=ctx.org_uuid)
 
@@ -166,7 +166,7 @@ async def list_agent_tools(ctx: OrgContext = Depends(get_current_org)):
     response_model=List[ToolResponse],
     summary="List tools for agent",
 )
-async def get_agent_tools(
+def get_agent_tools(
     agent_uuid: str = Path(
         description="The agent whose linked tools to list",
         examples=[_EXAMPLE_ID],
@@ -183,7 +183,7 @@ async def get_agent_tools(
     response_model=List[AgentResponse],
     summary="List agents for tool",
 )
-async def get_tool_agents(
+def get_tool_agents(
     tool_uuid: str = Path(
         description="The tool whose linked agents to list",
         examples=[_EXAMPLE_ID],
@@ -196,7 +196,7 @@ async def get_tool_agents(
 
 
 @router.delete("", summary="Unlink tool from agent")
-async def delete_agent_tool_link(
+def delete_agent_tool_link(
     agent_tool: AgentToolDelete, ctx: OrgContext = Depends(get_current_org)
 ):
     """Unlink a tool from an agent so the agent can no longer call it"""

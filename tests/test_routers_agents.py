@@ -191,7 +191,14 @@ def test_list_agents_returns_trimmed_summary(client):
     item = next(a for a in r.json()["items"] if a["uuid"] == agent["uuid"])
 
     # Summary fields present.
-    assert set(item.keys()) == {"uuid", "name", "type", "updated_at", "connection_verified"}
+    assert set(item.keys()) == {
+        "uuid",
+        "name",
+        "type",
+        "updated_at",
+        "connection_verified",
+        "has_default_inputs",
+    }
     assert item["name"] == name
     assert item["type"] == "agent"
     assert item["updated_at"]
@@ -238,6 +245,48 @@ def test_list_agents_derives_connection_verified(client):
         f"/agents/{conn['uuid']}", json={"connection_verified": False}, headers=h
     )
     assert _cv(conn["uuid"]) is False
+
+
+def test_list_agents_derives_has_default_inputs(client):
+    """has_default_inputs is True only when config.default_inputs is a non-empty
+    dict; absent or empty maps to False."""
+    h = _signup(client)
+
+    plain = _create_agent(client, h, f"di-none-{uuid.uuid4().hex[:6]}")
+
+    empty = client.post(
+        "/agents",
+        json={
+            "name": f"di-empty-{uuid.uuid4().hex[:6]}",
+            "type": "connection",
+            "config": {"agent_url": "https://example.com/a", "default_inputs": {}},
+        },
+        headers=h,
+    ).json()
+
+    withfields = client.post(
+        "/agents",
+        json={
+            "name": f"di-set-{uuid.uuid4().hex[:6]}",
+            "type": "connection",
+            "config": {
+                "agent_url": "https://example.com/a",
+                "default_inputs": {"trimester": 2},
+            },
+        },
+        headers=h,
+    ).json()
+
+    def _hdi(agent_uuid):
+        r = client.get("/agents", headers=h)
+        assert r.status_code == 200, r.text
+        return next(
+            a for a in r.json()["items"] if a["uuid"] == agent_uuid
+        )["has_default_inputs"]
+
+    assert _hdi(plain["uuid"]) is False
+    assert _hdi(empty["uuid"]) is False
+    assert _hdi(withfields["uuid"]) is True
 
 
 def test_list_agents_is_org_scoped(client):

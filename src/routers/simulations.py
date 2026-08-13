@@ -46,6 +46,7 @@ from db import (
 )
 from llm_judge import build_evaluator_cli_payload
 from utils import (
+    job_slot,
     AGENT_TYPE_DESCRIPTION,
     TaskStatus,
     TaskCreateResponse,
@@ -682,7 +683,7 @@ def apply_simulation_job_evaluator_enrichment(
 
 
 @router.post("", response_model=SimulationCreateResponse, summary="Create simulation")
-async def create_simulation_endpoint(
+def create_simulation_endpoint(
     simulation: SimulationCreate, ctx: OrgContext = Depends(get_current_org)
 ):
     """Create a simulation, optionally linking an agent, personas, scenarios, and `conversation` evaluators"""
@@ -748,7 +749,7 @@ async def create_simulation_endpoint(
 
 
 @router.get("", response_model=List[SimulationListResponse], summary="List simulations")
-async def list_simulations(ctx: OrgContext = Depends(get_current_org)):
+def list_simulations(ctx: OrgContext = Depends(get_current_org)):
     """List all simulations"""
     simulations = get_all_simulations(org_uuid=ctx.org_uuid)
     # Hydrate each simulation's agent summary from ONE batched query instead of
@@ -792,7 +793,7 @@ class VisibilityResponse(BaseModel):
 
 
 @router.patch("/run/{task_id}/visibility", response_model=VisibilityResponse, summary="Update simulation run visibility")
-async def update_simulation_run_visibility(
+def update_simulation_run_visibility(
     body: VisibilityRequest,
     task_id: str = PathParam(
         description="The simulation run to update",
@@ -824,7 +825,7 @@ async def update_simulation_run_visibility(
 
 
 @router.get("/run/{task_id}", response_model=SimulationRunStatusResponse, summary="Get simulation run status")
-async def get_simulation_run_status(
+def get_simulation_run_status(
     task_id: str = PathParam(
         description="The simulation run to poll",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -948,7 +949,7 @@ async def get_simulation_run_status(
 
 
 @router.get("/{simulation_uuid}/runs", response_model=SimulationRunsResponse, summary="List simulation runs")
-async def get_simulation_runs(
+def get_simulation_runs(
     simulation_uuid: str = PathParam(
         description="The simulation whose runs to list",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -991,7 +992,7 @@ async def get_simulation_runs(
 
 
 @router.get("/{simulation_uuid}", response_model=SimulationDetailResponse, summary="Get simulation")
-async def get_simulation_endpoint(
+def get_simulation_endpoint(
     simulation_uuid: str = PathParam(
         description="The simulation to retrieve",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1035,7 +1036,7 @@ async def get_simulation_endpoint(
 
 
 @router.put("/{simulation_uuid}", response_model=SimulationDetailResponse, summary="Update simulation")
-async def update_simulation_endpoint(
+def update_simulation_endpoint(
     simulation: SimulationUpdate,
     simulation_uuid: str = PathParam(
         description="The simulation to update",
@@ -1168,7 +1169,7 @@ async def update_simulation_endpoint(
 
 
 @router.delete("/{simulation_uuid}", summary="Delete simulation")
-async def delete_simulation_endpoint(
+def delete_simulation_endpoint(
     simulation_uuid: str = PathParam(
         description="The simulation to delete",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -2430,7 +2431,7 @@ def run_simulation_task(
 
 
 @router.post("/{simulation_uuid}/run", response_model=TaskCreateResponse, summary="Run simulation")
-async def run_simulation_endpoint(
+def run_simulation_endpoint(
     request: RunSimulationRequest,
     simulation_uuid: str = PathParam(
         description="The simulation to run",
@@ -2469,6 +2470,12 @@ async def run_simulation_endpoint(
                 detail="Agent connection not verified. Call POST /agents/{agent_uuid}/verify-connection first.",
             )
 
+    if agent_config.get("default_inputs"):
+        raise HTTPException(
+            status_code=400,
+            detail="Simulations are not supported for agents with default inputs. Run an agent test instead.",
+        )
+
     # Get linked entities
     personas = get_personas_for_simulation(simulation_uuid)
     scenarios = get_scenarios_for_simulation(simulation_uuid)
@@ -2492,26 +2499,24 @@ async def run_simulation_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    can_start = can_start_simulation_job(SIMULATION_JOB_TYPES, ctx.org_uuid)
-    initial_status = (
-        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
-    )
+    with job_slot(
+        lambda: can_start_simulation_job(SIMULATION_JOB_TYPES, ctx.org_uuid)
+    ) as initial_status:
+        # Create job in database with details for recovery
+        job_id = create_simulation_job(
+            simulation_id=simulation_uuid,
+            job_type=request.type,
+            status=initial_status,
+            details={
+                "simulation_uuid": simulation_uuid,
+                "agent_uuid": agent_uuid,
+                "s3_bucket": s3_bucket,
+                "evaluators": _snapshot_evaluators_for_job_details(evaluators),
+            },
+            results=None,
+        )
 
-    # Create job in database with details for recovery
-    job_id = create_simulation_job(
-        simulation_id=simulation_uuid,
-        job_type=request.type,
-        status=initial_status,
-        details={
-            "simulation_uuid": simulation_uuid,
-            "agent_uuid": agent_uuid,
-            "s3_bucket": s3_bucket,
-            "evaluators": _snapshot_evaluators_for_job_details(evaluators),
-        },
-        results=None,
-    )
-
-    if can_start:
+    if initial_status == TaskStatus.IN_PROGRESS.value:
         # Start background task in a separate thread
         thread = threading.Thread(
             target=run_simulation_task,
@@ -2527,7 +2532,7 @@ async def run_simulation_endpoint(
 
 
 @router.post("/run/{job_uuid}/abort", response_model=SimulationRunStatusResponse, summary="Abort simulation run")
-async def abort_simulation_run(
+def abort_simulation_run(
     job_uuid: str = PathParam(
         description="The in-progress simulation run to abort",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -2616,7 +2621,7 @@ async def abort_simulation_run(
 
 
 @router.delete("/run/{job_uuid}", summary="Delete simulation run")
-async def delete_simulation_job_endpoint(
+def delete_simulation_job_endpoint(
     job_uuid: str = PathParam(
         description="The simulation run to delete",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

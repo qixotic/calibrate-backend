@@ -54,6 +54,7 @@ from db import (
 from llm_judge import build_test_evaluators_payload, evaluator_value_name
 from auth_utils import get_current_org, get_org_jwt_or_api_key, OrgContext
 from utils import (
+    job_slot,
     TaskStatus,
     InitialTaskStatus,
     TaskCreateResponse,
@@ -396,6 +397,10 @@ class TestCaseResult(BaseModel):
     test_case: Optional[Dict[str, Any]] = Field(
         None, description="The test case definition that was run"
     )
+    inputs: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Extra request fields sent to the agent for this case, the agent's `default_inputs` with this case's overrides applied",
+    )
     judge_results: Optional[List[JudgeResult]] = Field(
         None,
         description="One verdict for each evaluator",
@@ -601,7 +606,7 @@ class GlobalTestRunListItem(AgentTestRunListItem):
     summary="Link tests to agent",
     tags=["Public API"],
 )
-async def create_agent_test_links(
+def create_agent_test_links(
     agent_tests: AgentTestsCreate,
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
@@ -640,7 +645,7 @@ async def create_agent_test_links(
 
 
 @router.get("", response_model=List[AgentTestResponse], summary="List agent-test links")
-async def list_agent_tests():
+def list_agent_tests():
     """List which tests are linked to which agents."""
     links = get_all_agent_tests()
     return links
@@ -652,7 +657,7 @@ async def list_agent_tests():
     summary="List tests for agent",
     tags=["Public API"],
 )
-async def get_agent_tests_endpoint(
+def get_agent_tests_endpoint(
     agent_uuid: str = PathParam(
         description="Agent whose linked tests to list",
         examples=[_EXAMPLE_AGENT_UUID],
@@ -778,7 +783,7 @@ def _run_item_has_failures(item: AgentTestRunListItem) -> bool:
     summary="List test runs for agent",
     tags=["Public API"],
 )
-async def get_agent_test_runs(
+def get_agent_test_runs(
     agent_uuid: str = PathParam(
         description="Agent whose test runs to list",
         examples=[_EXAMPLE_AGENT_UUID],
@@ -859,7 +864,7 @@ async def get_agent_test_runs(
     response_model=PaginatedResponse[GlobalTestRunListItem],
     summary="List test runs for workspace",
 )
-async def get_all_test_runs_for_user(
+def get_all_test_runs_for_user(
     ctx: OrgContext = Depends(get_current_org),
     type: Optional[AgentTestJobType] = Query(
         None,
@@ -933,7 +938,7 @@ async def get_all_test_runs_for_user(
     response_model=List[AgentResponse],
     summary="List agents for test",
 )
-async def get_test_agents(
+def get_test_agents(
     test_uuid: str = PathParam(
         description="Test whose linked agents to list",
         examples=[EXAMPLE_TEST_UUID],
@@ -950,7 +955,7 @@ async def get_test_agents(
 
 
 @router.delete("", summary="Unlink test from agent")
-async def delete_agent_test_link(agent_test: AgentTestDelete):
+def delete_agent_test_link(agent_test: AgentTestDelete):
     """Unlink a test from an agent so it no longer runs for that agent."""
     deleted = remove_test_from_agent(agent_test.agent_uuid, agent_test.test_uuid)
     if not deleted:
@@ -972,7 +977,7 @@ class AgentTestBulkDelete(BaseModel):
 
 
 @router.post("/bulk-unlink", summary="Bulk unlink tests from agent")
-async def bulk_delete_agent_test_links(payload: AgentTestBulkDelete):
+def bulk_delete_agent_test_links(payload: AgentTestBulkDelete):
     """Unlink multiple tests from an agent."""
     if not payload.test_uuids:
         raise HTTPException(status_code=400, detail="test_uuids must not be empty")
@@ -1006,7 +1011,7 @@ class AgentTestsBulkDeleteAll(BaseModel):
 
 
 @router.post("/bulk-delete-tests", summary="Bulk delete agent tests")
-async def bulk_delete_agent_tests(
+def bulk_delete_agent_tests(
     payload: AgentTestsBulkDeleteAll,
     ctx: OrgContext = Depends(get_current_org),
 ):
@@ -1290,6 +1295,8 @@ def _build_calibrate_config(
             config["evaluators"] = top_level_evaluators
         if agent_config.get("agent_headers"):
             config["agent_headers"] = agent_config["agent_headers"]
+        if agent_config.get("default_inputs"):
+            config["agent_default_inputs"] = agent_config["default_inputs"]
         return config, evaluators_by_test_id
 
     # Calibrate agent mode
@@ -1358,7 +1365,10 @@ def _read_agent_test_metrics_json(output_dir: Path) -> Optional[dict]:
     return None
 
 
-def _parse_agent_test_results(results_data: Optional[List[dict]]) -> List[dict]:
+def _parse_agent_test_results(
+    results_data: Optional[List[dict]],
+    default_inputs: Optional[Dict[str, Any]] = None,
+) -> List[dict]:
     """Parse results.json data into the format expected by the API.
 
     `judge_results` is preserved as the raw calibrate-emitted dict
@@ -1374,6 +1384,8 @@ def _parse_agent_test_results(results_data: Optional[List[dict]]) -> List[dict]:
         output_data = r.get("output", {})
         metrics = r.get("metrics", {})
         test_case = r.get("test_case", {})
+        case_inputs = test_case.get("inputs") or {}
+        effective_inputs = {**(default_inputs or {}), **case_inputs}
         test_results.append(
             {
                 "name": test_case.get("name"),
@@ -1385,6 +1397,7 @@ def _parse_agent_test_results(results_data: Optional[List[dict]]) -> List[dict]:
                     "tool_calls": output_data.get("tool_calls"),
                 },
                 "test_case": test_case,
+                "inputs": effective_inputs or None,
                 "judge_results": metrics.get("judge_results"),
                 # latency_ms is top-level on the calibrate result object (sibling of
                 # output/metrics); cost is nested inside output. Different depths by
@@ -1406,6 +1419,7 @@ def _pending_test_case_result_placeholder(name: str) -> Dict[str, Any]:
         "reasoning": None,
         "output": None,
         "test_case": None,
+        "inputs": None,
         "judge_results": None,
         "latency_ms": None,
         "cost": None,
@@ -1880,6 +1894,7 @@ def _update_agent_test_intermediate_results(
     task_id: str,
     output_dir: Path,
     test_names: List[str],
+    default_inputs: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
     Update intermediate results for an agent test job.
@@ -1890,7 +1905,7 @@ def _update_agent_test_intermediate_results(
         return 0
 
     # Parse results
-    test_results = _parse_agent_test_results(results_data)
+    test_results = _parse_agent_test_results(results_data, default_inputs)
     completed_count = len(test_results)
 
     # Build intermediate results: show completed tests with results, pending tests with just name
@@ -1976,6 +1991,7 @@ def run_llm_test_task(
                     task_id, agent, tests
                 )
                 agent_config = agent.get("config") or {}
+                default_inputs = agent_config.get("default_inputs")
 
                 # Create directories
                 input_dir = temp_path / "input"
@@ -2045,7 +2061,7 @@ def run_llm_test_task(
                     prev_completed = 0
                     while process.poll() is None:
                         completed = _update_agent_test_intermediate_results(
-                            task_id, output_dir, test_names
+                            task_id, output_dir, test_names, default_inputs
                         )
                         if completed != prev_completed:
                             logger.info(
@@ -2056,7 +2072,7 @@ def run_llm_test_task(
 
                     # Final update after process completes
                     _update_agent_test_intermediate_results(
-                        task_id, output_dir, test_names
+                        task_id, output_dir, test_names, default_inputs
                     )
 
                 # Read stdout/stderr
@@ -2108,7 +2124,7 @@ def run_llm_test_task(
                     raise subprocess.CalledProcessError(0, run_cmd, stdout, stderr)
 
                 # Parse results
-                test_results = _parse_agent_test_results(results_data)
+                test_results = _parse_agent_test_results(results_data, default_inputs)
 
                 # Add name field for consistency
                 for i, r in enumerate(test_results):
@@ -2260,6 +2276,56 @@ def _agent_connection_unverified(agent: Dict[str, Any]) -> bool:
     )
 
 
+def _agent_test_job_details(
+    agent: Dict[str, Any],
+    tests: List[Dict[str, Any]],
+    s3_bucket: str,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Build the `details` blob both agent-test launchers store on their job.
+
+    Returns ``(test_names, details)`` — test names come back separately because
+    each launcher also seeds its own placeholder `results` from them. The
+    calibrate config and per-test evaluator metadata are snapshotted here so the
+    worker (and enrichment) stay aligned even if links or live versions change
+    later.
+    """
+    test_names = [test.get("name") for test in tests if test.get("name")]
+    calibrate_config, evaluators_by_test_id = _build_calibrate_config(agent, tests)
+    return test_names, {
+        "agent_uuid": agent["uuid"],
+        "test_uuids": [t["uuid"] for t in tests],
+        "test_names": test_names,
+        "s3_bucket": s3_bucket,
+        "calibrate_config": calibrate_config,
+        "evaluators_by_test_id": evaluators_by_test_id,
+    }
+
+
+def _create_agent_test_job_in_slot(
+    agent: Dict[str, Any],
+    job_type: str,
+    details: Dict[str, Any],
+    results: Dict[str, Any],
+) -> tuple[str, str]:
+    """Claim a queue slot and create the job under one lock hold.
+
+    Returns ``(job_id, initial_status)``. The INSERT must stay inside
+    `job_slot` or concurrent submissions can each see the same free slot and
+    blow past MAX_CONCURRENT_JOBS.
+    """
+    with job_slot(
+        lambda: can_start_agent_test_job(AGENT_TEST_JOB_TYPES, agent.get("org_uuid"))
+    ) as initial_status:
+        job_id = create_agent_test_job(
+            agent_id=agent["uuid"],
+            job_type=job_type,
+            status=initial_status,
+            details=details,
+            results=results,
+        )
+    return job_id, initial_status
+
+
 def _launch_agent_test_run(
     agent: Dict[str, Any],
     tests: List[Dict[str, Any]],
@@ -2271,35 +2337,11 @@ def _launch_agent_test_run(
     ``(task_id, status)``. The caller owns agent-ownership, connection-verified,
     and non-empty ``tests`` checks. This just snapshots config and dispatches.
     """
-    agent_uuid = agent["uuid"]
-    org_uuid = agent.get("org_uuid")
-
-    can_start = can_start_agent_test_job(AGENT_TEST_JOB_TYPES, org_uuid)
-    initial_status = (
-        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
-    )
-
-    # Extract test names for progress tracking
-    test_names = [test.get("name") for test in tests if test.get("name")]
-
-    # Snapshot calibrate config and per-test evaluator metadata at submission so the
-    # worker (and enrichment) stay aligned even if links or live versions change later.
-    calibrate_config, evaluators_by_test_id = _build_calibrate_config(agent, tests)
-
-    # Create job in database with details for recovery
-    test_uuids = [t["uuid"] for t in tests]
-    job_id = create_agent_test_job(
-        agent_id=agent_uuid,
-        job_type="llm-unit-test",
-        status=initial_status,
-        details={
-            "agent_uuid": agent_uuid,
-            "test_uuids": test_uuids,
-            "test_names": test_names,
-            "s3_bucket": s3_bucket,
-            "calibrate_config": calibrate_config,
-            "evaluators_by_test_id": evaluators_by_test_id,
-        },
+    test_names, details = _agent_test_job_details(agent, tests, s3_bucket)
+    job_id, initial_status = _create_agent_test_job_in_slot(
+        agent,
+        "llm-unit-test",
+        details,
         results={
             "test_results": [
                 _pending_test_case_result_placeholder(name) for name in test_names
@@ -2307,7 +2349,7 @@ def _launch_agent_test_run(
         },
     )
 
-    if can_start:
+    if initial_status == TaskStatus.IN_PROGRESS.value:
         # Start background task in a separate thread
         thread = threading.Thread(
             target=run_llm_test_task,
@@ -2328,7 +2370,7 @@ def _launch_agent_test_run(
     tags=["Public API"],
     summary="Run agent tests",
 )
-async def run_agent_test(
+def run_agent_test(
     agent_uuid: str = PathParam(
         description="Agent to test",
         examples=[_EXAMPLE_AGENT_UUID],
@@ -2440,7 +2482,7 @@ def _run_tests_for_agents(
     tags=["Public API"],
     summary="Run agent tests in batch",
 )
-async def run_tests_batch(
+def run_tests_batch(
     request: Optional[BatchRunRequest] = None,
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
@@ -2523,7 +2565,7 @@ class VisibilityResponse(BaseModel):
     response_model=VisibilityResponse,
     summary="Update test run visibility",
 )
-async def update_test_run_visibility(
+def update_test_run_visibility(
     task_id: str = PathParam(
         description="Test run whose sharing settings to update",
         examples=[_EXAMPLE_TASK_UUID],
@@ -2562,7 +2604,7 @@ _RunProjection = make_projection_params(
     tags=["Public API"],
     summary="Get test run status",
 )
-async def get_agent_test_run_status(
+def get_agent_test_run_status(
     task_id: str = PathParam(
         description="Test run to poll for status and results",
         examples=[_EXAMPLE_TASK_UUID],
@@ -2731,6 +2773,7 @@ def _update_benchmark_intermediate_results(
     models: List[str],
     test_names: List[str],
     cli_models: Optional[List[str]] = None,
+    default_inputs: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
     Update intermediate results for a benchmark job.
@@ -2757,7 +2800,7 @@ def _update_benchmark_intermediate_results(
             results_data, metrics_data = all_results[matched_folder]
 
             # Parse results
-            test_results = _parse_agent_test_results(results_data)
+            test_results = _parse_agent_test_results(results_data, default_inputs)
 
             # Add name field for consistency
             for i, r in enumerate(test_results):
@@ -2890,6 +2933,7 @@ def run_benchmark_task(
                     task_id, agent, tests
                 )
                 agent_config = agent.get("config") or {}
+                default_inputs = agent_config.get("default_inputs")
 
                 # Clear any model from config — models are passed via CLI flags
                 if "params" in calibrate_config:
@@ -2963,7 +3007,8 @@ def run_benchmark_task(
                     prev_completed = 0
                     while process.poll() is None:
                         completed = _update_benchmark_intermediate_results(
-                            task_id, output_dir, models, test_names, cli_models
+                            task_id, output_dir, models, test_names, cli_models,
+                            default_inputs,
                         )
                         if completed != prev_completed:
                             logger.info(
@@ -2974,7 +3019,8 @@ def run_benchmark_task(
 
                     # Final update after process completes
                     _update_benchmark_intermediate_results(
-                        task_id, output_dir, models, test_names, cli_models
+                        task_id, output_dir, models, test_names, cli_models,
+                        default_inputs,
                     )
 
                 # Read stdout/stderr
@@ -3240,7 +3286,7 @@ def run_benchmark_task(
     summary="Run agent benchmark",
     tags=["Public API"],
 )
-async def run_agent_benchmark(
+def run_agent_benchmark(
     agent_uuid: str = PathParam(
         description="Agent to benchmark",
         examples=[_EXAMPLE_AGENT_UUID],
@@ -3312,40 +3358,20 @@ async def run_agent_benchmark(
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Per-org limit check uses the agent's org.
-    org_uuid = agent.get("org_uuid")
-
-    can_start = can_start_agent_test_job(AGENT_TEST_JOB_TYPES, org_uuid)
-    initial_status = (
-        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
-    )
-
-    # Extract test names for progress tracking
-    test_names = [test.get("name") for test in tests if test.get("name")]
-
-    calibrate_config, evaluators_by_test_id = _build_calibrate_config(agent, tests)
-
-    # Create job in database with details for recovery
-    test_uuids = [t["uuid"] for t in tests]
-    job_id = create_agent_test_job(
-        agent_id=agent_uuid,
-        job_type="llm-benchmark",
-        status=initial_status,
-        details={
-            "agent_uuid": agent_uuid,
-            "test_uuids": test_uuids,
-            "test_names": test_names,
-            "models": request.models,
-            "s3_bucket": s3_bucket,
-            "calibrate_config": calibrate_config,
-            "evaluators_by_test_id": evaluators_by_test_id,
-        },
+    test_names, details = _agent_test_job_details(agent, tests, s3_bucket)
+    details["models"] = request.models
+    job_id, initial_status = _create_agent_test_job_in_slot(
+        agent,
+        "llm-benchmark",
+        details,
         results={
-            "model_results": _benchmark_queued_model_results(request.models, test_names)
+            "model_results": _benchmark_queued_model_results(
+                request.models, test_names
+            )
         },
     )
 
-    if can_start:
+    if initial_status == TaskStatus.IN_PROGRESS.value:
         # Start background task
         thread = threading.Thread(
             target=run_benchmark_task,
@@ -3365,7 +3391,7 @@ async def run_agent_benchmark(
     response_model=VisibilityResponse,
     summary="Update benchmark visibility",
 )
-async def update_benchmark_visibility(
+def update_benchmark_visibility(
     task_id: str = PathParam(
         description="Benchmark run whose sharing settings to update",
         examples=[_EXAMPLE_TASK_UUID],
@@ -3401,7 +3427,7 @@ _BenchmarkProjection = make_projection_params(
     summary="Get benchmark status",
     tags=["Public API"],
 )
-async def get_benchmark_status(
+def get_benchmark_status(
     task_id: str = PathParam(
         description="Benchmark run to poll for status and results",
         examples=[_EXAMPLE_TASK_UUID],
@@ -3474,7 +3500,7 @@ async def get_benchmark_status(
 
 
 @router.delete("/job/{job_uuid}", summary="Delete test job")
-async def delete_agent_test_job_endpoint(
+def delete_agent_test_job_endpoint(
     job_uuid: str = PathParam(
         description="Test or benchmark job to delete",
         examples=[_EXAMPLE_TASK_UUID],

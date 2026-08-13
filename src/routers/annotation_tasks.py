@@ -71,6 +71,7 @@ from annotation_eval_runner import (
     start_annotation_eval_job,
 )
 from utils import (
+    job_slot,
     TaskStatus,
     AnnotationTaskTypeLiteral,
     InitialTaskStatus,
@@ -211,7 +212,7 @@ class TaskAgreementResponse(BaseModel):
         description="Agreement between annotators who labelled the same items"
     )
     evaluators: List[Dict[str, Any]] = Field(
-        description="Agreement between each evaluator and the annotators, one entry per linked evaluator"
+        description="Agreement between each evaluator and the annotators, plus that evaluator's own results, one entry per linked evaluator"
     )
 
 
@@ -303,6 +304,7 @@ from annotation_metrics import (
     aggregate_agreement,
     aggregate_human_evaluator_agreement,
     evaluator_human_pair_agreement,
+    evaluator_result_summary,
     per_item_agreement,
     has_any_comparable_pair,
     trend_series,
@@ -479,7 +481,7 @@ def _ensure_owned_task(task_uuid: str, org_uuid: str) -> Dict[str, Any]:
 
 
 @router.post("", response_model=AnnotationTaskCreateResponse, summary="Create annotation task", tags=["Public API"])
-async def create_annotation_task_endpoint(
+def create_annotation_task_endpoint(
     payload: AnnotationTaskCreate,
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
@@ -509,7 +511,7 @@ async def create_annotation_task_endpoint(
 
 
 @router.get("", response_model=PaginatedResponse[AnnotationTaskResponse], summary="List annotation tasks", tags=["Public API"])
-async def list_annotation_tasks(
+def list_annotation_tasks(
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
     search: _AnnotationTaskSearch = Depends(),
     pagination: OptionalPaginationParams = Depends(),
@@ -546,7 +548,7 @@ async def list_annotation_tasks(
 
 
 @router.get("/{task_uuid}", response_model=AnnotationTaskResponse, summary="Get annotation task", tags=["Public API"])
-async def get_annotation_task_endpoint(
+def get_annotation_task_endpoint(
     task_uuid: str = Path(
         description="Task to retrieve",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -596,7 +598,7 @@ async def get_annotation_task_endpoint(
 
 
 @router.put("/{task_uuid}", response_model=AnnotationTaskResponse, summary="Update annotation task")
-async def update_annotation_task_endpoint(
+def update_annotation_task_endpoint(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -626,7 +628,7 @@ async def update_annotation_task_endpoint(
 
 
 @router.delete("/{task_uuid}", summary="Delete annotation task")
-async def delete_annotation_task_endpoint(
+def delete_annotation_task_endpoint(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -645,7 +647,7 @@ async def delete_annotation_task_endpoint(
 
 
 @router.get("/{task_uuid}/evaluators", summary="List task evaluators")
-async def list_task_evaluators(
+def list_task_evaluators(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -711,7 +713,7 @@ async def list_task_evaluators(
 
 
 @router.post("/{task_uuid}/evaluators", response_model=EvaluatorLinkResponse, summary="Link evaluator to task")
-async def link_evaluator_to_task(
+def link_evaluator_to_task(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -727,7 +729,7 @@ async def link_evaluator_to_task(
 
 
 @router.put("/{task_uuid}/evaluators/order", summary="Reorder task evaluators")
-async def reorder_task_evaluators(
+def reorder_task_evaluators(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -755,7 +757,7 @@ async def reorder_task_evaluators(
     summary="Update task evaluators",
     tags=["Public API"],
 )
-async def set_task_evaluators(
+def set_task_evaluators(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -812,7 +814,7 @@ class BulkItemsRequest(BaseModel):
 
 
 @router.get("/{task_uuid}/items", summary="List task items")
-async def list_task_items(
+def list_task_items(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -838,7 +840,7 @@ class AnnotatedItemsCheckRequest(BaseModel):
 
 
 @router.post("/{task_uuid}/items/annotated-check", summary="Check annotated items")
-async def check_annotated_items(
+def check_annotated_items(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -890,7 +892,7 @@ async def check_annotated_items(
 
 
 @router.post("/{task_uuid}/items", response_model=BulkCreateItemsResponse, response_model_exclude_none=True, summary="Bulk create items", tags=["Public API"])
-async def bulk_create_items(
+def bulk_create_items(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1170,7 +1172,7 @@ class BulkUpdateItemsRequest(BaseModel):
 
 
 @router.put("/{task_uuid}/items", response_model=BulkUpdateItemsResponse, summary="Bulk update items", tags=["Public API"])
-async def bulk_update_items(
+def bulk_update_items(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1309,7 +1311,7 @@ class BulkDeleteItemsRequest(BaseModel):
 
 
 @router.delete("/{task_uuid}/items", summary="Bulk delete items")
-async def bulk_delete_items(
+def bulk_delete_items(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1338,7 +1340,7 @@ async def bulk_delete_items(
 
 
 @router.get("/{task_uuid}/items/{item_uuid}", summary="Get item")
-async def get_item(
+def get_item(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1358,7 +1360,7 @@ async def get_item(
 
 
 @router.get("/{task_uuid}/items/{item_uuid}/annotations", summary="List item annotations")
-async def list_item_annotations(
+def list_item_annotations(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1405,7 +1407,7 @@ class CreateJobsRequest(BaseModel):
 
 
 @router.get("/{task_uuid}/jobs", summary="List labelling jobs")
-async def list_task_jobs(
+def list_task_jobs(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1418,7 +1420,7 @@ async def list_task_jobs(
 
 
 @router.post("/{task_uuid}/jobs", summary="Create labelling jobs")
-async def create_jobs(
+def create_jobs(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1537,7 +1539,7 @@ async def create_jobs(
 
 
 @router.get("/{task_uuid}/jobs/{job_uuid}", summary="Get labelling job")
-async def get_annotation_job_endpoint(
+def get_annotation_job_endpoint(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1565,7 +1567,7 @@ class BulkDeleteJobsRequest(BaseModel):
 
 
 @router.delete("/{task_uuid}/jobs", summary="Bulk delete labelling jobs")
-async def bulk_delete_annotation_jobs_endpoint(
+def bulk_delete_annotation_jobs_endpoint(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1582,7 +1584,7 @@ async def bulk_delete_annotation_jobs_endpoint(
 
 
 @router.delete("/{task_uuid}/jobs/{job_uuid}", summary="Delete labelling job")
-async def delete_annotation_job_endpoint(
+def delete_annotation_job_endpoint(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1622,7 +1624,7 @@ class AnnotationJobVisibilityResponse(BaseModel):
     response_model=AnnotationJobVisibilityResponse,
     summary="Update labelling job visibility",
 )
-async def update_annotation_job_visibility_endpoint(
+def update_annotation_job_visibility_endpoint(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1688,7 +1690,7 @@ class AnnotationUpsertRequest(BaseModel):
 
 
 @router.post("/{task_uuid}/annotations", summary="Upsert annotation")
-async def upsert_annotation_endpoint(
+def upsert_annotation_endpoint(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1768,7 +1770,7 @@ class EvaluatorRunStartRequest(BaseModel):
 
 
 @router.post("/{task_uuid}/evaluator-runs", response_model=EvaluatorRunLaunchResponse, summary="Run evaluators on items", tags=["Public API"])
-async def start_evaluator_run(
+def start_evaluator_run(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1863,30 +1865,28 @@ async def start_evaluator_run(
         raise HTTPException(status_code=400, detail=str(e))
 
     # Decide queue vs immediate start (shared eval queue with stt-eval/tts-eval).
-    can_start = can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
-    initial_status = (
-        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
-    )
-
-    job_uuid = create_job(
-        job_type=ANNOTATION_EVAL_JOB_TYPE,
-        org_uuid=ctx.org_uuid,
-        user_id=ctx.user_id,
-        status=initial_status,
-        details={
-            "task_id": task_uuid,
-            "evaluators": [
-                {
-                    "evaluator_id": ev["uuid"],
-                    "evaluator_version_id": ev["_evaluator_version_id"],
-                    "name": ev["name"],
-                }
-                for ev in resolved
-            ],
-            "item_count": len(items),
-            "item_ids": item_ids_persisted,
-        },
-    )
+    with job_slot(
+        lambda: can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
+    ) as initial_status:
+        job_uuid = create_job(
+            job_type=ANNOTATION_EVAL_JOB_TYPE,
+            org_uuid=ctx.org_uuid,
+            user_id=ctx.user_id,
+            status=initial_status,
+            details={
+                "task_id": task_uuid,
+                "evaluators": [
+                    {
+                        "evaluator_id": ev["uuid"],
+                        "evaluator_version_id": ev["_evaluator_version_id"],
+                        "name": ev["name"],
+                    }
+                    for ev in resolved
+                ],
+                "item_count": len(items),
+                "item_ids": item_ids_persisted,
+            },
+        )
     # Snapshot the resolved item set onto the job so the runner reads
     # frozen payloads regardless of any subsequent edit / soft-delete on
     # the source `annotation_items` row. Order matches submission order
@@ -1894,7 +1894,7 @@ async def start_evaluator_run(
     # exact byte sequence calibrate sees.
     snapshot_eval_job_items(job_uuid, items)
 
-    if can_start:
+    if initial_status == TaskStatus.IN_PROGRESS.value:
         start_annotation_eval_job(
             job_uuid=job_uuid,
             task_uuid=task_uuid,
@@ -2104,7 +2104,7 @@ def _shape_eval_job_for_response(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.get("/{task_uuid}/evaluator-runs", summary="List evaluator runs")
-async def list_evaluator_run_jobs(
+def list_evaluator_run_jobs(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -2359,7 +2359,7 @@ def _human_agreement_for_run(
 
 
 @router.get("/{task_uuid}/evaluator-runs/{job_uuid}", response_model=EvaluatorRunResponse, summary="Get evaluator run", tags=["Public API"])
-async def get_evaluator_run_job(
+def get_evaluator_run_job(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -2406,7 +2406,7 @@ async def get_evaluator_run_job(
 
 
 @router.delete("/{task_uuid}/evaluator-runs/{job_uuid}", summary="Delete evaluator run")
-async def delete_evaluator_run_job(
+def delete_evaluator_run_job(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -2464,7 +2464,7 @@ class EvaluatorRunVisibilityResponse(BaseModel):
     response_model=EvaluatorRunVisibilityResponse,
     summary="Update evaluator run visibility",
 )
-async def update_evaluator_run_visibility(
+def update_evaluator_run_visibility(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -2502,7 +2502,7 @@ async def update_evaluator_run_visibility(
 
 
 @router.get("/{task_uuid}/items/{item_uuid}/evaluator-runs", summary="List item evaluator runs")
-async def list_item_evaluator_runs(
+def list_item_evaluator_runs(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -2551,13 +2551,14 @@ def _evaluator_alignment_block(
                 "current": cur,
                 "pair_count": pairs,
                 "series": series_by_id.get(ev_id, []),
+                "result": evaluator_result_summary(evaluator_runs, ev_id),
             }
         )
     return out
 
 
 @router.get("/{task_uuid}/agreement", response_model=TaskAgreementResponse, summary="Get task agreement", tags=["Public API"])
-async def task_agreement(
+def task_agreement(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -2598,7 +2599,7 @@ async def task_agreement(
 
 
 @router.get("/{task_uuid}/summary", response_model=TaskSummaryResponse, summary="Get task summary", tags=["Public API"])
-async def task_summary(
+def task_summary(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -3049,7 +3050,7 @@ async def task_summary(
 
 
 @router.delete("/{task_uuid}/evaluators/{evaluator_uuid}", summary="Unlink evaluator from task")
-async def unlink_evaluator_from_task(
+def unlink_evaluator_from_task(
     task_uuid: str = Path(
         description="Annotation task to act on",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

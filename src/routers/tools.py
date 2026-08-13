@@ -125,7 +125,7 @@ class ToolCreateResponse(BaseModel):
 
 
 @router.post("", response_model=ToolCreateResponse, summary="Create tool")
-async def create_tool_endpoint(
+def create_tool_endpoint(
     tool: ToolCreate, ctx: OrgContext = Depends(get_current_org)
 ):
     """Create a new tool"""
@@ -141,14 +141,14 @@ async def create_tool_endpoint(
 
 
 @router.get("", response_model=List[ToolResponse], summary="List tools")
-async def list_tools(ctx: OrgContext = Depends(get_current_org)):
+def list_tools(ctx: OrgContext = Depends(get_current_org)):
     """List your tools"""
     tools = get_all_tools(org_uuid=ctx.org_uuid)
     return tools
 
 
 @router.get("/{tool_uuid}", response_model=ToolResponse, summary="Get tool")
-async def get_tool_endpoint(
+def get_tool_endpoint(
     tool_uuid: str = Path(
         description="The tool to retrieve",
         examples=[_EXAMPLE_ID],
@@ -163,7 +163,7 @@ async def get_tool_endpoint(
 
 
 @router.put("/{tool_uuid}", response_model=ToolResponse, summary="Update tool")
-async def update_tool_endpoint(
+def update_tool_endpoint(
     tool: ToolUpdate,
     tool_uuid: str = Path(
         description="The tool to update",
@@ -194,7 +194,7 @@ async def update_tool_endpoint(
 
 
 @router.delete("/{tool_uuid}", summary="Delete tool")
-async def delete_tool_endpoint(
+def delete_tool_endpoint(
     tool_uuid: str = Path(
         description="The tool to delete",
         examples=[_EXAMPLE_ID],

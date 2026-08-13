@@ -138,11 +138,15 @@ async def _verify_agent_connection(
     agent_headers: Optional[Dict[str, str]] = None,
     model: Optional[str] = None,
     messages: Optional[List[Dict[str, str]]] = None,
+    default_inputs: Optional[Dict[str, Any]] = None,
+    inputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Verify agent connection using calibrate's TextAgentConnection."""
     _validate_agent_url(agent_url)
     safe_headers = _sanitize_headers(agent_headers)
-    agent = TextAgentConnection(url=agent_url, headers=safe_headers)
+    agent = TextAgentConnection(
+        url=agent_url, headers=safe_headers, default_inputs=default_inputs
+    )
 
     try:
         kwargs = {}
@@ -150,6 +154,8 @@ async def _verify_agent_connection(
             kwargs["model"] = model
         if messages:
             kwargs["messages"] = messages
+        if inputs:
+            kwargs["inputs"] = inputs
         result = await agent.verify(**kwargs)
     except Exception as e:
         logger.exception(
@@ -426,18 +432,24 @@ class AgentSummary(BaseModel):
         None,
         description="Whether the agent's connection has been verified, for a `type=connection` agent",
     )
+    has_default_inputs: bool = Field(
+        description="Whether the agent has custom request fields configured",
+    )
 
 
 def _to_agent_summary(agent: Dict[str, Any]) -> AgentSummary:
     """Project an agent row to the trimmed list shape, lifting
-    `config.connection_verified` to a top-level flag (None when absent)."""
-    verified = (agent.get("config") or {}).get("connection_verified")
+    `config.connection_verified` and a `config.default_inputs` presence flag to
+    top-level fields."""
+    config = agent.get("config") or {}
+    verified = config.get("connection_verified")
     return AgentSummary(
         uuid=agent["uuid"],
         name=agent["name"],
         type=agent["type"],
         updated_at=agent["updated_at"],
         connection_verified=None if verified is None else bool(verified),
+        has_default_inputs=bool(config.get("default_inputs")),
     )
 
 
@@ -530,6 +542,11 @@ class AgentVerifyRequest(BaseModel):
         description="Sample chat messages to send during verification. Omit to use the default probe",
         examples=[[{"role": "user", "content": "Hello"}]],
     )
+    inputs: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Extra request fields for this probe, overriding the agent's stored `default_inputs` per key",
+        examples=[{"condition_area": "cardiology"}],
+    )
 
 
 class VerifyConnectionRequest(AgentVerifyRequest):
@@ -542,6 +559,11 @@ class VerifyConnectionRequest(AgentVerifyRequest):
         None,
         description="Extra request headers to send to your agent, e.g. an auth token. Omit if none are needed",
         examples=[{"Authorization": "Bearer <token>"}],
+    )
+    default_inputs: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Extra fields merged into every request to the agent, since no agent is stored yet",
+        examples=[{"condition_area": "cardiology"}],
     )
 
 
@@ -574,6 +596,8 @@ async def verify_agent_connection_presave(
         agent_headers=request.agent_headers,
         model=request.model,
         messages=request.messages,
+        default_inputs=request.default_inputs,
+        inputs=request.inputs,
     )
     return VerifyConnectionResponse(**result)
 
@@ -621,6 +645,8 @@ async def verify_agent_connection(
         agent_headers=agent_headers,
         model=verify_model,
         messages=request.messages,
+        default_inputs=agent_config.get("default_inputs"),
+        inputs=request.inputs,
     )
 
     # Only persist successful verification results into agent config.
@@ -656,7 +682,7 @@ async def verify_agent_connection(
     tags=["Public API"],
     summary="Resolve agent names to IDs",
 )
-async def resolve_agent_names(
+def resolve_agent_names(
     request: ResolveAgentNamesRequest,
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
@@ -684,7 +710,7 @@ async def resolve_agent_names(
     summary="Create agent",
     openapi_extra={"x-codeSamples": _curl_code_samples(_CREATE_AGENT_EXAMPLES, "/agents")},
 )
-async def create_agent_endpoint(
+def create_agent_endpoint(
     agent: AgentCreate = Body(openapi_examples=_CREATE_AGENT_EXAMPLES),
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
@@ -714,7 +740,7 @@ async def create_agent_endpoint(
     tags=["Public API"],
     summary="List agents",
 )
-async def list_agents(
+def list_agents(
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
     search: _AgentSearch = Depends(),
     pagination: OptionalPaginationParams = Depends(),
@@ -740,7 +766,7 @@ async def list_agents(
     tags=["Public API"],
     summary="Get agent",
 )
-async def get_agent_endpoint(
+def get_agent_endpoint(
     agent_uuid: str = Path(
         description="The agent to retrieve",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -760,7 +786,7 @@ async def get_agent_endpoint(
     tags=["Public API"],
     summary="Update agent",
 )
-async def update_agent_endpoint(
+def update_agent_endpoint(
     agent_uuid: str = Path(
         description="The agent to update",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -821,7 +847,7 @@ async def update_agent_endpoint(
     response_model=BulkAgentDeleteResponse,
     summary="Bulk delete agents",
 )
-async def bulk_delete_agents_endpoint(
+def bulk_delete_agents_endpoint(
     payload: BulkAgentDelete, ctx: OrgContext = Depends(get_current_org)
 ):
     """Soft-delete multiple agents by ID, along with their linked tools, tests, and evaluators. Pre-existing job runs are kept"""
@@ -848,7 +874,7 @@ async def bulk_delete_agents_endpoint(
 
 
 @router.delete("/{agent_uuid}", summary="Delete agent")
-async def delete_agent_endpoint(
+def delete_agent_endpoint(
     agent_uuid: str = Path(
         description="The agent to delete",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -871,7 +897,7 @@ async def delete_agent_endpoint(
     response_model=AgentDuplicateResponse,
     summary="Duplicate agent",
 )
-async def duplicate_agent_endpoint(
+def duplicate_agent_endpoint(
     agent_uuid: str = Path(
         description="The agent to duplicate",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -949,7 +975,7 @@ async def duplicate_agent_endpoint(
     summary="List agent evaluators",
     tags=["Public API"],
 )
-async def list_agent_evaluators(
+def list_agent_evaluators(
     agent_uuid: str = Path(
         description="The agent whose evaluators to list",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -972,7 +998,7 @@ async def list_agent_evaluators(
     summary="Link evaluators to agent",
     tags=["Public API"],
 )
-async def link_evaluators_to_agent(
+def link_evaluators_to_agent(
     agent_uuid: str = Path(
         description="The agent to link the evaluators to",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -1009,7 +1035,7 @@ async def link_evaluators_to_agent(
     "/{agent_uuid}/evaluators/{evaluator_uuid}",
     summary="Unlink evaluator from agent",
 )
-async def unlink_evaluator_from_agent(
+def unlink_evaluator_from_agent(
     agent_uuid: str = Path(
         description="The agent to unlink the evaluator from",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

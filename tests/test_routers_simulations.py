@@ -606,3 +606,77 @@ def test_run_simulation_voice_connection_blocked(client, monkeypatch):
         headers=h,
     )
     assert resp.status_code == 400
+
+
+def test_run_simulation_text_default_inputs_blocked(client, monkeypatch):
+    """A connection agent with default_inputs cannot run text sims."""
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = client.post(
+        "/agents",
+        json={
+            "name": f"conn-{uuid.uuid4().hex[:6]}",
+            "type": "connection",
+            "config": {
+                "agent_url": "https://example.com/agent",
+                "connection_verified": True,
+                "default_inputs": {"foo": "bar"},
+            },
+        },
+        headers=h,
+    ).json()
+    persona = _create_persona(client, h)
+    scenario = _create_scenario(client, h)
+    create = client.post(
+        "/simulations",
+        json={
+            "name": f"sim-{uuid.uuid4().hex[:6]}",
+            "agent_uuid": agent["uuid"],
+            "persona_uuids": [persona["uuid"]],
+            "scenario_uuids": [scenario["uuid"]],
+        },
+        headers=h,
+    ).json()
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    resp = client.post(
+        f"/simulations/{create['uuid']}/run",
+        json={"type": "text"},
+        headers=h,
+    )
+    assert resp.status_code == 400
+
+
+def test_run_simulation_voice_default_inputs_blocked(client, monkeypatch):
+    """A managed agent with default_inputs cannot run voice sims either."""
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = client.post(
+        "/agents",
+        json={
+            "name": f"managed-{uuid.uuid4().hex[:6]}",
+            "type": "agent",
+            "config": {"default_inputs": {"foo": "bar"}},
+        },
+        headers=h,
+    ).json()
+    persona = _create_persona(client, h)
+    scenario = _create_scenario(client, h)
+    create = client.post(
+        "/simulations",
+        json={
+            "name": f"sim-{uuid.uuid4().hex[:6]}",
+            "agent_uuid": agent["uuid"],
+            "persona_uuids": [persona["uuid"]],
+            "scenario_uuids": [scenario["uuid"]],
+        },
+        headers=h,
+    ).json()
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    resp = client.post(
+        f"/simulations/{create['uuid']}/run",
+        json={"type": "voice"},
+        headers=h,
+    )
+    assert resp.status_code == 400

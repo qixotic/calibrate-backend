@@ -82,7 +82,7 @@ _JobsSearch = make_search_params(searchable=["dataset_name"])
 @router.get(
     "", response_model=PaginatedResponse[JobListItem], summary="List jobs"
 )
-async def list_jobs(
+def list_jobs(
     job_type: Optional[JobType] = Query(
         None, description="Filter jobs by type. Omit for all types"
     ),
@@ -116,7 +116,7 @@ class BulkDeleteJobsResponse(BaseModel):
 
 
 @router.delete("", response_model=BulkDeleteJobsResponse, summary="Bulk delete jobs")
-async def bulk_delete_jobs_endpoint(
+def bulk_delete_jobs_endpoint(
     payload: BulkDeleteJobsRequest = ...,
     ctx: OrgContext = Depends(get_current_org),
 ):
@@ -139,7 +139,7 @@ async def bulk_delete_jobs_endpoint(
 
 
 @router.delete("/{job_uuid}", summary="Delete job")
-async def delete_job_endpoint(
+def delete_job_endpoint(
     job_uuid: str = Path(
         description="Job to delete",
         examples=["a3b2c1d0-e5f4-3210-abcd-ef1234567890"],

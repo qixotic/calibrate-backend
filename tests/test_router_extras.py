@@ -630,6 +630,34 @@ def test_agent_verify_connection_paths(client):
     assert bad_url.status_code == 400
 
 
+def test_agent_verify_forwards_default_inputs(client):
+    """Pre-save verify passes default_inputs to the connection and inputs to verify()."""
+    auth = _signup(client)
+    h = auth["headers"]
+
+    fake_agent = MagicMock()
+    fake_agent.verify = AsyncMock(
+        return_value={"ok": True, "sample_output": {"text": "hi"}}
+    )
+    ctor = MagicMock(return_value=fake_agent)
+    fake_addr = [(0, 0, 0, "", ("93.184.216.34", 0))]
+    with patch("routers.agents.TextAgentConnection", ctor), patch(
+        "routers.agents.socket.getaddrinfo", return_value=fake_addr
+    ):
+        resp = client.post(
+            "/agents/verify-connection",
+            json={
+                "agent_url": "https://example.com/agent",
+                "default_inputs": {"trimester": 2},
+                "inputs": {"condition_area": "anc"},
+            },
+            headers=h,
+        )
+    assert resp.status_code == 200
+    assert ctor.call_args.kwargs["default_inputs"] == {"trimester": 2}
+    assert fake_agent.verify.await_args.kwargs["inputs"] == {"condition_area": "anc"}
+
+
 def test_agent_verify_saved_with_model_persists(client):
     auth = _signup(client)
     h = auth["headers"]

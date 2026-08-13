@@ -537,7 +537,7 @@ def build_evaluator_page(
 
 
 @router.post("", response_model=EvaluatorCreateResponse, summary="Create evaluator", tags=["Public API"])
-async def create_evaluator_endpoint(
+def create_evaluator_endpoint(
     payload: EvaluatorCreate, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
 ):
     """Create an evaluator along with its first version, which is set live"""
@@ -596,7 +596,7 @@ class DefaultPromptResponse(BaseModel):
 
 
 @router.get("/default-prompt", response_model=DefaultPromptResponse, summary="Get default prompt")
-async def get_default_prompt(
+def get_default_prompt(
     purpose: Literal["llm", "llm-general", "stt", "tts", "conversation"] = Query(
         description="Evaluation purpose whose canonical default prompt + config to return"
     ),
@@ -621,7 +621,7 @@ async def get_default_prompt(
 
 
 @router.get("", response_model=PaginatedResponse[EvaluatorResponse], summary="List evaluators", tags=["Public API"])
-async def list_evaluators(
+def list_evaluators(
     evaluator_type: Optional[EvaluatorTypeLiteral] = Query(
         None, description="Filter by what the evaluator judges. Omit for all types"
     ),
@@ -651,7 +651,7 @@ async def list_evaluators(
 
 
 @router.get("/{evaluator_uuid}", response_model=EvaluatorDetailResponseCompact, summary="Get evaluator", tags=["Public API"])
-async def get_evaluator_endpoint(
+def get_evaluator_endpoint(
     evaluator_uuid: str = Path(
         description="Evaluator to retrieve",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -680,7 +680,7 @@ async def get_evaluator_endpoint(
 
 
 @router.put("/{evaluator_uuid}", response_model=EvaluatorResponse, summary="Update evaluator")
-async def update_evaluator_endpoint(
+def update_evaluator_endpoint(
     payload: EvaluatorUpdate,
     evaluator_uuid: str = Path(
         description="Evaluator to update",
@@ -714,7 +714,7 @@ async def update_evaluator_endpoint(
 
 
 @router.delete("/{evaluator_uuid}", summary="Delete evaluator")
-async def delete_evaluator_endpoint(
+def delete_evaluator_endpoint(
     evaluator_uuid: str = Path(
         description="Evaluator to delete",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -730,7 +730,7 @@ async def delete_evaluator_endpoint(
 
 
 @router.post("/{evaluator_uuid}/duplicate", response_model=EvaluatorCreateResponse, summary="Duplicate evaluator")
-async def duplicate_evaluator_endpoint(
+def duplicate_evaluator_endpoint(
     payload: EvaluatorDuplicateRequest,
     evaluator_uuid: str = Path(
         description="Evaluator to copy. Must be visible in your workspace",
@@ -760,7 +760,7 @@ async def duplicate_evaluator_endpoint(
 
 
 @router.get("/{evaluator_uuid}/versions", response_model=List[EvaluatorVersionResponse], summary="List evaluator versions")
-async def list_versions(
+def list_versions(
     evaluator_uuid: str = Path(
         description="Evaluator whose versions to list",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -780,7 +780,7 @@ async def list_versions(
 
 
 @router.post("/{evaluator_uuid}/versions", response_model=VersionCreateResponse, summary="Create evaluator version", tags=["Public API"])
-async def create_version(
+def create_version(
     payload: EvaluatorVersionCreateRequest,
     evaluator_uuid: str = Path(
         description="Evaluator to add a version to",
@@ -812,7 +812,7 @@ async def create_version(
 
 
 @router.post("/{evaluator_uuid}/versions/live", summary="Set live version")
-async def mark_live(
+def mark_live(
     payload: SetLiveVersionRequest,
     evaluator_uuid: str = Path(
         description="Evaluator whose live version to set",
@@ -846,7 +846,7 @@ class PromptPreviewRequest(BaseModel):
 
 
 @router.post("/{evaluator_uuid}/preview-prompt", summary="Preview evaluator prompt")
-async def preview_prompt(
+def preview_prompt(
     payload: PromptPreviewRequest,
     evaluator_uuid: str = Path(
         description="Evaluator whose prompt to preview",

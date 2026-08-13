@@ -91,13 +91,13 @@ def _require_membership(org_uuid: str, user_id: str) -> str:
 
 
 @router.get("", response_model=List[OrganizationResponse], summary="List workspaces")
-async def list_orgs(user_id: str = Depends(get_current_user_id)):
+def list_orgs(user_id: str = Depends(get_current_user_id)):
     """List every workspace you are an active member of"""
     return [OrganizationResponse(**o) for o in list_organizations_for_user(user_id)]
 
 
 @router.post("", response_model=OrganizationResponse, status_code=201, summary="Create workspace")
-async def create_org(
+def create_org(
     request: CreateOrganizationRequest,
     user_id: str = Depends(get_current_user_id),
 ):
@@ -108,7 +108,7 @@ async def create_org(
 
 
 @router.patch("/{org_uuid}", response_model=OrganizationResponse, summary="Update workspace")
-async def rename_org(
+def rename_org(
     org_uuid: str = Path(
         description="The workspace to rename. You must be a member",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -124,7 +124,7 @@ async def rename_org(
 
 
 @router.get("/{org_uuid}/members", response_model=List[MemberResponse], summary="List members")
-async def list_members(
+def list_members(
     org_uuid: str = Path(
         description="The workspace whose members to list. You must be a member",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -142,7 +142,7 @@ async def list_members(
     status_code=201,
     summary="Add member",
 )
-async def add_member(
+def add_member(
     org_uuid: str = Path(
         description="The workspace to add a member to. You must be a member",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -168,7 +168,7 @@ async def add_member(
 
 
 @router.delete("/{org_uuid}/members/{target_user_id}", status_code=204, summary="Remove member")
-async def remove_member(
+def remove_member(
     org_uuid: str = Path(
         description="The workspace to remove the member from. You must be a member",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

@@ -29,7 +29,7 @@ router = APIRouter(prefix="/annotation-agreement", tags=["annotation-agreement"]
 
 
 @router.get("/trend", summary="Get workspace agreement trend")
-async def agreement_trend(
+def agreement_trend(
     bucket: str = Query(
         "week",
         pattern="^(week|month|year)$",
@@ -105,7 +105,7 @@ async def agreement_trend(
 
 
 @router.get("/evaluator/{evaluator_uuid}/trend", summary="Get evaluator agreement trend")
-async def evaluator_agreement_trend(
+def evaluator_agreement_trend(
     evaluator_uuid: str = Path(
         description="Evaluator to chart agreement for",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

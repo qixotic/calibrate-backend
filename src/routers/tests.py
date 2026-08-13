@@ -270,6 +270,10 @@ class BulkTestItem(BaseModel):
     tool_calls: Optional[List[ExpectedToolCall]] = Field(
         None, description="Expected tool calls. **Required for `tool_call` batches**"
     )
+    inputs: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Extra request fields for this test, overriding the agent's `default_inputs` per key",
+    )
 
 
 class BulkTestUpload(BaseModel):
@@ -406,7 +410,7 @@ def _with_evaluators(test_dict: Dict[str, Any]) -> Dict[str, Any]:
 @router.post(
     "/bulk-delete", response_model=BulkTestDeleteResponse, summary="Bulk delete tests"
 )
-async def bulk_delete_tests_endpoint(
+def bulk_delete_tests_endpoint(
     payload: BulkTestDelete, ctx: OrgContext = Depends(get_current_org)
 ):
     """Soft-delete multiple tests by ID"""
@@ -429,7 +433,7 @@ async def bulk_delete_tests_endpoint(
     tags=["Public API"],
     summary="Bulk create tests",
 )
-async def bulk_upload_tests(
+def bulk_upload_tests(
     payload: BulkTestUpload, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
 ):
     """Create many test cases at once and link them to your agents"""
@@ -464,6 +468,8 @@ async def bulk_upload_tests(
         }
         if payload.language:
             config["settings"] = {"language": payload.language}
+        if t.inputs:
+            config["inputs"] = t.inputs
 
         db_tests.append(
             {
@@ -519,7 +525,7 @@ async def bulk_upload_tests(
     tags=["Public API"],
     summary="Create test",
 )
-async def create_test_endpoint(
+def create_test_endpoint(
     test: TestCreate, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
 ):
     """Create a test that runs your agent against a conversation and evaluates its answer quality or the tools it calls"""
@@ -557,7 +563,7 @@ async def create_test_endpoint(
     tags=["Public API"],
     summary="List tests",
 )
-async def list_tests(
+def list_tests(
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
     search: _TestSearch = Depends(),
     pagination: OptionalPaginationParams = Depends(),
@@ -578,7 +584,7 @@ async def list_tests(
     tags=["Public API"],
     summary="Get test",
 )
-async def get_test_endpoint(
+def get_test_endpoint(
     test_uuid: str = Path(
         description="Test to retrieve",
         examples=["b1c2d3e4-f5a6-7890-bcde-f12345678901"],
@@ -598,7 +604,7 @@ async def get_test_endpoint(
     tags=["Public API"],
     summary="Update test",
 )
-async def update_test_endpoint(
+def update_test_endpoint(
     test: TestUpdate,
     test_uuid: str = Path(
         description="Test to update",
@@ -665,7 +671,7 @@ async def update_test_endpoint(
 
 
 @router.delete("/{test_uuid}", summary="Delete test")
-async def delete_test_endpoint(
+def delete_test_endpoint(
     test_uuid: str = Path(
         description="Test to delete",
         examples=["b1c2d3e4-f5a6-7890-bcde-f12345678901"],

@@ -6,8 +6,10 @@ import logging
 import threading
 import time
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, List, Literal, Optional, Dict, Any, Union, Tuple
 from urllib.parse import quote
@@ -480,6 +482,41 @@ def is_job_timed_out(
         return False
 
 
+@lru_cache(maxsize=4)
+def _build_s3_client(
+    endpoint_url: Optional[str],
+    aws_access_key_id: Optional[str],
+    aws_secret_access_key: Optional[str],
+    aws_region: str,
+):
+    """Construct (and cache) one boto3 S3 client per credential/endpoint combo.
+
+    Client construction costs ~2ms — negligible once, ruinous in a loop. Read
+    paths that presign per row (e.g. `presign_annotation_items_audio` over a
+    620-item annotation task) called this once per item, which dominated the
+    whole request. Cached on the resolved settings rather than globally so a
+    test or a runtime env change still builds a matching client. boto3 clients
+    are thread-safe for the calls made here (signing + get/put object).
+    """
+    # One shared client means one shared connection pool, so it has to be wide
+    # enough for the request thread pool plus the background job runners —
+    # botocore's default of 10 would leave concurrent artifact transfers opening
+    # and discarding sockets.
+    config_kwargs = {"max_pool_connections": 50}
+    if endpoint_url:
+        config_kwargs["request_checksum_calculation"] = "when_required"
+        config_kwargs["response_checksum_validation"] = "when_required"
+
+    kwargs = {"region_name": aws_region, "config": Config(**config_kwargs)}
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+    if aws_access_key_id and aws_secret_access_key:
+        kwargs["aws_access_key_id"] = aws_access_key_id
+        kwargs["aws_secret_access_key"] = aws_secret_access_key
+
+    return boto3.client("s3", **kwargs)
+
+
 def get_s3_client():
     """Get S3-compatible client. Honors S3_ENDPOINT_URL for GCS interop.
 
@@ -497,23 +534,12 @@ def get_s3_client():
     if is_local_object_storage():
         return None
 
-    endpoint_url = os.getenv("S3_ENDPOINT_URL") or None
-    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID") or None
-    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY") or None
-    aws_region = os.getenv("AWS_REGION") or "ap-south-1"
-
-    kwargs = {"region_name": aws_region}
-    if endpoint_url:
-        kwargs["endpoint_url"] = endpoint_url
-        kwargs["config"] = Config(
-            request_checksum_calculation="when_required",
-            response_checksum_validation="when_required",
-        )
-    if aws_access_key_id and aws_secret_access_key:
-        kwargs["aws_access_key_id"] = aws_access_key_id
-        kwargs["aws_secret_access_key"] = aws_secret_access_key
-
-    return boto3.client("s3", **kwargs)
+    return _build_s3_client(
+        os.getenv("S3_ENDPOINT_URL") or None,
+        os.getenv("AWS_ACCESS_KEY_ID") or None,
+        os.getenv("AWS_SECRET_ACCESS_KEY") or None,
+        os.getenv("AWS_REGION") or "ap-south-1",
+    )
 
 
 LOCAL_STORAGE_BUCKET = "local-dev-artifacts"
@@ -889,8 +915,33 @@ def get_max_concurrent_jobs_per_org() -> int:
     return 1
 
 
-# Job queue lock to ensure thread-safe queue operations
-_job_queue_lock = threading.Lock()
+# Job queue lock to ensure thread-safe queue operations. Reentrant so a caller
+# can hold it across `can_start_*_job(...)` + the job INSERT (see
+# `job_slot`) even though those helpers take it themselves.
+_job_queue_lock = threading.RLock()
+
+
+@contextmanager
+def job_slot(capacity_check: callable):
+    """Claim a queue slot: yields the status a new job should be created with.
+
+    `can_start_*_job(...)` only locks while counting, so on its own it is a
+    check-then-act race: two submissions can both see a free slot and both
+    launch, blowing past MAX_CONCURRENT_JOBS. Request handlers run in the
+    thread pool, so this is reachable from plain concurrent HTTP calls. Write
+    the job row inside the `with` so it counts against the limit before the
+    next caller counts. Starting the worker thread belongs outside.
+
+        with job_slot(lambda: can_start_job(EVAL_JOB_TYPES, org)) as status:
+            job_id = create_job(..., status=status)
+    """
+    with _job_queue_lock:
+        yield (
+            TaskStatus.IN_PROGRESS.value
+            if capacity_check()
+            else TaskStatus.QUEUED.value
+        )
+
 
 # Registry of job starter callbacks by job type
 _job_starters: Dict[str, callable] = {}

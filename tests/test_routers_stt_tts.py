@@ -1100,3 +1100,67 @@ def test_tts_retry_deleted_dataset_returns_clear_error(client, monkeypatch):
     )
     assert resp.status_code == 400
     assert "no longer exists" in resp.json()["detail"]
+
+
+def _lock_held_by_another_thread() -> bool:
+    """True when the job-queue lock is currently held.
+
+    Probed from a separate thread because the lock is reentrant: the calling
+    thread would re-acquire its own lock and learn nothing.
+    """
+    import threading
+
+    import utils
+
+    result = []
+
+    def probe():
+        got = utils._job_queue_lock.acquire(timeout=0.05)
+        result.append(got)
+        if got:
+            utils._job_queue_lock.release()
+
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join()
+    return not result[0]
+
+
+def test_stt_evaluate_holds_queue_lock_across_check_and_create(client, monkeypatch):
+    """Capacity check and job INSERT must happen under one lock hold.
+
+    Without it, two submissions can both see a free slot and both start,
+    exceeding MAX_CONCURRENT_JOBS.
+    """
+    import db as db_mod
+    import routers.stt as stt_mod
+
+    auth = _signup(client)
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+
+    held_during = {}
+    real_create_job = db_mod.create_job
+
+    def capacity_check(*args, **kwargs):
+        held_during["check"] = _lock_held_by_another_thread()
+        return False  # queue the job so no worker thread spawns
+
+    def create_job(*args, **kwargs):
+        held_during["create"] = _lock_held_by_another_thread()
+        return real_create_job(*args, **kwargs)
+
+    monkeypatch.setattr(stt_mod, "can_start_job", capacity_check)
+    monkeypatch.setattr(stt_mod, "create_job", create_job)
+
+    resp = client.post(
+        "/stt/evaluate",
+        json={
+            "providers": ["openai"],
+            "language": "en",
+            "audio_paths": ["s3://b/k.wav"],
+            "texts": ["hello"],
+        },
+        headers=auth["headers"],
+    )
+    assert resp.status_code == 200
+    assert held_during == {"check": True, "create": True}

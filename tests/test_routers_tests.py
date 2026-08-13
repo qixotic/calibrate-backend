@@ -287,6 +287,32 @@ def test_bulk_create_tests_with_api_key(client):
     assert r.json()["count"] == 2
 
 
+def test_bulk_create_tests_preserves_inputs(client):
+    """POST /tests/bulk keeps per-test inputs in config."""
+    jwt = _signup(client)
+    evaluators = client.get("/evaluators", headers=jwt).json()["items"]
+    llm_ev = next(e for e in evaluators if e.get("evaluator_type") == "llm")
+    r = client.post(
+        "/tests/bulk",
+        json={
+            "type": "response",
+            "tests": [
+                {
+                    "name": f"bulk-{uuid.uuid4().hex[:6]}",
+                    "conversation_history": [{"role": "user", "content": "hi"}],
+                    "evaluators": [{"evaluator_uuid": llm_ev["uuid"]}],
+                    "inputs": {"condition_area": "cardiology"},
+                }
+            ],
+        },
+        headers=jwt,
+    )
+    assert r.status_code == 200, r.text
+    test_uuid = r.json()["uuids"][0]
+    config = client.get(f"/tests/{test_uuid}", headers=jwt).json()["config"]
+    assert config["inputs"] == {"condition_area": "cardiology"}
+
+
 def test_bulk_create_rejects_system_role(client):
     """`system` is not a valid conversation_history role — the agent's system
     prompt lives in its config, not the history. Only user/assistant/tool."""

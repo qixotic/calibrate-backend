@@ -234,6 +234,13 @@ def init_db():
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
+        # Write-ahead logging: readers no longer block the writer (or each
+        # other), which matters because request handlers run in FastAPI's
+        # thread pool and background job runners write concurrently. Persisted
+        # in the database file, so setting it once here covers every later
+        # connection.
+        cursor.execute("PRAGMA journal_mode=WAL")
+
         # Create users table first (other tables reference it)
         cursor.execute(
             """

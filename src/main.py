@@ -243,6 +243,10 @@ def _strip_freeform_titles(node: Any) -> None:
 # Keyed by component-schema name.
 _PUBLIC_SPEC_HIDDEN_FIELDS: Dict[str, tuple] = {
     "AgentUpdate": ("connection_verified", "benchmark_models_verified"),
+    # The saved agent's stored `default_inputs` is applied automatically on verify,
+    # so the public verify body stays minimal (model + messages). The per-key
+    # `inputs` override is a JWT/UI convenience, not part of the key API surface.
+    "AgentVerifyRequest": ("inputs",),
     # Auto-increment pivot-row IDs from the link endpoints — internal DB keys a
     # UUID-based public client has no use for. `ids` is too generic to strip
     # globally, so it's pinned to the link responses that return it.
@@ -495,7 +499,7 @@ async def local_artifact(artifact_path: str, request: Request):
 
 
 @app.post("/presigned-url", response_model=PresignedURLResponse)
-async def get_presigned_url(
+def get_presigned_url(
     request: PresignedURLRequest,
     user_id: str = Depends(get_current_user_id),
 ):
@@ -577,7 +581,7 @@ async def get_provider_status(request: Request, refresh: bool = False):
 
 
 @app.get("/providers")
-async def list_available_providers() -> Dict[str, Any]:
+def list_available_providers() -> Dict[str, Any]:
     """
     List providers enabled by the current environment's API keys.
 
@@ -648,5 +652,5 @@ async def list_openrouter_providers() -> Optional[Dict[str, Any]]:
 
 
 @app.get("/sentry-debug")
-async def trigger_error():
+def trigger_error():
     division_by_zero = 1 / 0

@@ -15,6 +15,7 @@ from annotation_metrics import (
     aggregate_human_evaluator_agreement,
     build_buckets,
     evaluator_human_pair_agreement,
+    evaluator_result_summary,
     filter_runs_to_live_versions,
     has_any_comparable_pair,
     per_item_agreement,
@@ -126,6 +127,39 @@ def test_evaluator_human_pair_agreement():
     # eval = numeric; mismatched-type humans are skipped
     total, pairs = evaluator_human_pair_agreement(3, [3, "foo"])
     assert pairs == 1
+
+
+def test_evaluator_result_summary():
+    assert evaluator_result_summary([], "e1") == {
+        "count": 0,
+        "true_count": None,
+        "mean": None,
+    }
+
+    binary_runs = [
+        {"item_id": "i1", "evaluator_id": "e1", "value": {"value": True}},
+        {"item_id": "i2", "evaluator_id": "e1", "value": {"value": False}},
+        # Latest run wins for the same item
+        {"item_id": "i1", "evaluator_id": "e1", "value": {"value": False}, "completed_at": "2024-02-01 00:00:00"},
+        # Other evaluator, and a failed run with no value
+        {"item_id": "i3", "evaluator_id": "e2", "value": {"value": True}},
+        {"item_id": "i4", "evaluator_id": "e1", "value": None},
+    ]
+    assert evaluator_result_summary(binary_runs, "e1") == {
+        "count": 2,
+        "true_count": 0,
+        "mean": None,
+    }
+
+    rating_runs = [
+        {"item_id": "i1", "evaluator_id": "e1", "value": {"value": 4}},
+        {"item_id": "i2", "evaluator_id": "e1", "value": {"value": 3}},
+    ]
+    assert evaluator_result_summary(rating_runs, "e1") == {
+        "count": 2,
+        "true_count": None,
+        "mean": 3.5,
+    }
 
 
 def test_aggregate_human_evaluator_agreement_empty():

@@ -30,6 +30,7 @@ from dataset_utils import (
 from auth_utils import get_current_org, OrgContext
 from llm_judge import build_evaluator_cli_payload, refresh_evaluators_to_live
 from utils import (
+    job_slot,
     TaskStatus,
     ProviderResult,
     TaskCreateResponse,
@@ -692,7 +693,7 @@ def run_tts_evaluation_task(
 
 
 @router.post("/evaluate", response_model=TaskCreateResponse, summary="Run TTS evaluation")
-async def evaluate_tts(
+def evaluate_tts(
     request: TTSEvaluationRequest, ctx: OrgContext = Depends(get_current_org)
 ):
     """Benchmark TTS providers against text inputs as a background job"""
@@ -728,30 +729,28 @@ async def evaluate_tts(
         expected_evaluator_type="tts",
     )
 
-    can_start = can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
-    initial_status = (
-        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
-    )
+    with job_slot(
+        lambda: can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
+    ) as initial_status:
+        job_id = create_job(
+            job_type="tts-eval",
+            org_uuid=ctx.org_uuid,
+            user_id=ctx.user_id,
+            status=initial_status,
+            details={
+                "texts": texts,
+                "providers": request.providers,
+                "language": request.language,
+                "s3_bucket": s3_bucket,
+                "dataset_id": resolved_dataset_id,
+                "dataset_name": resolved_dataset_name,
+                "dataset_item_ids": dataset_item_ids,
+                "evaluators": resolved_evaluators,
+            },
+            results=None,
+        )
 
-    job_id = create_job(
-        job_type="tts-eval",
-        org_uuid=ctx.org_uuid,
-        user_id=ctx.user_id,
-        status=initial_status,
-        details={
-            "texts": texts,
-            "providers": request.providers,
-            "language": request.language,
-            "s3_bucket": s3_bucket,
-            "dataset_id": resolved_dataset_id,
-            "dataset_name": resolved_dataset_name,
-            "dataset_item_ids": dataset_item_ids,
-            "evaluators": resolved_evaluators,
-        },
-        results=None,
-    )
-
-    if can_start:
+    if initial_status == TaskStatus.IN_PROGRESS.value:
         # Start background task in a separate thread
         thread = threading.Thread(
             target=run_tts_evaluation_task,
@@ -776,7 +775,7 @@ async def evaluate_tts(
     response_model=TaskCreateResponse,
     summary="Retry TTS evaluation",
 )
-async def retry_tts_evaluation(
+def retry_tts_evaluation(
     task_id: str = PathParam(
         description="The TTS evaluation to re-run",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -823,21 +822,19 @@ async def retry_tts_evaluation(
         "evaluators": details.get("evaluators", []),
     }
 
-    can_start = can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
-    initial_status = (
-        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
-    )
-
-    update_job(
-        task_id,
-        status=initial_status,
-        results={},
-        details=rerun_details,
-        replace_details=True,
-    )
+    with job_slot(
+        lambda: can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
+    ) as initial_status:
+        update_job(
+            task_id,
+            status=initial_status,
+            results={},
+            details=rerun_details,
+            replace_details=True,
+        )
 
     request = _tts_request_from_job_details(rerun_details)
-    if can_start:
+    if initial_status == TaskStatus.IN_PROGRESS.value:
         thread = threading.Thread(
             target=run_tts_evaluation_task,
             args=(task_id, request, s3_bucket),
@@ -875,7 +872,7 @@ class VisibilityResponse(BaseModel):
     response_model=VisibilityResponse,
     summary="Update TTS evaluation visibility",
 )
-async def update_tts_visibility(
+def update_tts_visibility(
     body: VisibilityRequest,
     task_id: str = PathParam(
         description="The TTS evaluation to update",
@@ -902,7 +899,7 @@ async def update_tts_visibility(
     response_model=TaskStatusResponse,
     summary="Get TTS evaluation status",
 )
-async def get_tts_evaluation_status(
+def get_tts_evaluation_status(
     task_id: str = PathParam(
         description="The TTS evaluation to poll",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

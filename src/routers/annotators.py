@@ -76,7 +76,7 @@ def _ensure_owned_annotator(annotator_uuid: str, org_uuid: str):
 
 
 @router.post("", response_model=AnnotatorCreateResponse, summary="Create annotator")
-async def create_annotator_endpoint(
+def create_annotator_endpoint(
     payload: AnnotatorCreate,
     ctx: OrgContext = Depends(get_current_org),
 ):
@@ -96,7 +96,7 @@ async def create_annotator_endpoint(
 
 
 @router.get("", response_model=List[AnnotatorResponse], summary="List annotators")
-async def list_annotators(ctx: OrgContext = Depends(get_current_org)):
+def list_annotators(ctx: OrgContext = Depends(get_current_org)):
     """List annotators with job counts and agreement stats"""
     annotators = get_all_annotators(org_uuid=ctx.org_uuid)
     if not annotators:
@@ -120,7 +120,7 @@ async def list_annotators(ctx: OrgContext = Depends(get_current_org)):
 
 
 @router.get("/{annotator_uuid}", summary="Get annotator")
-async def get_annotator_endpoint(
+def get_annotator_endpoint(
     annotator_uuid: str = Path(
         description="Annotator to retrieve",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -172,7 +172,7 @@ async def get_annotator_endpoint(
 
 
 @router.put("/{annotator_uuid}", response_model=AnnotatorResponse, summary="Update annotator")
-async def update_annotator_endpoint(
+def update_annotator_endpoint(
     annotator_uuid: str = Path(
         description="Annotator to update",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -199,7 +199,7 @@ async def update_annotator_endpoint(
 
 
 @router.delete("/{annotator_uuid}", summary="Delete annotator")
-async def delete_annotator_endpoint(
+def delete_annotator_endpoint(
     annotator_uuid: str = Path(
         description="Annotator to delete",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

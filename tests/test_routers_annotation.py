@@ -1514,6 +1514,11 @@ def test_annotation_task_agreement_and_summary(client):
     # Empty agreement
     agree = client.get(f"/annotation-tasks/{task_uuid}/agreement", headers=h)
     assert agree.status_code == 200
+    assert agree.json()["evaluators"][0]["result"] == {
+        "count": 0,
+        "true_count": None,
+        "mean": None,
+    }
     # missing task
     assert (
         client.get("/annotation-tasks/missing/agreement", headers=h).status_code == 404

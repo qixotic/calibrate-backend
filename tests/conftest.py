@@ -54,3 +54,18 @@ def initialized_db():
     db.init_db()
     run_traces_migrations()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_s3_client_cache():
+    """Drop the cached boto3 client between tests.
+
+    `utils._build_s3_client` caches per credential set, so a client built while
+    `boto3.client` was patched would otherwise be handed to a later test, and a
+    test asserting that construction happens would see a cache hit instead.
+    """
+    import utils
+
+    utils._build_s3_client.cache_clear()
+    yield
+    utils._build_s3_client.cache_clear()

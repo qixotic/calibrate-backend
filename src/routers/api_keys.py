@@ -102,7 +102,7 @@ class CreateApiKeyResponse(ApiKeyResponse):
 @router.post(
     "", response_model=CreateApiKeyResponse, status_code=201, summary="Create API key"
 )
-async def create_key(
+def create_key(
     request: CreateApiKeyRequest,
     ctx: OrgContext = Depends(get_current_org),
 ):
@@ -120,13 +120,13 @@ async def create_key(
 
 
 @router.get("", response_model=List[ApiKeyResponse], summary="List API keys")
-async def list_keys(ctx: OrgContext = Depends(get_current_org)):
+def list_keys(ctx: OrgContext = Depends(get_current_org)):
     """List active API keys"""
     return [ApiKeyResponse.from_row(k) for k in list_api_keys_for_org(ctx.org_uuid)]
 
 
 @router.delete("/{key_uuid}", status_code=204, summary="Revoke API key")
-async def revoke_key(
+def revoke_key(
     key_uuid: str = Path(
         description="The API key to revoke",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

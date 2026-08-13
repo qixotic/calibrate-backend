@@ -60,7 +60,7 @@ class ScenarioCreateResponse(BaseModel):
 
 
 @router.post("", response_model=ScenarioCreateResponse, summary="Create scenario")
-async def create_scenario_endpoint(
+def create_scenario_endpoint(
     scenario: ScenarioCreate, ctx: OrgContext = Depends(get_current_org)
 ):
     """Create a new scenario"""
@@ -77,14 +77,14 @@ async def create_scenario_endpoint(
 
 
 @router.get("", response_model=List[ScenarioResponse], summary="List scenarios")
-async def list_scenarios(ctx: OrgContext = Depends(get_current_org)):
+def list_scenarios(ctx: OrgContext = Depends(get_current_org)):
     """List your scenarios"""
     scenarios = get_all_scenarios(org_uuid=ctx.org_uuid)
     return scenarios
 
 
 @router.get("/{scenario_uuid}", response_model=ScenarioResponse, summary="Get scenario")
-async def get_scenario_endpoint(
+def get_scenario_endpoint(
     scenario_uuid: str = Path(
         description="The scenario to retrieve",
         examples=[_EXAMPLE_ID],
@@ -99,7 +99,7 @@ async def get_scenario_endpoint(
 
 
 @router.put("/{scenario_uuid}", response_model=ScenarioResponse, summary="Update scenario")
-async def update_scenario_endpoint(
+def update_scenario_endpoint(
     scenario: ScenarioUpdate,
     scenario_uuid: str = Path(
         description="The scenario to update",
@@ -133,7 +133,7 @@ async def update_scenario_endpoint(
 
 
 @router.delete("/{scenario_uuid}", summary="Delete scenario")
-async def delete_scenario_endpoint(
+def delete_scenario_endpoint(
     scenario_uuid: str = Path(
         description="The scenario to delete",
         examples=[_EXAMPLE_ID],

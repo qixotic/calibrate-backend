@@ -239,6 +239,31 @@ def _latest_evaluator_value_per_slot(
     return out
 
 
+def evaluator_result_summary(
+    evaluator_runs: Iterable[Dict[str, Any]],
+    evaluator_id: str,
+) -> Dict[str, Any]:
+    """Roll one evaluator's own judgements up into `{count, true_count, mean}`.
+
+    Same per-slot value the summary table shows (latest run per item), so the
+    two screens can't disagree. `true_count` is set for binary values and
+    `mean` for numeric ones; the other stays None.
+    """
+    values = [
+        value
+        for (value, _ts) in _latest_evaluator_value_per_slot(
+            evaluator_runs, evaluator_id
+        ).values()
+    ]
+    bools = [v for v in values if isinstance(v, bool)]
+    numbers = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return {
+        "count": len(values),
+        "true_count": sum(1 for v in bools if v) if bools else None,
+        "mean": _round_agreement(sum(numbers) / len(numbers)) if numbers else None,
+    }
+
+
 def evaluator_human_pair_agreement(
     eval_value: Any,
     human_values: Iterable[Any],

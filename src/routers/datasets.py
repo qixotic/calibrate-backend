@@ -152,7 +152,7 @@ def _dataset_row_to_response(
 
 
 @router.post("", response_model=DatasetResponse, status_code=201, summary="Create dataset")
-async def create_new_dataset(
+def create_new_dataset(
     request: DatasetCreateRequest,
     ctx: OrgContext = Depends(get_current_org),
 ):
@@ -169,7 +169,7 @@ async def create_new_dataset(
 
 
 @router.get("", response_model=List[DatasetResponse], summary="List datasets")
-async def list_datasets(
+def list_datasets(
     dataset_type: Optional[str] = Query(
         None, description="Filter by dataset type (`stt` or `tts`). Omit to return all types"
     ),
@@ -196,7 +196,7 @@ async def list_datasets(
 
 
 @router.get("/{dataset_id}", response_model=DatasetDetailResponse, summary="Get dataset")
-async def get_dataset_detail(
+def get_dataset_detail(
     dataset_id: str = Path(
         description="The dataset to retrieve",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -223,7 +223,7 @@ async def get_dataset_detail(
 
 
 @router.patch("/{dataset_id}", response_model=DatasetResponse, summary="Update dataset")
-async def rename_dataset(
+def rename_dataset(
     request: DatasetRenameRequest,
     dataset_id: str = Path(
         description="The dataset to rename",
@@ -251,7 +251,7 @@ async def rename_dataset(
 
 
 @router.delete("/{dataset_id}", status_code=204, summary="Delete dataset")
-async def remove_dataset(
+def remove_dataset(
     dataset_id: str = Path(
         description="The dataset to delete",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -272,7 +272,7 @@ async def remove_dataset(
     status_code=201,
     summary="Bulk create dataset items",
 )
-async def add_items(
+def add_items(
     items: List[DatasetItemIn],
     dataset_id: str = Path(
         description="The dataset to add items to",
@@ -305,7 +305,7 @@ async def add_items(
     response_model=DatasetItemResponse,
     summary="Update dataset item",
 )
-async def update_item(
+def update_item(
     request: DatasetItemUpdate,
     dataset_id: str = Path(
         description="The dataset containing the item",
@@ -357,7 +357,7 @@ async def update_item(
 @router.delete(
     "/{dataset_id}/items/{item_uuid}", status_code=204, summary="Delete dataset item"
 )
-async def remove_item(
+def remove_item(
     dataset_id: str = Path(
         description="The dataset containing the item",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

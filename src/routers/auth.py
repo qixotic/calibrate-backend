@@ -139,7 +139,7 @@ class CredentialLoginRequest(BaseModel):
 
 
 @router.post("/signup", response_model=LoginResponse, summary="Sign up with email and password")
-async def signup(request: SignupRequest):
+def signup(request: SignupRequest):
     """Create an account with email and password and receive a JWT plus your profile"""
     # 409 if email already has a password; invite stub rows (no password yet) are hydrated in place.
     # A row may already exist as a stub created by an org invite (no
@@ -185,7 +185,7 @@ async def signup(request: SignupRequest):
 
 
 @router.post("/login", response_model=LoginResponse, summary="Log in with email and password")
-async def login(request: CredentialLoginRequest):
+def login(request: CredentialLoginRequest):
     """Log in with email and password and receive a JWT plus your profile"""
     user = get_user_by_email(request.email)
     if not user or not user.get("password_hash"):

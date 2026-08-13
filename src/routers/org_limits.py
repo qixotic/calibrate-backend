@@ -95,7 +95,7 @@ class OrgLimitsCreateResponse(BaseModel):
 
 
 @router.get("/me/max-rows-per-eval", summary="Get own max rows per eval")
-async def get_max_rows_per_eval(ctx: OrgContext = Depends(get_current_org)):
+def get_max_rows_per_eval(ctx: OrgContext = Depends(get_current_org)):
     """Get the max rows per eval"""
     # Falls back to DEFAULT_MAX_ROWS_PER_EVAL when no workspace-specific limit is set.
     limits = get_org_limits(ctx.org_uuid)
@@ -111,7 +111,7 @@ async def get_max_traces(ctx: OrgContext = Depends(get_current_org)):
 
 
 @router.post("", response_model=OrgLimitsCreateResponse, summary="Create workspace limits")
-async def create_org_limits_endpoint(
+def create_org_limits_endpoint(
     data: OrgLimitsCreate, user_id: str = Depends(require_superadmin)
 ):
     """Create limits for a workspace. Superadmin only"""
@@ -137,7 +137,7 @@ async def create_org_limits_endpoint(
 
 
 @router.get("/{target_org_uuid}", response_model=OrgLimitsResponse, summary="Get workspace limits")
-async def get_org_limits_endpoint(
+def get_org_limits_endpoint(
     target_org_uuid: str = Path(
         description="The workspace whose limits to read. You must be a member",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -154,7 +154,7 @@ async def get_org_limits_endpoint(
 
 
 @router.put("/{target_org_uuid}", response_model=OrgLimitsResponse, summary="Update workspace limits")
-async def update_org_limits_endpoint(
+def update_org_limits_endpoint(
     target_org_uuid: str = Path(
         description="The workspace whose limits to update",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -170,7 +170,7 @@ async def update_org_limits_endpoint(
 
 
 @router.delete("/{target_org_uuid}", summary="Delete workspace limits")
-async def delete_org_limits_endpoint(
+def delete_org_limits_endpoint(
     target_org_uuid: str = Path(
         description="The workspace whose limits to delete",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

@@ -29,6 +29,7 @@ from dataset_utils import (
 from auth_utils import get_current_org, OrgContext
 from llm_judge import build_evaluator_cli_payload, refresh_evaluators_to_live
 from utils import (
+    job_slot,
     TaskStatus,
     ProviderResult,
     TaskCreateResponse,
@@ -675,7 +676,7 @@ def run_evaluation_task(
 
 
 @router.post("/evaluate", response_model=TaskCreateResponse, summary="Run STT evaluation")
-async def evaluate_stt(
+def evaluate_stt(
     request: STTEvaluationRequest, ctx: OrgContext = Depends(get_current_org)
 ):
     """Benchmark STT providers against a dataset as a background job"""
@@ -713,32 +714,28 @@ async def evaluate_stt(
         expected_evaluator_type="stt",
     )
 
-    can_start = can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
-    initial_status = (
-        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
-    )
+    with job_slot(lambda: can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)) as initial_status:
+        job_id = create_job(
+            job_type="stt-eval",
+            org_uuid=ctx.org_uuid,
+            user_id=ctx.user_id,
+            status=initial_status,
+            details={
+                "audio_paths": audio_paths,
+                "texts": texts,
+                "providers": request.providers,
+                "language": request.language,
+                "s3_bucket": s3_bucket,
+                "dataset_id": resolved_dataset_id,
+                "dataset_name": resolved_dataset_name,
+                "dataset_item_ids": dataset_item_ids,
+                "evaluators": resolved_evaluators,
+                "sarvam_judges": request.sarvam_judges,
+            },
+            results=None,
+        )
 
-    job_id = create_job(
-        job_type="stt-eval",
-        org_uuid=ctx.org_uuid,
-        user_id=ctx.user_id,
-        status=initial_status,
-        details={
-            "audio_paths": audio_paths,
-            "texts": texts,
-            "providers": request.providers,
-            "language": request.language,
-            "s3_bucket": s3_bucket,
-            "dataset_id": resolved_dataset_id,
-            "dataset_name": resolved_dataset_name,
-            "dataset_item_ids": dataset_item_ids,
-            "evaluators": resolved_evaluators,
-            "sarvam_judges": request.sarvam_judges,
-        },
-        results=None,
-    )
-
-    if can_start:
+    if initial_status == TaskStatus.IN_PROGRESS.value:
         # Start background task in a separate thread
         thread = threading.Thread(
             target=run_evaluation_task,
@@ -763,7 +760,7 @@ async def evaluate_stt(
     response_model=TaskCreateResponse,
     summary="Retry STT evaluation",
 )
-async def retry_stt_evaluation(
+def retry_stt_evaluation(
     task_id: str = PathParam(
         description="The STT evaluation to re-run",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
@@ -812,21 +809,19 @@ async def retry_stt_evaluation(
         "sarvam_judges": details.get("sarvam_judges", True),
     }
 
-    can_start = can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
-    initial_status = (
-        TaskStatus.IN_PROGRESS.value if can_start else TaskStatus.QUEUED.value
-    )
-
-    update_job(
-        task_id,
-        status=initial_status,
-        results={},
-        details=rerun_details,
-        replace_details=True,
-    )
+    with job_slot(
+        lambda: can_start_job(EVAL_JOB_TYPES, ctx.org_uuid)
+    ) as initial_status:
+        update_job(
+            task_id,
+            status=initial_status,
+            results={},
+            details=rerun_details,
+            replace_details=True,
+        )
 
     request = _stt_request_from_job_details(rerun_details)
-    if can_start:
+    if initial_status == TaskStatus.IN_PROGRESS.value:
         thread = threading.Thread(
             target=run_evaluation_task,
             args=(task_id, request, s3_bucket),
@@ -864,7 +859,7 @@ class VisibilityResponse(BaseModel):
     response_model=VisibilityResponse,
     summary="Update STT evaluation visibility",
 )
-async def update_stt_visibility(
+def update_stt_visibility(
     body: VisibilityRequest,
     task_id: str = PathParam(
         description="The STT evaluation to update",
@@ -891,7 +886,7 @@ async def update_stt_visibility(
     response_model=TaskStatusResponse,
     summary="Get STT evaluation status",
 )
-async def get_evaluation_status(
+def get_evaluation_status(
     task_id: str = PathParam(
         description="The STT evaluation to poll",
         examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],

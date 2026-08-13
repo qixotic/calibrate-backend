@@ -430,7 +430,7 @@ def _public_default_evaluator_response(
     response_model=List[PublicDefaultEvaluatorResponse],
     summary="List public default evaluators",
 )
-async def get_public_default_evaluators(
+def get_public_default_evaluators(
     share_token: str = Query(..., min_length=1, description="Share token that grants access to the linked run"),
     types: Optional[str] = Query(
         None,
@@ -452,7 +452,7 @@ async def get_public_default_evaluators(
 
 
 @router.get("/stt/{share_token}", response_model=PublicSTTResponse, summary="Get shared STT run")
-async def get_public_stt(
+def get_public_stt(
     share_token: str = Path(description="Share token for the STT run"),
 ):
     """Get a shared STT evaluation result"""
@@ -524,7 +524,7 @@ async def get_public_stt(
 
 
 @router.get("/tts/{share_token}", response_model=PublicTTSResponse, summary="Get shared TTS run")
-async def get_public_tts(
+def get_public_tts(
     share_token: str = Path(description="Share token for the TTS run"),
 ):
     """Get a shared TTS evaluation result"""
@@ -578,7 +578,7 @@ async def get_public_tts(
 
 
 @router.get("/test-run/{share_token}", response_model=PublicTestRunResponse, summary="Get shared test run")
-async def get_public_test_run(
+def get_public_test_run(
     share_token: str = Path(description="Share token for the LLM test run"),
 ):
     """Get a shared LLM test run result"""
@@ -618,7 +618,7 @@ async def get_public_test_run(
 
 
 @router.get("/benchmark/{share_token}", response_model=PublicBenchmarkResponse, summary="Get shared benchmark")
-async def get_public_benchmark(
+def get_public_benchmark(
     share_token: str = Path(description="Share token for the LLM benchmark run"),
 ):
     """Get a shared LLM benchmark result"""
@@ -653,7 +653,7 @@ async def get_public_benchmark(
 
 
 @router.get("/simulation-run/{share_token}", response_model=PublicSimulationRunResponse, summary="Get shared simulation run")
-async def get_public_simulation_run(
+def get_public_simulation_run(
     share_token: str = Path(description="Share token for the simulation run"),
 ):
     """Get a shared simulation run result"""
@@ -700,7 +700,7 @@ async def get_public_simulation_run(
     response_model=PublicAnnotationEvalResponse,
     summary="Get shared annotation eval run",
 )
-async def get_public_annotation_eval(
+def get_public_annotation_eval(
     share_token: str = Path(description="Share token for the annotation evaluator run"),
 ):
     """Get a shared annotation evaluator-run result"""
