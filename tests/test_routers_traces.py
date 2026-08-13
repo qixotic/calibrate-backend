@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Optional
 from unittest.mock import patch
 
 import pytest
@@ -43,9 +44,34 @@ def _api_key_headers(client, h):
     return {"X-API-Key": created.json()["key"]}
 
 
-def _payload(message_id: str, conversation_id: str = "conv-1", **overrides):
+def _create_agent(client, h) -> str:
+    created = client.post(
+        "/agents",
+        json={"name": f"agent-{uuid.uuid4().hex[:8]}", "type": "agent"},
+        headers=h,
+    )
+    assert created.status_code in (200, 201), created.text
+    return created.json()["uuid"]
+
+
+def _signup_with_agent(client):
+    h = _signup(client)
+    return h, _create_agent(client, h)
+
+
+def _mid() -> str:
+    return f"m-{uuid.uuid4().hex[:10]}"
+
+
+def _payload(
+    agent_id: str,
+    message_id: Optional[str] = None,
+    conversation_id: str = "conv-1",
+    **overrides,
+):
     payload = {
-        "message_id": message_id,
+        "agent_id": agent_id,
+        "message_id": message_id or _mid(),
         "conversation_id": conversation_id,
         "input": [
             {"role": "system", "content": "You are a vaccination assistant."},
@@ -63,90 +89,149 @@ def _payload(message_id: str, conversation_id: str = "conv-1", **overrides):
     return payload
 
 
-def _mid() -> str:
-    return f"m-{uuid.uuid4().hex[:10]}"
-
-
 # ---------------------------------------------------------------------------
 # Ingestion
 # ---------------------------------------------------------------------------
 
 
 def test_ingest_requires_auth(client):
-    assert client.post("/traces", json=_payload(_mid())).status_code in (401, 403)
+    h, agent = _signup_with_agent(client)
+    assert client.post("/traces", json=_payload(agent)).status_code in (401, 403)
     assert (
         client.post(
-            "/traces", json=_payload(_mid()), headers={"X-API-Key": "sk_bogus"}
+            "/traces", json=_payload(agent), headers={"X-API-Key": "sk_bogus"}
         ).status_code
         == 401
     )
 
 
 def test_ingest_with_jwt_is_idempotent(client):
-    h = _signup(client)
+    h, agent = _signup_with_agent(client)
     mid = _mid()
 
-    first = client.post("/traces", json=_payload(mid), headers=h)
+    first = client.post("/traces", json=_payload(agent, mid), headers=h)
     assert first.status_code == 200, first.text
     body = first.json()
     assert body["created"] is True
     assert len(body["uuid"]) == 36
+    assert body["agent_id"] == agent
     assert body["message_id"] == mid
     assert body["conversation_id"] == "conv-1"
     assert body["created_at"].endswith("Z") and "T" in body["created_at"]
 
-    retry = client.post("/traces", json=_payload(mid), headers=h)
+    retry = client.post("/traces", json=_payload(agent, mid), headers=h)
     assert retry.status_code == 200
     assert retry.json()["created"] is False
     assert retry.json()["uuid"] == body["uuid"]
 
 
 def test_ingest_with_api_key(client):
-    h = _signup(client)
+    h, agent = _signup_with_agent(client)
     key_headers = _api_key_headers(client, h)
 
-    res = client.post("/traces", json=_payload(_mid()), headers=key_headers)
+    res = client.post("/traces", json=_payload(agent), headers=key_headers)
     assert res.status_code == 200, res.text
     assert res.json()["created"] is True
 
 
+def test_ingest_requires_a_known_agent(client):
+    h, agent = _signup_with_agent(client)
+
+    # Missing entirely, or blank, is a schema error.
+    no_agent = _payload(agent)
+    del no_agent["agent_id"]
+    assert client.post("/traces", json=no_agent, headers=h).status_code == 422
+    assert client.post("/traces", json=_payload(""), headers=h).status_code == 422
+
+    # A well-formed but unknown id is a 404, and nothing is stored.
+    unknown = _payload("00000000-0000-4000-8000-000000000001")
+    assert client.post("/traces", json=unknown, headers=h).status_code == 404
+    assert client.get("/traces", headers=h).json()["total"] == 0
+
+    # A malformed id lands on the same 404 rather than a third error shape.
+    assert client.post("/traces", json=_payload("nope"), headers=h).status_code == 404
+
+
+def test_ingest_rejects_another_workspaces_agent(client):
+    h, _agent = _signup_with_agent(client)
+    _other_h, other_agent = _signup_with_agent(client)
+
+    # Cross-workspace must be indistinguishable from nonexistent.
+    res = client.post("/traces", json=_payload(other_agent), headers=h)
+    assert res.status_code == 404
+    assert res.json()["detail"] == "Agent not found"
+    assert client.get("/traces", headers=h).json()["total"] == 0
+
+
+def test_ingest_agent_check_precedes_idempotency(client):
+    """A retry naming an unknown agent must fail the same way as the first call."""
+    h, agent = _signup_with_agent(client)
+    mid = _mid()
+    assert (
+        client.post("/traces", json=_payload(agent, mid), headers=h).status_code == 200
+    )
+
+    retry = client.post(
+        "/traces",
+        json=_payload("00000000-0000-4000-8000-000000000002", mid),
+        headers=h,
+    )
+    assert retry.status_code == 404
+
+
+def test_reingest_under_a_different_agent_returns_the_stored_trace(client):
+    """The idempotency key stays workspace-scoped, so the turn does not move."""
+    h, agent = _signup_with_agent(client)
+    second_agent = _create_agent(client, h)
+    mid = _mid()
+
+    first = client.post("/traces", json=_payload(agent, mid), headers=h).json()
+    retry = client.post("/traces", json=_payload(second_agent, mid), headers=h)
+
+    assert retry.status_code == 200
+    body = retry.json()
+    assert body["created"] is False
+    assert body["uuid"] == first["uuid"]
+    assert body["agent_id"] == agent
+
+
 def test_ingest_validation(client):
-    h = _signup(client)
+    h, agent = _signup_with_agent(client)
 
     # output is required.
-    bad = _payload(_mid())
+    bad = _payload(agent)
     del bad["output"]
     assert client.post("/traces", json=bad, headers=h).status_code == 422
 
     # output needs a response or at least one tool call.
-    empty_output = _payload(_mid(), output={"response": "  ", "tool_calls": None})
+    empty_output = _payload(agent, output={"response": "  ", "tool_calls": None})
     assert client.post("/traces", json=empty_output, headers=h).status_code == 422
 
     # Tool-call-only turns are legal.
     tool_only = _payload(
-        _mid(), output={"tool_calls": [{"tool": "get_schedule", "arguments": {}}]}
+        agent, output={"tool_calls": [{"tool": "get_schedule", "arguments": {}}]}
     )
     ok = client.post("/traces", json=tool_only, headers=h)
     assert ok.status_code == 200 and ok.json()["created"] is True
 
     # input must be non-empty.
     assert (
-        client.post("/traces", json=_payload(_mid(), input=[]), headers=h).status_code
+        client.post("/traces", json=_payload(agent, input=[]), headers=h).status_code
         == 422
     )
 
     # Unknown top-level keys are rejected; new needs belong in metadata.
-    extra_top = _payload(_mid())
+    extra_top = _payload(agent)
     extra_top["custom_fields"] = []
     assert client.post("/traces", json=extra_top, headers=h).status_code == 422
 
     # Metadata entries are strict {key, value} pairs.
-    bad_meta = _payload(_mid(), metadata=[{"key": "k", "value": "v", "extra": 1}])
+    bad_meta = _payload(agent, metadata=[{"key": "k", "value": "v", "extra": 1}])
     assert client.post("/traces", json=bad_meta, headers=h).status_code == 422
 
     # OpenAI-format extras on input turns pass through (tool_calls, tool_call_id).
     openai_history = _payload(
-        _mid(),
+        agent,
         input=[
             {"role": "user", "content": "check the schedule"},
             {
@@ -170,13 +255,16 @@ def test_ingest_validation(client):
 def test_ingest_cap_returns_429_but_keeps_retries_idempotent(client, monkeypatch):
     from routers import org_limits as org_limits_mod
 
-    h = _signup(client)
+    h, agent = _signup_with_agent(client)
     monkeypatch.setattr(org_limits_mod, "DEFAULT_MAX_TRACES", 1)
 
     first_mid = _mid()
-    assert client.post("/traces", json=_payload(first_mid), headers=h).status_code == 200
+    assert (
+        client.post("/traces", json=_payload(agent, first_mid), headers=h).status_code
+        == 200
+    )
 
-    capped = client.post("/traces", json=_payload(_mid()), headers=h)
+    capped = client.post("/traces", json=_payload(agent), headers=h)
     assert capped.status_code == 429
     detail = capped.json()["detail"]
     assert detail["current"] == 1
@@ -184,9 +272,21 @@ def test_ingest_cap_returns_429_but_keeps_retries_idempotent(client, monkeypatch
     assert "hint" in detail
 
     # A retry of an already-stored message_id still succeeds at the cap.
-    retry = client.post("/traces", json=_payload(first_mid), headers=h)
+    retry = client.post("/traces", json=_payload(agent, first_mid), headers=h)
     assert retry.status_code == 200
     assert retry.json()["created"] is False
+
+
+def test_cap_counts_the_whole_workspace_not_one_agent(client, monkeypatch):
+    from routers import org_limits as org_limits_mod
+
+    h, agent = _signup_with_agent(client)
+    second_agent = _create_agent(client, h)
+    monkeypatch.setattr(org_limits_mod, "DEFAULT_MAX_TRACES", 1)
+
+    assert client.post("/traces", json=_payload(agent), headers=h).status_code == 200
+    capped = client.post("/traces", json=_payload(second_agent), headers=h)
+    assert capped.status_code == 429
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +309,10 @@ def test_curation_endpoints_are_jwt_only(client):
 
 
 def test_list_and_detail_roundtrip(client):
-    h = _signup(client)
+    h, agent = _signup_with_agent(client)
 
     mid_a = _mid()
-    client.post(
-        "/traces", json=_payload(mid_a, conversation_id="conv-a"), headers=h
-    )
+    client.post("/traces", json=_payload(agent, mid_a, "conv-a"), headers=h)
     mid_b = _mid()
     openai_extras = [
         {"role": "user", "content": "check the POLIO schedule"},
@@ -234,7 +332,7 @@ def test_list_and_detail_roundtrip(client):
     ]
     created_b = client.post(
         "/traces",
-        json=_payload(mid_b, conversation_id="conv-b", input=openai_extras),
+        json=_payload(agent, mid_b, "conv-b", input=openai_extras),
         headers=h,
     ).json()
 
@@ -246,6 +344,7 @@ def test_list_and_detail_roundtrip(client):
     # Newest first.
     assert [item["message_id"] for item in body["items"]] == [mid_b, mid_a]
     summary_b = body["items"][0]
+    assert summary_b["agent_id"] == agent
     assert summary_b["turn_count"] == 4
     assert summary_b["tool_call_count"] == 1
     assert summary_b["metadata_count"] == 1
@@ -255,6 +354,7 @@ def test_list_and_detail_roundtrip(client):
     detail = client.get(f"/traces/{created_b['uuid']}", headers=h)
     assert detail.status_code == 200
     full = detail.json()
+    assert full["agent_id"] == agent
     assert full["conversation_id"] == "conv-b"
     # OpenAI-format extras on history turns survive storage verbatim.
     assert full["input"][1]["tool_calls"][0]["function"]["name"] == "get_schedule"
@@ -273,65 +373,83 @@ def test_list_and_detail_roundtrip(client):
     )
     # Another workspace can't read this trace.
     other = _signup(client)
+    assert client.get(f"/traces/{created_b['uuid']}", headers=other).status_code == 404
+
+
+def test_list_filters_by_agent(client):
+    h, agent = _signup_with_agent(client)
+    other_agent = _create_agent(client, h)
+
+    mine = _mid()
+    client.post("/traces", json=_payload(agent, mine), headers=h)
+    client.post("/traces", json=_payload(other_agent), headers=h)
+    client.post("/traces", json=_payload(other_agent), headers=h)
+
+    scoped = client.get("/traces", params={"agent_id": agent}, headers=h).json()
+    assert scoped["total"] == 1
+    assert scoped["items"][0]["message_id"] == mine
+
     assert (
-        client.get(f"/traces/{created_b['uuid']}", headers=other).status_code == 404
+        client.get("/traces", params={"agent_id": other_agent}, headers=h).json()[
+            "total"
+        ]
+        == 2
+    )
+    # Omitting the filter still reads the whole workspace.
+    assert client.get("/traces", headers=h).json()["total"] == 3
+
+
+def test_list_rejects_another_workspaces_agent_filter(client):
+    h, _agent = _signup_with_agent(client)
+    _other, foreign_agent = _signup_with_agent(client)
+
+    assert (
+        client.get("/traces", params={"agent_id": foreign_agent}, headers=h).status_code
+        == 404
     )
 
 
 def test_list_search_filter_and_pagination(client):
-    h = _signup(client)
+    h, agent = _signup_with_agent(client)
     mid_polio = _mid()
     client.post(
         "/traces",
         json=_payload(
+            agent,
             mid_polio,
-            conversation_id="conv-x",
+            "conv-x",
             input=[{"role": "user", "content": "Tell me about POLIO boosters"}],
         ),
         headers=h,
     )
-    client.post(
-        "/traces", json=_payload(_mid(), conversation_id="conv-y"), headers=h
-    )
-    client.post(
-        "/traces", json=_payload(_mid(), conversation_id="conv-y"), headers=h
-    )
+    client.post("/traces", json=_payload(agent, conversation_id="conv-y"), headers=h)
+    client.post("/traces", json=_payload(agent, conversation_id="conv-y"), headers=h)
 
     hits = client.get("/traces", params={"q": "polio"}, headers=h).json()
     assert hits["total"] == 1
     assert hits["items"][0]["message_id"] == mid_polio
 
-    conv = client.get(
-        "/traces", params={"conversation_id": "conv-y"}, headers=h
-    ).json()
+    conv = client.get("/traces", params={"conversation_id": "conv-y"}, headers=h).json()
     assert conv["total"] == 2
 
-    page = client.get(
-        "/traces", params={"limit": 1, "offset": 1}, headers=h
-    ).json()
+    page = client.get("/traces", params={"limit": 1, "offset": 1}, headers=h).json()
     assert page["total"] == 3
     assert len(page["items"]) == 1
     assert page["limit"] == 1 and page["offset"] == 1
 
 
 def test_bulk_delete_router_contract(client):
-    h = _signup(client)
+    h, agent = _signup_with_agent(client)
     mid_keep = _mid()
     kept = client.post(
-        "/traces", json=_payload(mid_keep, conversation_id="conv-keep"), headers=h
+        "/traces", json=_payload(agent, mid_keep, "conv-keep"), headers=h
     ).json()
     mid_gone = _mid()
-    client.post(
-        "/traces", json=_payload(mid_gone, conversation_id="conv-gone"), headers=h
-    )
-    client.post(
-        "/traces", json=_payload(_mid(), conversation_id="conv-gone"), headers=h
-    )
+    client.post("/traces", json=_payload(agent, mid_gone, "conv-gone"), headers=h)
+    client.post("/traces", json=_payload(agent, conversation_id="conv-gone"), headers=h)
 
     # Neither ids nor select_all is a 400.
-    assert (
-        client.post("/traces/bulk-delete", json={}, headers=h).status_code == 400
-    )
+    assert client.post("/traces/bulk-delete", json={}, headers=h).status_code == 400
 
     # select_all with a conversation filter deletes exactly that set.
     filtered = client.post(
@@ -350,7 +468,54 @@ def test_bulk_delete_router_contract(client):
     assert by_ids.status_code == 200 and by_ids.json() == {"deleted": 1}
     assert client.get(f"/traces/{kept['uuid']}", headers=h).status_code == 404
 
-    reingested = client.post("/traces", json=_payload(mid_keep), headers=h)
+    reingested = client.post("/traces", json=_payload(agent, mid_keep), headers=h)
     assert reingested.status_code == 200
     assert reingested.json()["created"] is True
     assert reingested.json()["uuid"] != kept["uuid"]
+
+
+def test_bulk_delete_select_all_is_bounded_by_agent(client):
+    """The subtab's "delete all matching" must not reach another agent's traces."""
+    h, agent = _signup_with_agent(client)
+    other_agent = _create_agent(client, h)
+    client.post("/traces", json=_payload(agent), headers=h)
+    client.post("/traces", json=_payload(other_agent), headers=h)
+    client.post("/traces", json=_payload(other_agent), headers=h)
+
+    res = client.post(
+        "/traces/bulk-delete",
+        json={"select_all": True, "agent_id": agent},
+        headers=h,
+    )
+    assert res.status_code == 200 and res.json() == {"deleted": 1}
+    assert client.get("/traces", headers=h).json()["total"] == 2
+
+
+def test_bulk_delete_by_ids_is_bounded_by_agent(client):
+    """agent_id bounds an explicit id list too, not just select_all."""
+    h, agent = _signup_with_agent(client)
+    other_agent = _create_agent(client, h)
+    mine = client.post("/traces", json=_payload(agent), headers=h).json()
+    theirs = client.post("/traces", json=_payload(other_agent), headers=h).json()
+
+    res = client.post(
+        "/traces/bulk-delete",
+        json={"trace_ids": [mine["uuid"], theirs["uuid"]], "agent_id": agent},
+        headers=h,
+    )
+    assert res.status_code == 200 and res.json() == {"deleted": 1}
+    assert client.get(f"/traces/{theirs['uuid']}", headers=h).status_code == 200
+
+
+def test_bulk_delete_rejects_another_workspaces_agent(client):
+    h, _agent = _signup_with_agent(client)
+    _other, foreign_agent = _signup_with_agent(client)
+
+    assert (
+        client.post(
+            "/traces/bulk-delete",
+            json={"select_all": True, "agent_id": foreign_agent},
+            headers=h,
+        ).status_code
+        == 404
+    )

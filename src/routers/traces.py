@@ -16,6 +16,8 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from auth_utils import OrgContext, get_current_org, get_org_jwt_or_api_key
+from db import get_agent
+from org_scope import ensure_owned_agent
 from pagination import PaginatedResponse, PaginationParams, page_envelope
 from routers.org_limits import get_max_traces_for_org
 from traces import store as traces_store
@@ -29,7 +31,11 @@ MAX_METADATA_ENTRIES = 100
 
 _EXAMPLE_TRACE_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
+_EXAMPLE_AGENT_UUID = "86186be6-d898-404a-b79c-4f6ff5336afb"
+
 _TRACE_UUID_DESCRIPTION = "Unique ID for the trace"
+
+_AGENT_ID_DESCRIPTION = "ID of the agent that produced this turn"
 
 _Q_DESCRIPTION = (
     "Case-insensitive substring search on `message_id`, `conversation_id`, "
@@ -106,6 +112,12 @@ class TraceMetadataEntry(BaseModel):
 class TraceIngest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    agent_id: str = Field(
+        min_length=1,
+        max_length=36,
+        description="ID of the agent that produced this turn. The trace appears on that agent's Traces tab",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
     message_id: str = Field(
         min_length=1,
         max_length=255,
@@ -136,6 +148,9 @@ class TraceIngestResponse(BaseModel):
         description=_TRACE_UUID_DESCRIPTION,
         examples=[_EXAMPLE_TRACE_UUID],
     )
+    agent_id: str = Field(
+        description=_AGENT_ID_DESCRIPTION, examples=[_EXAMPLE_AGENT_UUID]
+    )
     message_id: str = Field(description="Your ID for the trace's last user message")
     conversation_id: str = Field(
         description="Your ID for the conversation the trace belongs to"
@@ -152,6 +167,9 @@ class TraceSummary(BaseModel):
         max_length=36,
         description=_TRACE_UUID_DESCRIPTION,
         examples=[_EXAMPLE_TRACE_UUID],
+    )
+    agent_id: str = Field(
+        description=_AGENT_ID_DESCRIPTION, examples=[_EXAMPLE_AGENT_UUID]
     )
     message_id: str = Field(description="Your ID for the trace's last user message")
     conversation_id: str = Field(
@@ -182,6 +200,9 @@ class TraceResponse(BaseModel):
         description=_TRACE_UUID_DESCRIPTION,
         examples=[_EXAMPLE_TRACE_UUID],
     )
+    agent_id: str = Field(
+        description=_AGENT_ID_DESCRIPTION, examples=[_EXAMPLE_AGENT_UUID]
+    )
     message_id: str = Field(description="Your ID for the trace's last user message")
     conversation_id: str = Field(
         description="Your ID for the conversation the trace belongs to"
@@ -200,6 +221,12 @@ class TraceResponse(BaseModel):
 
 
 class BulkDeleteTracesRequest(BaseModel):
+    agent_id: Optional[str] = Field(
+        None,
+        max_length=36,
+        description="Delete only traces belonging to this agent. Bounds `trace_ids` as well as `select_all`",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
     trace_ids: Optional[List[str]] = Field(
         None,
         description="IDs of the traces to delete. **Required when `select_all` is false.** Ignored otherwise",
@@ -245,6 +272,7 @@ def _to_summary(row: Dict[str, Any]) -> Dict[str, Any]:
     output = row.get("output") or {}
     return {
         "uuid": row["uuid"],
+        "agent_id": row["agent_id"],
         "message_id": row["message_id"],
         "conversation_id": row["conversation_id"],
         "input_preview": _preview(_last_user_content(row.get("input") or [])),
@@ -259,6 +287,7 @@ def _to_summary(row: Dict[str, Any]) -> Dict[str, Any]:
 def _ingest_response(row: Dict[str, Any], created: bool) -> Dict[str, Any]:
     return {
         "uuid": row["uuid"],
+        "agent_id": row["agent_id"],
         "message_id": row["message_id"],
         "conversation_id": row["conversation_id"],
         "created": created,
@@ -271,8 +300,17 @@ async def ingest_trace(
     payload: TraceIngest, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
 ):
     """Store a production agent turn and its conversation history for later curation"""
+    # Ahead of the idempotency short-circuit so an unknown agent fails the same
+    # way on a retry as on the first call. 404 (not 403) for the cross-workspace
+    # case matches every other agent lookup — existence must not leak.
+    agent = get_agent(payload.agent_id)
+    if not agent or agent.get("org_uuid") != ctx.org_uuid:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
     # Idempotency outranks the cap: a retry of an already-stored message_id
-    # must succeed even when the workspace is at its limit.
+    # must succeed even when the workspace is at its limit. The key stays
+    # workspace-scoped, so a retry naming a different agent returns the stored
+    # row rather than re-filing the turn under the new agent.
     existing = traces_store.get_trace_by_message_id(ctx.org_uuid, payload.message_id)
     if existing:
         return _ingest_response(existing, created=False)
@@ -292,6 +330,7 @@ async def ingest_trace(
 
     row, created = traces_store.create_trace(
         org_uuid=ctx.org_uuid,
+        agent_id=payload.agent_id,
         message_id=payload.message_id,
         conversation_id=payload.conversation_id,
         input=[turn.model_dump(exclude_none=True) for turn in payload.input],
@@ -313,8 +352,15 @@ async def list_traces_endpoint(
     conversation_id: Optional[str] = Query(
         None, description="Return only traces from this conversation"
     ),
+    agent_id: Optional[str] = Query(
+        None,
+        description="Return only traces produced by this agent",
+        examples=[_EXAMPLE_AGENT_UUID],
+    ),
 ):
     """List ingested traces, newest first"""
+    if agent_id:
+        ensure_owned_agent(agent_id, ctx.org_uuid)
     # Search/filter/count run in SQL (traces.store), not the post-fetch
     # pagination helpers, and paging uses the bounded PaginationParams rather
     # than the unbounded OptionalPaginationParams: traces are machine-written
@@ -325,6 +371,7 @@ async def list_traces_endpoint(
         offset=pagination.offset,
         q=q,
         conversation_id=conversation_id,
+        agent_id=agent_id,
     )
     return page_envelope([_to_summary(row) for row in rows], total, pagination)
 
@@ -343,12 +390,15 @@ async def bulk_delete_traces(
             status_code=400,
             detail="trace_ids must be non-empty when select_all is false",
         )
+    if payload.agent_id:
+        ensure_owned_agent(payload.agent_id, ctx.org_uuid)
     deleted = traces_store.soft_delete_traces(
         ctx.org_uuid,
         trace_ids=payload.trace_ids,
         select_all=payload.select_all,
         q=payload.q,
         conversation_id=payload.conversation_id,
+        agent_id=payload.agent_id,
     )
     return {"deleted": deleted}
 
