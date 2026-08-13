@@ -187,6 +187,10 @@ class TraceSummary(BaseModel):
     tool_call_count: int = Field(
         description="Number of tool calls the agent issued for this turn"
     )
+    tool_call_names: List[str] = Field(
+        default_factory=list,
+        description="Names of the tools the agent called, in the order they were issued, first occurrence only. Truncated for display, so this can be shorter than `tool_call_count`",
+    )
     metadata_count: int = Field(
         description="Number of metadata entries stored with the trace"
     )
@@ -268,6 +272,27 @@ def _last_user_content(input_turns: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+_PREVIEW_TOOL_NAMES = 5
+
+
+def _tool_call_names(output: Dict[str, Any]) -> List[str]:
+    """Distinct tool names, first-seen order, capped for display.
+
+    Distinct rather than one entry per call: repeats spend preview slots
+    without adding information, and `tool_call_count` already carries volume.
+    Stored rows are read back as plain JSON, so names are re-checked here
+    rather than trusted from the ingest-time model.
+    """
+    names: List[str] = []
+    for call in output.get("tool_calls") or []:
+        name = (call or {}).get("tool")
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+            if len(names) == _PREVIEW_TOOL_NAMES:
+                break
+    return names
+
+
 def _to_summary(row: Dict[str, Any]) -> Dict[str, Any]:
     output = row.get("output") or {}
     return {
@@ -279,6 +304,7 @@ def _to_summary(row: Dict[str, Any]) -> Dict[str, Any]:
         "response_preview": _preview(output.get("response")),
         "turn_count": len(row.get("input") or []),
         "tool_call_count": len(output.get("tool_calls") or []),
+        "tool_call_names": _tool_call_names(output),
         "metadata_count": len(row.get("metadata") or []),
         "created_at": row["created_at"],
     }

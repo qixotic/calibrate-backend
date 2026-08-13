@@ -347,6 +347,7 @@ def test_list_and_detail_roundtrip(client):
     assert summary_b["agent_id"] == agent
     assert summary_b["turn_count"] == 4
     assert summary_b["tool_call_count"] == 1
+    assert summary_b["tool_call_names"] == ["get_schedule"]
     assert summary_b["metadata_count"] == 1
     assert summary_b["input_preview"] == "and in months?"
     assert summary_b["response_preview"].startswith("Aapki beti")
@@ -374,6 +375,52 @@ def test_list_and_detail_roundtrip(client):
     # Another workspace can't read this trace.
     other = _signup(client)
     assert client.get(f"/traces/{created_b['uuid']}", headers=other).status_code == 404
+
+
+def test_summary_previews_distinct_tool_names(client):
+    h, agent = _signup_with_agent(client)
+    calls = [
+        {"tool": "get_schedule", "arguments": {"weeks": 14}},
+        # A repeat spends no preview slot — tool_call_count carries the volume.
+        {"tool": "get_schedule", "arguments": {"weeks": 18}},
+        {"tool": "send_reminder", "arguments": {}},
+    ]
+    client.post(
+        "/traces",
+        json=_payload(agent, output={"response": "done", "tool_calls": calls}),
+        headers=h,
+    )
+
+    item = client.get("/traces", headers=h).json()["items"][0]
+    assert item["tool_call_count"] == 3
+    assert item["tool_call_names"] == ["get_schedule", "send_reminder"]
+
+
+def test_summary_caps_the_tool_name_preview(client):
+    h, agent = _signup_with_agent(client)
+    calls = [{"tool": f"tool_{i}", "arguments": {}} for i in range(8)]
+    client.post(
+        "/traces",
+        json=_payload(agent, output={"response": "done", "tool_calls": calls}),
+        headers=h,
+    )
+
+    item = client.get("/traces", headers=h).json()["items"][0]
+    assert item["tool_call_count"] == 8
+    assert item["tool_call_names"] == [f"tool_{i}" for i in range(5)]
+
+
+def test_summary_tool_names_empty_without_tool_calls(client):
+    h, agent = _signup_with_agent(client)
+    client.post(
+        "/traces",
+        json=_payload(agent, output={"response": "no tools here"}),
+        headers=h,
+    )
+
+    item = client.get("/traces", headers=h).json()["items"][0]
+    assert item["tool_call_count"] == 0
+    assert item["tool_call_names"] == []
 
 
 def test_list_filters_by_agent(client):
