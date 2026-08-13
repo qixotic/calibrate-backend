@@ -26,6 +26,7 @@ def _to_dict(t: Trace) -> Dict[str, Any]:
     return {
         "uuid": t.uuid,
         "org_uuid": t.org_uuid,
+        "agent_id": t.agent_id,
         "message_id": t.message_id,
         "conversation_id": t.conversation_id,
         "input": t.input,
@@ -62,9 +63,14 @@ def _search_condition(q: str):
 
 
 def _filters(
-    org_uuid: str, q: Optional[str] = None, conversation_id: Optional[str] = None
+    org_uuid: str,
+    q: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
 ) -> List[Any]:
     conds = _live(org_uuid)
+    if agent_id:
+        conds.append(Trace.agent_id == agent_id)
     if conversation_id:
         conds.append(Trace.conversation_id == conversation_id)
     if q and q.strip():
@@ -88,16 +94,18 @@ def get_trace(org_uuid: str, trace_uuid: str) -> Optional[Dict[str, Any]]:
         return _to_dict(row) if row else None
 
 
-def count_live_traces(org_uuid: str) -> int:
+def count_live_traces(org_uuid: str, agent_id: Optional[str] = None) -> int:
+    """Count live traces, workspace-wide (the `max_traces` cap) or for one agent."""
+    conds = _live(org_uuid)
+    if agent_id:
+        conds.append(Trace.agent_id == agent_id)
     with traces_session() as s:
-        return (
-            s.scalar(select(func.count()).select_from(Trace).where(*_live(org_uuid)))
-            or 0
-        )
+        return s.scalar(select(func.count()).select_from(Trace).where(*conds)) or 0
 
 
 def create_trace(
     org_uuid: str,
+    agent_id: str,
     message_id: str,
     conversation_id: str,
     input: Any,
@@ -118,6 +126,7 @@ def create_trace(
         with traces_session() as s:
             row = Trace(
                 org_uuid=org_uuid,
+                agent_id=agent_id,
                 message_id=message_id,
                 conversation_id=conversation_id,
                 input=input,
@@ -141,9 +150,10 @@ def list_traces(
     offset: int,
     q: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Return `(page, total)` newest-first; filters and count run in SQL."""
-    conds = _filters(org_uuid, q, conversation_id)
+    conds = _filters(org_uuid, q, conversation_id, agent_id)
     with traces_session() as s:
         total = s.scalar(select(func.count()).select_from(Trace).where(*conds)) or 0
         rows = s.scalars(
@@ -163,19 +173,25 @@ def soft_delete_traces(
     select_all: bool = False,
     q: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
 ) -> int:
     """Soft-delete traces, returning the number of rows flipped.
 
     Mirrors the annotation-task bulk contract: select_all=True targets every
-    live trace matching q/conversation_id and ignores trace_ids; otherwise only
-    the given trace_ids are deleted (empty list deletes nothing).
+    live trace matching q/conversation_id/agent_id and ignores trace_ids;
+    otherwise only the given trace_ids are deleted (empty list deletes
+    nothing). `agent_id` bounds BOTH modes — a caller scoped to one agent must
+    never reach another agent's traces, however it selected them.
     """
+    conds = _live(org_uuid)
+    if agent_id:
+        conds.append(Trace.agent_id == agent_id)
     if select_all:
-        conds = _filters(org_uuid, q, conversation_id)
+        conds = _filters(org_uuid, q, conversation_id, agent_id)
     else:
         if not trace_ids:
             return 0
-        conds = _live(org_uuid) + [Trace.uuid.in_(trace_ids)]
+        conds.append(Trace.uuid.in_(trace_ids))
     now = utcnow()
     with traces_session() as s:
         result = s.execute(

@@ -11,7 +11,22 @@ def _org() -> str:
     return str(uuid.uuid4())
 
 
-def _ingest(org: str, message_id: str, conversation_id: str = "conv-1", **overrides):
+def _agent() -> str:
+    return str(uuid.uuid4())
+
+
+# The store does not resolve agents (they live in another database), so any
+# well-formed id is enough here; the ingest handler owns that check.
+_DEFAULT_AGENT = "11111111-1111-4111-8111-111111111111"
+
+
+def _ingest(
+    org: str,
+    message_id: str,
+    conversation_id: str = "conv-1",
+    agent_id: str = _DEFAULT_AGENT,
+    **overrides,
+):
     payload = {
         "input": [
             {"role": "system", "content": "You are a vaccination assistant."},
@@ -26,6 +41,7 @@ def _ingest(org: str, message_id: str, conversation_id: str = "conv-1", **overri
     payload.update(overrides)
     return store.create_trace(
         org_uuid=org,
+        agent_id=agent_id,
         message_id=message_id,
         conversation_id=conversation_id,
         **payload,
@@ -38,6 +54,7 @@ def test_create_and_get_roundtrip():
     assert created is True
     assert len(row["uuid"]) == 36
     assert row["message_id"] == "m-1"
+    assert row["agent_id"] == _DEFAULT_AGENT
     assert row["conversation_id"] == "conv-1"
     assert row["input"][0]["role"] == "system"
     assert row["output"]["tool_calls"][0]["tool"] == "get_schedule"
@@ -144,6 +161,51 @@ def test_bulk_delete_contract():
     # Explicit ids path; already-deleted rows don't count again.
     assert store.soft_delete_traces(org, trace_ids=[a["uuid"], "not-a-real-uuid"]) == 1
     assert store.count_live_traces(org) == 0
+
+
+def test_agent_scoped_reads_and_counts():
+    org = _org()
+    agent_a, agent_b = _agent(), _agent()
+    _ingest(org, "m-a1", agent_id=agent_a)
+    _ingest(org, "m-b1", agent_id=agent_b)
+    _ingest(org, "m-b2", agent_id=agent_b)
+
+    rows, total = store.list_traces(org, limit=50, offset=0, agent_id=agent_a)
+    assert total == 1 and [r["message_id"] for r in rows] == ["m-a1"]
+
+    _rows, total = store.list_traces(org, limit=50, offset=0, agent_id=agent_b)
+    assert total == 2
+
+    # Omitting the filter reads the whole workspace, which is what the
+    # max_traces cap counts.
+    assert store.count_live_traces(org) == 3
+    assert store.count_live_traces(org, agent_id=agent_a) == 1
+
+    # Filters combine with search.
+    _rows, total = store.list_traces(
+        org, limit=50, offset=0, agent_id=agent_a, q="m-b1"
+    )
+    assert total == 0
+
+
+def test_agent_bounds_both_delete_modes():
+    org = _org()
+    agent_a, agent_b = _agent(), _agent()
+    a1, _ = _ingest(org, "m-a1", agent_id=agent_a)
+    b1, _ = _ingest(org, "m-b1", agent_id=agent_b)
+    _ingest(org, "m-b2", agent_id=agent_b)
+
+    # select_all never reaches past the named agent.
+    assert store.soft_delete_traces(org, select_all=True, agent_id=agent_a) == 1
+    assert store.count_live_traces(org) == 2
+
+    # An explicit id list is bounded too — a foreign id in the list is ignored
+    # rather than deleted.
+    assert (
+        store.soft_delete_traces(org, trace_ids=[b1["uuid"]], agent_id=agent_a) == 0
+    )
+    assert store.count_live_traces(org, agent_id=agent_b) == 2
+    assert store.get_trace(org, a1["uuid"]) is None
 
 
 def test_org_isolation():

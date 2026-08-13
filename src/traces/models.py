@@ -38,6 +38,10 @@ class Trace(TracesBase):
         String(36), nullable=False, default=lambda: str(uuid.uuid4())
     )
     org_uuid: Mapped[str] = mapped_column(String(36), nullable=False)
+    # No ForeignKey: `agents` lives in pense.db, a different database. Referential
+    # integrity is enforced in the ingest handler instead. Becomes a real FK only
+    # if agents ever move into this store.
+    agent_id: Mapped[str] = mapped_column(String(36), nullable=False)
     message_id: Mapped[str] = mapped_column(String(255), nullable=False)
     conversation_id: Mapped[str] = mapped_column(String(255), nullable=False)
     input: Mapped[Any] = mapped_column(PORTABLE_JSON, nullable=False)
@@ -64,5 +68,6 @@ class Trace(TracesBase):
             postgresql_where=text("deleted_at IS NULL"),
         ),
         Index("ix_traces_org_deleted", "org_uuid", "deleted_at"),
+        Index("ix_traces_org_agent_deleted", "org_uuid", "agent_id", "deleted_at"),
         Index("ix_traces_org_conversation", "org_uuid", "conversation_id"),
     )
