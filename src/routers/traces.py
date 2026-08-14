@@ -28,6 +28,7 @@ MAX_INPUT_TURNS = 500
 MAX_TURN_CONTENT_CHARS = 50_000
 MAX_TOOL_CALLS = 50
 MAX_METADATA_ENTRIES = 100
+_PREVIEW_TOOL_NAMES = 5
 
 _EXAMPLE_TRACE_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
@@ -189,6 +190,7 @@ class TraceSummary(BaseModel):
     )
     tool_call_names: List[str] = Field(
         default_factory=list,
+        max_length=_PREVIEW_TOOL_NAMES,
         description="Names of the tools the agent called, in the order they were issued. Each name appears once, and the list is truncated for display",
     )
     metadata_count: int = Field(
@@ -227,6 +229,7 @@ class TraceResponse(BaseModel):
 class BulkDeleteTracesRequest(BaseModel):
     agent_id: Optional[str] = Field(
         None,
+        min_length=1,
         max_length=36,
         description="Limit the delete to traces from this agent. Applies to both `trace_ids` and `select_all`. Omit to delete traces from every agent",
         examples=[_EXAMPLE_AGENT_UUID],
@@ -270,9 +273,6 @@ def _last_user_content(input_turns: List[Dict[str, Any]]) -> Optional[str]:
         if turn.get("role") == "user" and isinstance(turn.get("content"), str):
             return turn["content"]
     return None
-
-
-_PREVIEW_TOOL_NAMES = 5
 
 
 def _tool_call_names(output: Dict[str, Any]) -> List[str]:
