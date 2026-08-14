@@ -115,7 +115,7 @@ class TraceIngest(BaseModel):
     agent_id: str = Field(
         min_length=1,
         max_length=36,
-        description="ID of the agent that produced this turn. The trace appears on that agent's Traces tab",
+        description=_AGENT_ID_DESCRIPTION,
         examples=[_EXAMPLE_AGENT_UUID],
     )
     message_id: str = Field(
@@ -189,7 +189,7 @@ class TraceSummary(BaseModel):
     )
     tool_call_names: List[str] = Field(
         default_factory=list,
-        description="Names of the tools the agent called, in the order they were issued, first occurrence only. Truncated for display, so this can be shorter than `tool_call_count`",
+        description="Names of the tools the agent called, in the order they were issued. Each name appears once, and the list is truncated for display",
     )
     metadata_count: int = Field(
         description="Number of metadata entries stored with the trace"
@@ -228,7 +228,7 @@ class BulkDeleteTracesRequest(BaseModel):
     agent_id: Optional[str] = Field(
         None,
         max_length=36,
-        description="Delete only traces belonging to this agent. Bounds `trace_ids` as well as `select_all`",
+        description="Limit the delete to traces from this agent. Applies to both `trace_ids` and `select_all`. Omit to delete traces from every agent",
         examples=[_EXAMPLE_AGENT_UUID],
     )
     trace_ids: Optional[List[str]] = Field(
@@ -241,11 +241,11 @@ class BulkDeleteTracesRequest(BaseModel):
     )
     q: Optional[str] = Field(
         None,
-        description=_Q_DESCRIPTION + ". Applied when `select_all` is true",
+        description=_Q_DESCRIPTION + ". Applied when `select_all` is true. Omit to match every trace",
     )
     conversation_id: Optional[str] = Field(
         None,
-        description="Limit `select_all` to traces from this conversation",
+        description="Limit `select_all` to traces from this conversation. Omit to delete traces from every conversation",
     )
 
 
@@ -376,11 +376,12 @@ async def list_traces_endpoint(
     pagination: PaginationParams = Depends(),
     q: Optional[str] = Query(None, description=_Q_DESCRIPTION + ". Blank is a no-op"),
     conversation_id: Optional[str] = Query(
-        None, description="Return only traces from this conversation"
+        None,
+        description="Return only traces from this conversation. Omit to include traces from every conversation",
     ),
     agent_id: Optional[str] = Query(
         None,
-        description="Return only traces produced by this agent",
+        description="Return only traces produced by this agent. Omit to include traces from every agent in your workspace",
         examples=[_EXAMPLE_AGENT_UUID],
     ),
 ):
