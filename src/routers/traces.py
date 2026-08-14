@@ -20,7 +20,9 @@ from db import get_agent
 from org_scope import ensure_owned_agent
 from pagination import PaginatedResponse, PaginationParams, page_envelope
 from routers.org_limits import get_max_traces_for_org
+from traces import eval_store as traces_eval_store
 from traces import store as traces_store
+from utils import OUTPUT_TYPE_DESCRIPTION, OutputTypeLiteral
 
 router = APIRouter(prefix="/traces", tags=["traces"])
 
@@ -33,6 +35,10 @@ _PREVIEW_TOOL_NAMES = 5
 _EXAMPLE_TRACE_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
 _EXAMPLE_AGENT_UUID = "86186be6-d898-404a-b79c-4f6ff5336afb"
+
+_EXAMPLE_RUN_UUID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+
+_EXAMPLE_EVALUATOR_UUID = "9c858901-8a57-4791-81fe-4c455b099bc9"
 
 _TRACE_UUID_DESCRIPTION = "Unique ID for the trace"
 
@@ -162,6 +168,11 @@ class TraceIngestResponse(BaseModel):
     created_at: str = Field(description="When the trace was created (ISO 8601 UTC)")
 
 
+class TraceEvalSummary(BaseModel):
+    passed: int = Field(description="Number of verdicts that came back a pass")
+    total: int = Field(description="Number of verdicts recorded for the trace")
+
+
 class TraceSummary(BaseModel):
     uuid: str = Field(
         min_length=36,
@@ -196,7 +207,54 @@ class TraceSummary(BaseModel):
     metadata_count: int = Field(
         description="Number of metadata entries stored with the trace"
     )
+    eval_summary: Optional[TraceEvalSummary] = Field(
+        None,
+        description="Tally of every evaluator verdict recorded for the trace. Absent while the trace is still awaiting its first evaluation",
+    )
     created_at: str = Field(description="When the trace was created (ISO 8601 UTC)")
+
+
+class TraceEvaluationResult(BaseModel):
+    run_uuid: str = Field(
+        description="ID of the evaluation run that produced this verdict",
+        examples=[_EXAMPLE_RUN_UUID],
+    )
+    evaluator_uuid: str = Field(
+        description="ID of the evaluator that judged the trace",
+        examples=[_EXAMPLE_EVALUATOR_UUID],
+    )
+    evaluator_name: str = Field(
+        description="Name the evaluator carried when it judged the trace"
+    )
+    output_type: OutputTypeLiteral = Field(description=OUTPUT_TYPE_DESCRIPTION)
+    passed: Optional[bool] = Field(
+        None, description="Pass or fail verdict, for binary evaluators"
+    )
+    score: Optional[float] = Field(
+        None, description="Numeric score the judge gave, for rating evaluators"
+    )
+    scale_min: Optional[float] = Field(
+        None, description="Lowest score on the rating scale the judge used"
+    )
+    scale_max: Optional[float] = Field(
+        None, description="Highest score on the rating scale the judge used"
+    )
+    reasoning: Optional[str] = Field(
+        None, description="The judge's written justification for this verdict"
+    )
+    created_at: str = Field(description="When the verdict was created (ISO 8601 UTC)")
+
+
+class TraceEvaluationsResponse(BaseModel):
+    trace_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description=_TRACE_UUID_DESCRIPTION,
+        examples=[_EXAMPLE_TRACE_UUID],
+    )
+    results: List[TraceEvaluationResult] = Field(
+        description="One verdict for each evaluator that judged the trace, newest first"
+    )
 
 
 class TraceResponse(BaseModel):
@@ -293,7 +351,9 @@ def _tool_call_names(output: Dict[str, Any]) -> List[str]:
     return names
 
 
-def _to_summary(row: Dict[str, Any]) -> Dict[str, Any]:
+def _to_summary(
+    row: Dict[str, Any], eval_summary: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     output = row.get("output") or {}
     return {
         "uuid": row["uuid"],
@@ -306,6 +366,7 @@ def _to_summary(row: Dict[str, Any]) -> Dict[str, Any]:
         "tool_call_count": len(output.get("tool_calls") or []),
         "tool_call_names": _tool_call_names(output),
         "metadata_count": len(row.get("metadata") or []),
+        "eval_summary": eval_summary,
         "created_at": row["created_at"],
     }
 
@@ -400,7 +461,18 @@ async def list_traces_endpoint(
         conversation_id=conversation_id,
         agent_id=agent_id,
     )
-    return page_envelope([_to_summary(row) for row in rows], total, pagination)
+    # One batched lookup for the whole page. A lookup for each row would be an
+    # N+1 against the eval store on every page view, and traces omitted from the
+    # result are exactly the ones with no verdict yet, which is what lets
+    # `eval_summary` stay absent instead of reading as an all-failed tally.
+    summaries = traces_eval_store.eval_summaries_for_traces(
+        ctx.org_uuid, [row["uuid"] for row in rows]
+    )
+    return page_envelope(
+        [_to_summary(row, summaries.get(row["uuid"])) for row in rows],
+        total,
+        pagination,
+    )
 
 
 @router.post(
@@ -428,6 +500,27 @@ async def bulk_delete_traces(
         agent_id=payload.agent_id,
     )
     return {"deleted": deleted}
+
+
+@router.get(
+    "/{trace_uuid}/evaluations",
+    response_model=TraceEvaluationsResponse,
+    summary="List trace evaluations",
+)
+async def list_trace_evaluations(
+    trace_uuid: str = Path(
+        description="The trace whose verdicts to read",
+        examples=[_EXAMPLE_TRACE_UUID],
+    ),
+    ctx: OrgContext = Depends(get_current_org),
+):
+    """List every verdict evaluators have recorded against one trace"""
+    if not traces_store.get_trace(ctx.org_uuid, trace_uuid):
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return {
+        "trace_uuid": trace_uuid,
+        "results": traces_eval_store.results_for_trace(ctx.org_uuid, trace_uuid),
+    }
 
 
 @router.get("/{trace_uuid}", response_model=TraceResponse, summary="Get trace")

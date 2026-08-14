@@ -63,6 +63,58 @@ def _mid() -> str:
     return f"m-{uuid.uuid4().hex[:10]}"
 
 
+def _org_uuid(agent_id: str) -> str:
+    from db import get_agent
+
+    return get_agent(agent_id)["org_uuid"]
+
+
+def _record_verdicts(agent_id: str, trace_uuid: str, verdicts) -> str:
+    """Land one eval run's worth of verdicts on a trace, returning the run ID."""
+    from traces import eval_store
+
+    org_uuid = _org_uuid(agent_id)
+    run = eval_store.create_eval_run(
+        org_uuid,
+        agent_id,
+        trigger=eval_store.TRIGGER_MANUAL,
+        inferred_type="response",
+        status="done",
+    )
+    eval_store.record_results(
+        org_uuid,
+        run["uuid"],
+        [dict(v, trace_uuid=trace_uuid) for v in verdicts],
+    )
+    return run["uuid"]
+
+
+def _binary(name: str = "safety", passed: bool = True, **overrides):
+    verdict = {
+        "evaluator_uuid": str(uuid.uuid4()),
+        "evaluator_name": name,
+        "output_type": "binary",
+        "passed": passed,
+        "reasoning": f"{name} verdict",
+    }
+    verdict.update(overrides)
+    return verdict
+
+
+def _rating(name: str = "helpfulness", score: float = 4.0, **overrides):
+    verdict = {
+        "evaluator_uuid": str(uuid.uuid4()),
+        "evaluator_name": name,
+        "output_type": "rating",
+        "score": score,
+        "scale_min": 1.0,
+        "scale_max": 5.0,
+        "reasoning": f"{name} verdict",
+    }
+    verdict.update(overrides)
+    return verdict
+
+
 def _payload(
     agent_id: str,
     message_id: Optional[str] = None,
@@ -566,3 +618,160 @@ def test_bulk_delete_rejects_another_workspaces_agent(client):
         ).status_code
         == 404
     )
+
+
+# ---------------------------------------------------------------------------
+# Evaluation verdicts on the read surface
+# ---------------------------------------------------------------------------
+
+
+def test_list_eval_summary_is_absent_until_a_verdict_lands(client):
+    h, agent = _signup_with_agent(client)
+    trace = client.post("/traces", json=_payload(agent), headers=h).json()
+
+    assert client.get("/traces", headers=h).json()["items"][0]["eval_summary"] is None
+
+    _record_verdicts(
+        agent,
+        trace["uuid"],
+        [_binary("safety", True), _binary("tone", False), _rating(score=5.0, passed=True)],
+    )
+
+    item = client.get("/traces", headers=h).json()["items"][0]
+    assert item["eval_summary"] == {"passed": 2, "total": 3}
+
+
+def test_list_eval_summary_separates_unevaluated_from_all_failed(client):
+    """A badge must tell "not evaluated yet" from "evaluated and failed everything"."""
+    h, agent = _signup_with_agent(client)
+    unjudged = client.post("/traces", json=_payload(agent), headers=h).json()
+    failed = client.post("/traces", json=_payload(agent), headers=h).json()
+    _record_verdicts(
+        agent, failed["uuid"], [_binary("safety", False), _binary("tone", False)]
+    )
+
+    by_uuid = {
+        item["uuid"]: item["eval_summary"]
+        for item in client.get("/traces", headers=h).json()["items"]
+    }
+    assert by_uuid[unjudged["uuid"]] is None
+    assert by_uuid[failed["uuid"]] == {"passed": 0, "total": 2}
+
+
+def test_list_eval_summary_is_looked_up_once_per_page(client, monkeypatch):
+    from traces import eval_store as eval_store_mod
+
+    h, agent = _signup_with_agent(client)
+    traces = [
+        client.post("/traces", json=_payload(agent), headers=h).json()
+        for _ in range(3)
+    ]
+    _record_verdicts(agent, traces[0]["uuid"], [_binary("safety", True)])
+
+    calls = []
+    real = eval_store_mod.eval_summaries_for_traces
+
+    def spy(org_uuid, trace_uuids):
+        calls.append(list(trace_uuids))
+        return real(org_uuid, trace_uuids)
+
+    monkeypatch.setattr(eval_store_mod, "eval_summaries_for_traces", spy)
+
+    body = client.get("/traces", headers=h).json()
+
+    assert len(calls) == 1
+    assert set(calls[0]) == {t["uuid"] for t in traces}
+    assert sum(1 for item in body["items"] if item["eval_summary"]) == 1
+
+
+def test_trace_evaluations_roundtrip(client):
+    h, agent = _signup_with_agent(client)
+    trace = client.post("/traces", json=_payload(agent), headers=h).json()
+    first_run = _record_verdicts(
+        agent, trace["uuid"], [_binary("safety", True, reasoning="No unsafe advice")]
+    )
+    second_run = _record_verdicts(
+        agent,
+        trace["uuid"],
+        [_rating("helpfulness", 4.0, reasoning="Mostly actionable")],
+    )
+
+    res = client.get(f"/traces/{trace['uuid']}/evaluations", headers=h)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["trace_uuid"] == trace["uuid"]
+    assert len(body["results"]) == 2
+
+    # Newest run first.
+    rating, binary = body["results"]
+    assert rating["run_uuid"] == second_run
+    assert binary["run_uuid"] == first_run
+
+    assert rating["output_type"] == "rating"
+    assert rating["evaluator_name"] == "helpfulness"
+    assert rating["score"] == 4.0
+    assert rating["scale_min"] == 1.0 and rating["scale_max"] == 5.0
+    assert rating["passed"] is None
+    assert rating["reasoning"] == "Mostly actionable"
+    assert rating["created_at"].endswith("Z") and "T" in rating["created_at"]
+
+    assert binary["output_type"] == "binary"
+    assert binary["passed"] is True
+    assert binary["score"] is None
+    assert binary["scale_min"] is None and binary["scale_max"] is None
+    assert binary["reasoning"] == "No unsafe advice"
+
+
+def test_trace_evaluations_is_empty_before_any_run(client):
+    h, agent = _signup_with_agent(client)
+    trace = client.post("/traces", json=_payload(agent), headers=h).json()
+
+    res = client.get(f"/traces/{trace['uuid']}/evaluations", headers=h)
+    assert res.status_code == 200
+    assert res.json() == {"trace_uuid": trace["uuid"], "results": []}
+
+
+def test_trace_evaluations_404s_for_missing_and_cross_workspace_traces(client):
+    h, agent = _signup_with_agent(client)
+    trace = client.post("/traces", json=_payload(agent), headers=h).json()
+    _record_verdicts(agent, trace["uuid"], [_binary("safety", True)])
+
+    missing = client.get(
+        "/traces/00000000-0000-4000-8000-000000000001/evaluations", headers=h
+    )
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "Trace not found"
+
+    # Cross-workspace must be indistinguishable from nonexistent.
+    other = _signup(client)
+    foreign = client.get(f"/traces/{trace['uuid']}/evaluations", headers=other)
+    assert foreign.status_code == 404
+    assert foreign.json()["detail"] == "Trace not found"
+
+
+def test_trace_evaluations_is_jwt_only(client):
+    h, agent = _signup_with_agent(client)
+    trace = client.post("/traces", json=_payload(agent), headers=h).json()
+    key_headers = _api_key_headers(client, h)
+
+    assert client.get(f"/traces/{trace['uuid']}/evaluations").status_code in (401, 403)
+    assert client.get(
+        f"/traces/{trace['uuid']}/evaluations", headers=key_headers
+    ).status_code in (401, 403)
+
+
+def test_evaluations_path_does_not_collide_with_the_detail_route(client):
+    """`/{trace_uuid}` must not swallow the more specific `/{trace_uuid}/evaluations`."""
+    h, agent = _signup_with_agent(client)
+    trace = client.post("/traces", json=_payload(agent), headers=h).json()
+
+    detail = client.get(f"/traces/{trace['uuid']}", headers=h).json()
+    evaluations = client.get(
+        f"/traces/{trace['uuid']}/evaluations", headers=h
+    ).json()
+
+    assert "input" in detail and "results" not in detail
+    assert set(evaluations) == {"trace_uuid", "results"}
+    # A trace literally named "evaluations" would still be a plain 404, not a
+    # route-shape error.
+    assert client.get("/traces/evaluations", headers=h).status_code == 404
