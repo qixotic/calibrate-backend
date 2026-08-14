@@ -35,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from db import init_db, NameAlreadyExistsError
 from auth_utils import get_current_user_id
+from traces import eval_scheduler
 from traces.migrate import run_traces_migrations
 from routers.auth import router as auth_router
 from routers.agents import router as agents_router
@@ -57,6 +58,7 @@ from routers.annotators import router as annotators_router
 from routers.annotation_agreement import router as annotation_agreement_router
 from routers.organizations import router as organizations_router
 from routers.api_keys import router as api_keys_router
+from routers.trace_evals import router as trace_evals_router
 from routers.traces import router as traces_router
 from utils import (
     LOCAL_ARTIFACTS_URL_PREFIX,
@@ -85,15 +87,21 @@ async def lifespan(app: FastAPI):
     run_traces_migrations()
     logger.info("Checking for in_progress jobs to recover...")
     recover_pending_jobs()
+    # A trace-eval run's worker thread died with the previous process, so any
+    # run still marked live is orphaned. Recover before the poller starts, or
+    # its traces stay claimed and the backlog never drains.
+    eval_scheduler.recover_orphaned_runs()
     provider_status_task = asyncio.create_task(provider_status_monitor.refresh_loop())
+    trace_eval_task = asyncio.create_task(eval_scheduler.poll_loop())
     try:
         yield
     finally:
-        provider_status_task.cancel()
-        try:
-            await provider_status_task
-        except asyncio.CancelledError:
-            pass
+        for task in (provider_status_task, trace_eval_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         logger.info("Application shutting down")
 
 
@@ -437,6 +445,7 @@ app.include_router(annotation_agreement_router)
 app.include_router(organizations_router)
 app.include_router(api_keys_router)
 app.include_router(traces_router)
+app.include_router(trace_evals_router)
 # Public (no-auth) sharing endpoints — must be registered without any auth dependency
 app.include_router(public_router)
 
