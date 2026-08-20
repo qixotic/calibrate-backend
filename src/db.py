@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import logging
+import time
 import uuid
 from os.path import join
 import os
@@ -9920,6 +9921,105 @@ def create_trace(
             "SELECT * FROM traces WHERE uuid = ?", (trace_uuid,)
         ).fetchone()
         return _trace_row(row)
+
+
+def usable_evaluators_for_agent(agent_id: str) -> List[Dict[str, Any]]:
+    """Evaluators linked to `agent_id` (via `agent_evaluators`) that async trace
+    scoring can actually run: each must have a live version, and that version
+    must declare no `{{placeholder}}` variables -- `agent_evaluators` has no
+    `variable_values` column, so there is nowhere to supply them. A link that
+    fails either check is silently skipped rather than blocking ingest.
+
+    Returns `[{"uuid": evaluator_uuid, "live_version_id": <evaluator_versions.id>}]`.
+    """
+    evaluators = get_evaluators_for_agent(agent_id)
+    if not evaluators:
+        return []
+    version_uuids = [e["live_version_id"] for e in evaluators if e.get("live_version_id")]
+    versions = get_evaluator_versions_by_uuids(version_uuids)
+    usable = []
+    for evaluator in evaluators:
+        version = versions.get(evaluator.get("live_version_id") or "")
+        if not version or version.get("variables"):
+            continue
+        usable.append({"uuid": evaluator["uuid"], "live_version_id": version["id"]})
+    return usable
+
+
+def create_trace_with_eval_queue(
+    *,
+    org_uuid: str,
+    agent: Dict[str, Any],
+    message_id: Optional[str],
+    conversation_id: Optional[str],
+    input: Any,
+    output: Any,
+    metadata: Optional[Any],
+) -> Dict[str, Any]:
+    """Insert a trace and, for an opted-in agent, its scoring-queue rows in one
+    transaction -- so neither can exist without the other.
+
+    Uses BEGIN IMMEDIATE rather than a bare BEGIN (the first in this codebase):
+    a deferred transaction starts as a reader and only upgrades to a writer at
+    its first write, which can fail with SQLITE_BUSY without honouring
+    busy_timeout. Taking the write lock up front means the timeout applies.
+    """
+    evaluators = (
+        usable_evaluators_for_agent(agent["uuid"])
+        if agent.get("auto_score_traces")
+        else []
+    )
+    now = int(time.time())
+    trace_uuid = str(uuid.uuid4())
+
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            """
+            INSERT INTO traces
+                (uuid, org_uuid, agent_id, message_id, conversation_id,
+                 input, output, metadata, evaluators_expected)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trace_uuid,
+                org_uuid,
+                agent["uuid"],
+                message_id,
+                conversation_id,
+                json.dumps(input),
+                json.dumps(output),
+                json.dumps(metadata) if metadata is not None else None,
+                len(evaluators),
+            ),
+        )
+        if evaluators:
+            # Wakes idle workers once the pool exists (PR 6); no-op until then.
+            cur.executemany(
+                "INSERT INTO trace_eval_queue"
+                "(trace_uuid, evaluator_uuid, evaluator_version_id, org_uuid,"
+                " agent_id, available_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        trace_uuid,
+                        e["uuid"],
+                        e["live_version_id"],
+                        org_uuid,
+                        agent["uuid"],
+                        now,
+                    )
+                    for e in evaluators
+                ],
+            )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM traces WHERE uuid = ?", (trace_uuid,)
+        ).fetchone()
+
+    trace = _trace_row(row)
+    trace["evaluators_expected"] = row["evaluators_expected"]
+    return trace
 
 
 def list_traces(

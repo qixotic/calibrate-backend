@@ -26,7 +26,7 @@ from db import (
     add_test_to_agent,
     bulk_create_tests,
     count_live_traces,
-    create_trace,
+    create_trace_with_eval_queue,
     get_agent,
     get_all_tests_summary,
     get_evaluator_versions_by_uuids,
@@ -333,7 +333,7 @@ async def ingest_trace(
     payload: TraceIngest, ctx: OrgContext = Depends(get_org_jwt_or_api_key)
 ):
     """Store a production agent turn and its conversation history for later review"""
-    ensure_owned_agent(payload.agent_id, ctx.org_uuid)
+    agent = ensure_owned_agent(payload.agent_id, ctx.org_uuid)
 
     cap = MAX_TRACES_PER_WORKSPACE
     current = count_live_traces(ctx.org_uuid)
@@ -348,9 +348,9 @@ async def ingest_trace(
             },
         )
 
-    row = create_trace(
+    row = create_trace_with_eval_queue(
         org_uuid=ctx.org_uuid,
-        agent_id=payload.agent_id,
+        agent=agent,
         message_id=payload.message_id,
         conversation_id=payload.conversation_id,
         input=[turn.model_dump(exclude_none=True) for turn in payload.input],
