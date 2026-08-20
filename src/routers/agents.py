@@ -398,6 +398,10 @@ class AgentUpdate(BaseModel):
         description="Set the benchmark verification map, keyed by model, for a `type=connection` agent. Omit to leave it untouched",
         examples=[{"openai/gpt-4.1": {"verified": True, "verified_at": "2026-01-01T00:00:00Z", "error": None}}],
     )
+    auto_score_traces: Optional[bool] = Field(
+        None,
+        description="Enable automatic LLM scoring of this agent's ingested traces. Omit to leave it untouched",
+    )
 
 
 class AgentResponse(BaseModel):
@@ -413,6 +417,9 @@ class AgentResponse(BaseModel):
     created_at: str = Field(description="When the agent was created (ISO 8601 UTC)")
     updated_at: str = Field(
         description="When the agent was last updated (ISO 8601 UTC)"
+    )
+    auto_score_traces: bool = Field(
+        description="Whether ingested traces for this agent are automatically scored by linked evaluators",
     )
 
 
@@ -840,6 +847,7 @@ def update_agent_endpoint(
             agent_uuid=agent_uuid,
             name=agent.name,
             config=agent.config,
+            auto_score_traces=agent.auto_score_traces,
         )
 
     if not updated:

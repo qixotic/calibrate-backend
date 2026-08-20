@@ -4079,6 +4079,7 @@ def update_agent(
     agent_uuid: str,
     name: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
+    auto_score_traces: Optional[bool] = None,
 ) -> bool:
     """Update an agent. Returns True if the agent was found and updated."""
     # Build dynamic update query
@@ -4092,6 +4093,9 @@ def update_agent(
         updates.append("config = ?")
         # Serialize config to JSON string for storage
         params.append(json.dumps(config))
+    if auto_score_traces is not None:
+        updates.append("auto_score_traces = ?")
+        params.append(int(auto_score_traces))
 
     if not updates:
         return False

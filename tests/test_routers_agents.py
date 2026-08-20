@@ -99,6 +99,50 @@ def test_resolve_dedupes_not_found(client):
     assert body["not_found"] == [missing]
 
 
+def test_auto_score_traces_defaults_off(client):
+    h = _signup(client)
+    name = f"scoring-default-{uuid.uuid4().hex[:6]}"
+    created = _create_agent(client, h, name)
+
+    r = client.get(f"/agents/{created['uuid']}", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is False
+
+
+def test_auto_score_traces_can_be_toggled_and_persists(client):
+    h = _signup(client)
+    name = f"scoring-toggle-{uuid.uuid4().hex[:6]}"
+    created = _create_agent(client, h, name)
+
+    r = client.put(
+        f"/agents/{created['uuid']}", json={"auto_score_traces": True}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is True
+
+    r = client.get(f"/agents/{created['uuid']}", headers=h)
+    assert r.json()["auto_score_traces"] is True
+
+    r = client.put(
+        f"/agents/{created['uuid']}", json={"auto_score_traces": False}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is False
+
+
+def test_auto_score_traces_omitted_leaves_it_unchanged(client):
+    h = _signup(client)
+    name = f"scoring-omit-{uuid.uuid4().hex[:6]}"
+    created = _create_agent(client, h, name)
+    client.put(
+        f"/agents/{created['uuid']}", json={"auto_score_traces": True}, headers=h
+    )
+
+    r = client.put(f"/agents/{created['uuid']}", json={"name": name}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is True
+
+
 def test_resolve_is_org_scoped(client):
     """An agent in org A must not resolve for a caller in org B."""
     ha = _signup(client)
