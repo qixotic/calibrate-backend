@@ -1201,16 +1201,6 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-        # Expected evaluator count per trace, recorded at ingest. Without a
-        # recorded expectation, COUNT(DISTINCT evaluator_uuid) on trace_scores
-        # has nothing to be short of, so partial scoring is undetectable.
-        try:
-            cursor.execute(
-                "ALTER TABLE traces ADD COLUMN evaluators_expected INTEGER NOT NULL DEFAULT 0"
-            )
-        except sqlite3.OperationalError:
-            pass
-
         # Add is_public and share_token columns for public sharing feature
         for table in ("jobs", "agent_test_jobs", "simulation_jobs"):
             try:
@@ -1548,6 +1538,20 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_traces_org_created "
             "ON traces(org_uuid, deleted_at, created_at DESC, id DESC)"
         )
+        conn.commit()
+
+        # Expected evaluator count per trace, recorded at ingest. Without a
+        # recorded expectation, COUNT(DISTINCT evaluator_uuid) on trace_scores
+        # has nothing to be short of, so partial scoring is undetectable.
+        # Placed after traces' own CREATE TABLE above -- a bare ALTER against
+        # a not-yet-existing table just no-ops under the OperationalError
+        # guard, silently skipping the column on a fresh database.
+        try:
+            cursor.execute(
+                "ALTER TABLE traces ADD COLUMN evaluators_expected INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
         # ============ trace_eval_queue / trace_scores / trace_eval_errors ============
