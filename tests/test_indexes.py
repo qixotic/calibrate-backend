@@ -22,6 +22,9 @@ EXPECTED_INDEXES = [
     "idx_annotation_jobs_annotator",
     "idx_traces_org_agent_active",
     "idx_traces_org_created",
+    "ix_trace_queue_claim",
+    "ix_trace_scores_org_eval",
+    "ix_trace_errors_eval",
 ]
 
 
@@ -139,3 +142,29 @@ def test_traces_default_list_sorts_from_the_index():
     )
     assert "idx_traces_org_created" in plan, plan
     assert "TEMP B-TREE" not in plan, plan
+
+
+def test_trace_queue_claim_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_eval_queue WHERE status IN ('pending', 'processing') "
+        "AND available_at <= ? ORDER BY available_at LIMIT 10",
+        (0,),
+    )
+    assert "ix_trace_queue_claim" in plan, plan
+
+
+def test_trace_scores_by_org_eval_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_scores WHERE org_uuid = ? AND evaluator_uuid = ? "
+        "ORDER BY completed_at",
+        ("org", "eval"),
+    )
+    assert "ix_trace_scores_org_eval" in plan, plan
+
+
+def test_trace_errors_by_eval_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_eval_errors WHERE evaluator_uuid = ? ORDER BY failed_at",
+        ("eval",),
+    )
+    assert "ix_trace_errors_eval" in plan, plan

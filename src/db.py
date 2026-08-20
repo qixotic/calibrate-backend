@@ -1193,6 +1193,24 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        # Trace scoring opt-in flag per agent
+        try:
+            cursor.execute(
+                "ALTER TABLE agents ADD COLUMN auto_score_traces INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        # Expected evaluator count per trace, recorded at ingest. Without a
+        # recorded expectation, COUNT(DISTINCT evaluator_uuid) on trace_scores
+        # has nothing to be short of, so partial scoring is undetectable.
+        try:
+            cursor.execute(
+                "ALTER TABLE traces ADD COLUMN evaluators_expected INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # Add is_public and share_token columns for public sharing feature
         for table in ("jobs", "agent_test_jobs", "simulation_jobs"):
             try:
@@ -1529,6 +1547,91 @@ def init_db():
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_traces_org_created "
             "ON traces(org_uuid, deleted_at, created_at DESC, id DESC)"
+        )
+        conn.commit()
+
+        # ============ trace_eval_queue / trace_scores / trace_eval_errors ============
+        # Async scoring of opted-in agents' traces. `trace_eval_queue` has no
+        # `deleted_at` — a soft-deleted trace's pending/processing rows are
+        # hard-deleted by soft_delete_traces (see there) rather than carried
+        # as history, since a deleted trace has no output to display a score
+        # against.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trace_eval_queue (
+                id                   INTEGER PRIMARY KEY,
+                trace_uuid           TEXT    NOT NULL,
+                evaluator_uuid       TEXT    NOT NULL,
+                evaluator_version_id INTEGER NOT NULL,
+                org_uuid             TEXT    NOT NULL,
+                agent_id             TEXT    NOT NULL,
+                status               TEXT    NOT NULL DEFAULT 'pending',
+                available_at         INTEGER NOT NULL,
+                attempts             INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (trace_uuid) REFERENCES traces(uuid),
+                FOREIGN KEY (evaluator_uuid) REFERENCES evaluators(uuid),
+                FOREIGN KEY (org_uuid) REFERENCES organizations(uuid),
+                FOREIGN KEY (agent_id) REFERENCES agents(uuid)
+            )
+            """
+        )
+        # The claim, and the only index the queue needs. Partial on the two
+        # live statuses because completed rows are deleted outright, so this
+        # stays small no matter how many traces have been scored.
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trace_queue_claim "
+            "ON trace_eval_queue(available_at) "
+            "WHERE status IN ('pending', 'processing')"
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trace_scores (
+                trace_uuid           TEXT    NOT NULL,
+                evaluator_uuid       TEXT    NOT NULL,
+                evaluator_version_id INTEGER,
+                org_uuid             TEXT    NOT NULL,
+                score                REAL,
+                reasoning            TEXT,
+                completed_at         INTEGER,
+                UNIQUE (trace_uuid, evaluator_uuid, evaluator_version_id),
+                FOREIGN KEY (trace_uuid) REFERENCES traces(uuid),
+                FOREIGN KEY (evaluator_uuid) REFERENCES evaluators(uuid),
+                FOREIGN KEY (org_uuid) REFERENCES organizations(uuid)
+            )
+            """
+        )
+        # Serves both the per-trace aggregate the FE reads and the trend an
+        # evaluator's score follows for an org over time.
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trace_scores_org_eval "
+            "ON trace_scores(org_uuid, evaluator_uuid, completed_at)"
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trace_eval_errors (
+                id                   INTEGER PRIMARY KEY,
+                trace_uuid           TEXT    NOT NULL,
+                evaluator_uuid       TEXT    NOT NULL,
+                evaluator_version_id INTEGER,
+                org_uuid             TEXT    NOT NULL,
+                attempts             INTEGER NOT NULL,
+                error                TEXT,
+                failed_at            INTEGER NOT NULL,
+                FOREIGN KEY (trace_uuid) REFERENCES traces(uuid),
+                FOREIGN KEY (evaluator_uuid) REFERENCES evaluators(uuid),
+                FOREIGN KEY (org_uuid) REFERENCES organizations(uuid)
+            )
+            """
+        )
+        # With no circuit breaker in this MVP, this index IS the detection
+        # story: alert on failure rate PER evaluator, since a 100%-failing
+        # evaluator is invisible in a global error rate dominated by healthy
+        # ones.
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trace_errors_eval "
+            "ON trace_eval_errors(evaluator_uuid, failed_at)"
         )
         conn.commit()
 
@@ -9839,7 +9942,12 @@ _TRACE_DELETE_CHUNK = 500
 
 
 def soft_delete_traces(org_uuid: str, *, trace_ids: List[str]) -> int:
-    """Soft-delete the given traces, returning the number of rows flipped."""
+    """Soft-delete the given traces, returning the number of rows flipped.
+
+    Also hard-deletes any pending/processing trace_eval_queue rows for these
+    traces — a deleted trace has no output left to score, so queued work for
+    it is dropped rather than left to fail against a soft-deleted row.
+    """
     if not trace_ids:
         return 0
     deleted = 0
@@ -9854,5 +9962,10 @@ def soft_delete_traces(org_uuid: str, *, trace_ids: List[str]) -> int:
                 [org_uuid] + list(chunk),
             )
             deleted += cursor.rowcount or 0
+            conn.execute(
+                f"DELETE FROM trace_eval_queue WHERE org_uuid = ? "
+                f"AND trace_uuid IN ({placeholders})",
+                [org_uuid] + list(chunk),
+            )
         conn.commit()
     return deleted
