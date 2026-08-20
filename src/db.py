@@ -10004,7 +10004,6 @@ def create_trace_with_eval_queue(
             ),
         )
         if evaluators:
-            # Wakes idle workers once the pool exists (PR 6); no-op until then.
             cur.executemany(
                 "INSERT INTO trace_eval_queue"
                 "(trace_uuid, evaluator_uuid, evaluator_version_id, org_uuid,"
@@ -10025,6 +10024,11 @@ def create_trace_with_eval_queue(
         row = conn.execute(
             "SELECT * FROM traces WHERE uuid = ?", (trace_uuid,)
         ).fetchone()
+
+    if evaluators:
+        import trace_scoring_nudge
+
+        trace_scoring_nudge.set()
 
     trace = _trace_row(row)
     trace["evaluators_expected"] = row["evaluators_expected"]
