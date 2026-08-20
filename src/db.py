@@ -1,6 +1,8 @@
 import sqlite3
 import json
 import logging
+import random
+import time
 import uuid
 from os.path import join
 import os
@@ -240,6 +242,14 @@ def init_db():
     """Initialize the database and create tables if they don't exist."""
     # Ensure the data directory exists
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # The trace-eval claim query uses RETURNING (SQLite 3.35+). Assert at boot
+    # rather than failing opaquely at the first claim.
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        raise RuntimeError(
+            f"SQLite {sqlite3.sqlite_version} is too old — trace-eval claiming "
+            "requires 3.35+ for RETURNING support"
+        )
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -9973,3 +9983,153 @@ def soft_delete_traces(org_uuid: str, *, trace_ids: List[str]) -> int:
             )
         conn.commit()
     return deleted
+
+
+# Fixed lease/backoff parameters for the trace-eval queue. No per-org tuning
+# yet -- see the trace-scoring plan's sampling-rate follow-up for the next
+# lever if a backlog needs finer control than the on/off switch.
+TRACE_EVAL_LEASE_SECONDS = 120
+TRACE_EVAL_MAX_ATTEMPTS = 5
+_TRACE_EVAL_BACKOFF_CAP_SECONDS = 300
+_TRACE_EVAL_JITTER_SECONDS = 5
+
+
+def claim_trace_eval_queue_rows(
+    *, batch_size: int, lease_seconds: int = TRACE_EVAL_LEASE_SECONDS
+) -> List[Dict[str, Any]]:
+    """Atomically claim up to `batch_size` ready trace_eval_queue rows.
+
+    `available_at` serves both readiness and lease expiry, so a timed-out
+    lease is reclaimed by the same query that picks up fresh work -- no
+    separate sweeper. The UPDATE...WHERE id IN (SELECT...) runs inside one
+    BEGIN IMMEDIATE transaction, so two concurrent claimers serialize on
+    SQLite's write lock and can never select the same row.
+    """
+    now = int(time.time())
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            """
+            UPDATE trace_eval_queue
+               SET status = 'processing',
+                   available_at = ? + ?,
+                   attempts = attempts + 1
+             WHERE id IN (
+                     SELECT id FROM trace_eval_queue
+                      WHERE status IN ('pending', 'processing')
+                        AND available_at <= ?
+                      ORDER BY available_at
+                      LIMIT ?
+                   )
+            RETURNING id, trace_uuid, evaluator_uuid, evaluator_version_id,
+                      org_uuid, agent_id, attempts
+            """,
+            (now, lease_seconds, now, batch_size),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.commit()
+    return rows
+
+
+def settle_trace_eval_success(
+    queue_id: int,
+    *,
+    trace_uuid: str,
+    evaluator_uuid: str,
+    evaluator_version_id: int,
+    org_uuid: str,
+    score: Optional[float],
+    reasoning: Optional[str],
+) -> None:
+    """Record a successful score and remove the claimed queue row.
+
+    Upserts on (trace_uuid, evaluator_uuid, evaluator_version_id): a retry of
+    the same queue row (fixed version) overwrites its own prior attempt; a
+    later re-score under a NEW version inserts a new row instead of
+    clobbering history.
+    """
+    now = int(time.time())
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO trace_scores
+                (trace_uuid, evaluator_uuid, evaluator_version_id, org_uuid,
+                 score, reasoning, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (trace_uuid, evaluator_uuid, evaluator_version_id)
+            DO UPDATE SET score = excluded.score,
+                          reasoning = excluded.reasoning,
+                          completed_at = excluded.completed_at
+            """,
+            (
+                trace_uuid,
+                evaluator_uuid,
+                evaluator_version_id,
+                org_uuid,
+                score,
+                reasoning,
+                now,
+            ),
+        )
+        conn.execute("DELETE FROM trace_eval_queue WHERE id = ?", (queue_id,))
+        conn.commit()
+
+
+def _trace_eval_backoff_seconds(attempts: int) -> int:
+    """Exponential backoff with jitter, capped so a long-failing evaluator's
+    rows don't wait indefinitely between attempts. Jitter is not optional --
+    without it, a whole-batch failure defers every row to the same timestamp,
+    and the next claim reassembles the identical batch and fails it again."""
+    backoff = min(2**attempts, _TRACE_EVAL_BACKOFF_CAP_SECONDS)
+    return backoff + random.randint(0, _TRACE_EVAL_JITTER_SECONDS)
+
+
+def settle_trace_eval_failure(
+    queue_id: int,
+    *,
+    trace_uuid: str,
+    evaluator_uuid: str,
+    evaluator_version_id: Optional[int],
+    org_uuid: str,
+    attempts: int,
+    error: str,
+    max_attempts: int = TRACE_EVAL_MAX_ATTEMPTS,
+) -> bool:
+    """Defer the claimed row for a retry, or dead-letter it past
+    `max_attempts`. `attempts` is the row's post-claim attempt count.
+    Returns True if dead-lettered, False if deferred.
+    """
+    if attempts >= max_attempts:
+        now = int(time.time())
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO trace_eval_errors
+                    (trace_uuid, evaluator_uuid, evaluator_version_id,
+                     org_uuid, attempts, error, failed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trace_uuid,
+                    evaluator_uuid,
+                    evaluator_version_id,
+                    org_uuid,
+                    attempts,
+                    error,
+                    now,
+                ),
+            )
+            conn.execute("DELETE FROM trace_eval_queue WHERE id = ?", (queue_id,))
+            conn.commit()
+        return True
+
+    available_at = int(time.time()) + _trace_eval_backoff_seconds(attempts)
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE trace_eval_queue SET status = 'pending', available_at = ? "
+            "WHERE id = ?",
+            (available_at, queue_id),
+        )
+        conn.commit()
+    return False
