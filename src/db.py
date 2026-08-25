@@ -4,6 +4,7 @@ import logging
 import random
 import time
 import uuid
+from datetime import datetime, timezone
 from os.path import join
 import os
 from pathlib import Path
@@ -9811,6 +9812,7 @@ def _trace_row(row: sqlite3.Row) -> Dict[str, Any]:
         "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
         "created_at": _trace_iso(row["created_at"]),
         "updated_at": _trace_iso(row["updated_at"]),
+        "evaluators_expected": row["evaluators_expected"],
     }
 
 
@@ -9880,6 +9882,60 @@ def get_traces_by_uuids(org_uuid: str, trace_uuids: List[str]) -> List[Dict[str,
         ).fetchall()
     by_uuid = {row["uuid"]: _trace_row(row) for row in rows}
     return [by_uuid[u] for u in unique if u in by_uuid]
+
+
+def get_trace_scores_for_traces(
+    org_uuid: str, trace_uuids: List[str]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Every trace_scores row for the given trace UUIDs, bucketed by trace_uuid
+    (newest evaluator name/output_type; a soft-deleted evaluator's score is
+    still returned, its identity resolved best-effort via the LEFT JOIN).
+
+    One query for a whole page of traces -- the caller (a list view) must not
+    fetch scores per row. `trace_uuid` leads the `trace_scores` UNIQUE
+    constraint, so the IN-list lookup is indexed without a dedicated index.
+    """
+    result: Dict[str, List[Dict[str, Any]]] = {u: [] for u in trace_uuids}
+    unique = list(dict.fromkeys(trace_uuids))
+    if not unique:
+        return result
+    placeholders = ",".join("?" * len(unique))
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT ts.trace_uuid, ts.evaluator_uuid, ts.evaluator_version_id,
+                   ts.score, ts.reasoning, ts.completed_at,
+                   e.name AS evaluator_name, e.output_type AS output_type
+              FROM trace_scores ts
+              LEFT JOIN evaluators e ON e.uuid = ts.evaluator_uuid
+             WHERE ts.org_uuid = ? AND ts.trace_uuid IN ({placeholders})
+             ORDER BY ts.trace_uuid, ts.completed_at
+            """,
+            [org_uuid] + unique,
+        ).fetchall()
+    for row in rows:
+        result.setdefault(row["trace_uuid"], []).append(
+            {
+                "evaluator_uuid": row["evaluator_uuid"],
+                "evaluator_name": row["evaluator_name"] or row["evaluator_uuid"],
+                "output_type": row["output_type"] or "binary",
+                "evaluator_version_id": row["evaluator_version_id"],
+                "score": row["score"],
+                "reasoning": row["reasoning"],
+                "completed_at": (
+                    # Unlike traces.created_at (a SQLite TIMESTAMP string),
+                    # trace_scores.completed_at is a unix epoch INTEGER
+                    # (int(time.time()) at settle time) -- convert, don't
+                    # reuse _trace_iso's string-reformatting.
+                    datetime.fromtimestamp(row["completed_at"], tz=timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                    if row["completed_at"] is not None
+                    else None
+                ),
+            }
+        )
+    return result
 
 
 def count_live_traces(org_uuid: str) -> int:

@@ -33,6 +33,7 @@ from db import (
     get_evaluators_by_uuids,
     get_trace,
     get_traces_by_uuids,
+    get_trace_scores_for_traces,
     list_traces,
     set_test_evaluators,
     soft_delete_traces,
@@ -197,6 +198,12 @@ class TraceIngestResponse(BaseModel):
     created_at: str = Field(description="When the trace was created (ISO 8601 UTC)")
 
 
+_EVALUATORS_EXPECTED_DESCRIPTION = (
+    "Number of evaluators linked for scoring when this trace was ingested. "
+    "Zero if the agent was not opted into automatic scoring at the time"
+)
+
+
 class TraceSummary(BaseModel):
     uuid: str = Field(
         min_length=36,
@@ -233,6 +240,7 @@ class TraceSummary(BaseModel):
         description="Number of metadata entries stored with the trace"
     )
     created_at: str = Field(description="When the trace was created (ISO 8601 UTC)")
+    evaluators_expected: int = Field(description=_EVALUATORS_EXPECTED_DESCRIPTION)
 
 
 class TraceResponse(BaseModel):
@@ -260,6 +268,7 @@ class TraceResponse(BaseModel):
     updated_at: str = Field(
         description="When the trace was last updated (ISO 8601 UTC)"
     )
+    evaluators_expected: int = Field(description=_EVALUATORS_EXPECTED_DESCRIPTION)
 
 
 class BulkDeleteTracesRequest(BaseModel):
@@ -276,6 +285,41 @@ class BulkDeleteTracesRequest(BaseModel):
 
 class BulkDeleteTracesResponse(BaseModel):
     deleted: int = Field(description="Number of traces deleted")
+
+
+# How many trace IDs one scores lookup accepts. Matches a list page's size,
+# not a bulk-export cap -- this endpoint is for rendering the visible page.
+MAX_SCORES_TRACE_IDS = MAX_LIST_LIMIT
+
+
+class TraceScoreEntry(BaseModel):
+    evaluator_uuid: str = Field(description="ID of the evaluator that produced this score")
+    evaluator_name: str = Field(description="Name of the evaluator")
+    evaluator_version_id: int = Field(
+        description="ID of the evaluator version that produced this score"
+    )
+    match: Optional[bool] = Field(None, description="Pass/fail verdict, set for binary evaluators")
+    score: Optional[float] = Field(None, description="Numeric score, set for rating evaluators")
+    reasoning: Optional[str] = Field(None, description="The judge's reasoning for this score")
+    completed_at: Optional[str] = Field(
+        None, description="When this score was recorded (ISO 8601 UTC)"
+    )
+
+
+class TraceScoresResponse(BaseModel):
+    scores: Dict[str, List[TraceScoreEntry]] = Field(
+        description="Scores for each requested trace ID, keyed by trace ID. An unscored trace maps to an empty list"
+    )
+
+
+class TraceScoresRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    trace_ids: List[TraceUuid] = Field(
+        min_length=1,
+        max_length=MAX_SCORES_TRACE_IDS,
+        description="IDs of the traces to fetch scores for",
+    )
 
 
 _PREVIEW_CHARS = 160
@@ -320,6 +364,7 @@ def _to_summary(row: Dict[str, Any]) -> Dict[str, Any]:
         "tool_call_count": len(calls),
         "metadata_count": len(row.get("metadata") or []),
         "created_at": row["created_at"],
+        "evaluators_expected": row.get("evaluators_expected") or 0,
     }
 
 
@@ -647,6 +692,37 @@ def convert_traces_to_tests(
         "created": len(test_uuids),
         "test_uuids": test_uuids,
         "warnings": warnings or None,
+    }
+
+
+def _shape_score_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+    is_binary = row["output_type"] == "binary"
+    raw_score = row["score"]
+    return {
+        "evaluator_uuid": row["evaluator_uuid"],
+        "evaluator_name": row["evaluator_name"],
+        "evaluator_version_id": row["evaluator_version_id"],
+        "match": bool(raw_score) if is_binary and raw_score is not None else None,
+        "score": raw_score if not is_binary else None,
+        "reasoning": row["reasoning"],
+        "completed_at": row["completed_at"],
+    }
+
+
+@router.post(
+    "/scores", response_model=TraceScoresResponse, summary="Get trace scores"
+)
+async def get_trace_scores_endpoint(
+    payload: TraceScoresRequest, ctx: OrgContext = Depends(get_current_org)
+):
+    """Get each trace's scores, keyed by trace ID"""
+    unique_ids = list(dict.fromkeys(payload.trace_ids))
+    scores = get_trace_scores_for_traces(ctx.org_uuid, unique_ids)
+    return {
+        "scores": {
+            trace_uuid: [_shape_score_entry(row) for row in rows]
+            for trace_uuid, rows in scores.items()
+        }
     }
 
 

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+import db
 from routers.traces import MAX_LIST_LIMIT
 from fastapi.testclient import TestClient
 
@@ -1358,3 +1359,85 @@ def test_convert_response_accepts_a_trace_with_no_tool_calls(client):
     assert created["type"] == "response"
     assert created["config"]["evaluation"] == {"type": "response"}
     assert created["config"]["history"] == payload["input"]
+
+
+def _trace_org_uuid(trace_uuid: str) -> str:
+    with db.get_db_connection() as conn:
+        return conn.execute(
+            "SELECT org_uuid FROM traces WHERE uuid = ?", (trace_uuid,)
+        ).fetchone()["org_uuid"]
+
+
+def test_traces_list_and_detail_expose_evaluators_expected(client):
+    h, agent_id = _signup_with_agent(client)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+
+    detail = client.get(f"/traces/{trace['uuid']}", headers=h).json()
+    assert detail["evaluators_expected"] == 0
+
+    listed = client.get("/traces", headers=h).json()["items"]
+    item = next(t for t in listed if t["uuid"] == trace["uuid"])
+    assert item["evaluators_expected"] == 0
+
+
+def test_get_trace_scores_returns_scores_for_requested_traces(client):
+    h, agent_id = _signup_with_agent(client)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    evaluator = _create_evaluator(client, h)
+
+    db.settle_trace_eval_success(
+        123456,
+        trace_uuid=trace["uuid"],
+        evaluator_uuid=evaluator["uuid"],
+        evaluator_version_id=1,
+        org_uuid=_trace_org_uuid(trace["uuid"]),
+        score=1.0,
+        reasoning="looks right",
+    )
+
+    res = client.post("/traces/scores", json={"trace_ids": [trace["uuid"]]}, headers=h)
+    assert res.status_code == 200, res.text
+    entries = res.json()["scores"][trace["uuid"]]
+    assert len(entries) == 1
+    assert entries[0]["evaluator_uuid"] == evaluator["uuid"]
+    assert entries[0]["evaluator_name"] == evaluator["name"]
+    assert entries[0]["match"] is True
+    assert entries[0]["score"] is None
+    assert entries[0]["reasoning"] == "looks right"
+
+
+def test_get_trace_scores_empty_list_for_unscored_trace(client):
+    h, agent_id = _signup_with_agent(client)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+
+    res = client.post("/traces/scores", json={"trace_ids": [trace["uuid"]]}, headers=h)
+    assert res.status_code == 200, res.text
+    assert res.json()["scores"] == {trace["uuid"]: []}
+
+
+def test_get_trace_scores_is_org_scoped(client):
+    h, agent_id = _signup_with_agent(client)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    evaluator = _create_evaluator(client, h)
+    db.settle_trace_eval_success(
+        123457,
+        trace_uuid=trace["uuid"],
+        evaluator_uuid=evaluator["uuid"],
+        evaluator_version_id=1,
+        org_uuid=_trace_org_uuid(trace["uuid"]),
+        score=1.0,
+        reasoning="looks right",
+    )
+
+    other_h, _ = _signup_with_agent(client)
+    res = client.post(
+        "/traces/scores", json={"trace_ids": [trace["uuid"]]}, headers=other_h
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["scores"] == {trace["uuid"]: []}
+
+
+def test_get_trace_scores_rejects_empty_trace_ids(client):
+    h, _ = _signup_with_agent(client)
+    res = client.post("/traces/scores", json={"trace_ids": []}, headers=h)
+    assert res.status_code == 422, res.text

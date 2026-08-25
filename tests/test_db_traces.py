@@ -253,3 +253,66 @@ def test_create_allows_null_labels():
     assert row["message_id"] is None
     assert row["conversation_id"] is None
     assert db.get_trace(org, row["uuid"])["message_id"] is None
+
+
+def test_new_traces_report_zero_evaluators_expected():
+    org = _org()
+    row = _ingest(org, "m-expected")
+    assert row["evaluators_expected"] == 0
+    assert db.get_trace(org, row["uuid"])["evaluators_expected"] == 0
+    assert db.get_traces_by_uuids(org, [row["uuid"]])[0]["evaluators_expected"] == 0
+
+
+def _evaluator(org: str) -> str:
+    evaluator_uuid = db.create_evaluator(
+        name=f"ev-{uuid.uuid4().hex[:6]}", org_uuid=org, owner_user_id=str(uuid.uuid4())
+    )
+    version = db.create_evaluator_version(
+        evaluator_uuid, judge_model="openai/gpt-4o", system_prompt="Judge this."
+    )
+    db.set_evaluator_live_version(evaluator_uuid, version["uuid"])
+    return evaluator_uuid
+
+
+def test_get_trace_scores_for_traces_buckets_by_trace_and_org():
+    org = _org()
+    other_org = _org()
+    trace = _ingest(org, "m-scores")
+    evaluator_uuid = _evaluator(org)
+
+    db.settle_trace_eval_success(
+        999999,
+        trace_uuid=trace["uuid"],
+        evaluator_uuid=evaluator_uuid,
+        evaluator_version_id=1,
+        org_uuid=org,
+        score=1.0,
+        reasoning="looks good",
+    )
+
+    scores = db.get_trace_scores_for_traces(org, [trace["uuid"]])
+    assert len(scores[trace["uuid"]]) == 1
+    entry = scores[trace["uuid"]][0]
+    assert entry["evaluator_uuid"] == evaluator_uuid
+    assert entry["evaluator_name"].startswith("ev-")
+    assert entry["output_type"] == "binary"
+    assert entry["score"] == 1.0
+    assert entry["reasoning"] == "looks good"
+    assert entry["completed_at"].endswith("Z")
+
+    # A different org never sees another org's scores, even if it happened
+    # to ask about the same trace UUID.
+    assert db.get_trace_scores_for_traces(other_org, [trace["uuid"]]) == {
+        trace["uuid"]: []
+    }
+
+
+def test_get_trace_scores_for_traces_empty_for_unscored_traces():
+    org = _org()
+    trace = _ingest(org, "m-unscored")
+    scores = db.get_trace_scores_for_traces(org, [trace["uuid"]])
+    assert scores == {trace["uuid"]: []}
+
+
+def test_get_trace_scores_for_traces_handles_empty_input():
+    assert db.get_trace_scores_for_traces(_org(), []) == {}
