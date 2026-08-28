@@ -239,10 +239,24 @@ def is_name_taken(
         return cursor.fetchone() is not None
 
 
+# UPDATE...RETURNING in claim_trace_evaluations needs SQLite 3.35+. Assert at
+# boot so an ancient libsqlite fails before the first scoring claim.
+SQLITE_RETURNING_MIN = (3, 35, 0)
+
+
+def assert_sqlite_returning_support() -> None:
+    if sqlite3.sqlite_version_info < SQLITE_RETURNING_MIN:
+        raise RuntimeError(
+            f"SQLite {sqlite3.sqlite_version} is too old for trace scoring "
+            "(need 3.35+ for UPDATE...RETURNING)"
+        )
+
+
 def init_db():
     """Initialize the database and create tables if they don't exist."""
     # Ensure the data directory exists
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    assert_sqlite_returning_support()
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -5528,22 +5542,24 @@ def get_evaluator(evaluator_uuid: str) -> Optional[Dict[str, Any]]:
 
 def get_evaluators_by_uuids(
     evaluator_uuids: List[str],
+    include_deleted: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Bulk variant of `get_evaluator` — single query for many UUIDs.
-    Returns `{uuid: evaluator_row}`; missing or soft-deleted UUIDs are
-    omitted from the result. Use this when a caller would otherwise loop
-    `get_evaluator(...)` per id (N+1)."""
+    Returns `{uuid: evaluator_row}`; missing UUIDs are omitted. Soft-deleted
+    rows are omitted unless `include_deleted=True` (pinned historical versions
+    still need the evaluator's name and `output_type`)."""
     if not evaluator_uuids:
         return {}
     unique_uuids = list({u for u in evaluator_uuids if u})
     if not unique_uuids:
         return {}
     placeholders = ",".join("?" for _ in unique_uuids)
+    deleted_clause = "" if include_deleted else " AND deleted_at IS NULL"
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             f"SELECT * FROM evaluators "
-            f"WHERE uuid IN ({placeholders}) AND deleted_at IS NULL",
+            f"WHERE uuid IN ({placeholders}){deleted_clause}",
             unique_uuids,
         )
         return {row["uuid"]: _parse_evaluator_row(row) for row in cursor.fetchall()}
@@ -10553,3 +10569,244 @@ def delete_pending_trace_evaluations_for_agent(
         deleted = _delete_pending_trace_evaluations(conn.cursor(), agent_id, org_uuid)
         conn.commit()
         return deleted
+
+
+def _trace_eval_row(row: sqlite3.Row) -> Dict[str, Any]:
+    return dict(row)
+
+
+def _trace_scoring_skip_reason_on(
+    cur: sqlite3.Cursor, org_uuid: str, trace_uuid: str, agent_id: str
+) -> Optional[str]:
+    """Return `trace_deleted` / `agent_deleted` if either row is gone or
+    soft-deleted, else None. Trace is checked first."""
+    trace = cur.execute(
+        "SELECT deleted_at FROM traces WHERE uuid = ? AND org_uuid = ?",
+        (trace_uuid, org_uuid),
+    ).fetchone()
+    if trace is None or trace["deleted_at"] is not None:
+        return "trace_deleted"
+    agent = cur.execute(
+        "SELECT deleted_at FROM agents WHERE uuid = ?", (agent_id,)
+    ).fetchone()
+    if agent is None or agent["deleted_at"] is not None:
+        return "agent_deleted"
+    return None
+
+
+def trace_scoring_skip_reason(
+    org_uuid: str, trace_uuid: str, agent_id: str
+) -> Optional[str]:
+    with get_db_connection() as conn:
+        return _trace_scoring_skip_reason_on(
+            conn.cursor(), org_uuid, trace_uuid, agent_id
+        )
+
+
+def get_trace_evaluation(run_uuid: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM trace_evaluations WHERE uuid = ?", (run_uuid,)
+        ).fetchone()
+        return _trace_eval_row(row) if row else None
+
+
+def get_trace_scores(run_uuid: str) -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trace_scores WHERE run_uuid = ? "
+            "ORDER BY evaluator_uuid",
+            (run_uuid,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def claim_trace_evaluations(
+    *,
+    now: int,
+    lease_seconds: int,
+    batch_size: int,
+) -> List[Dict[str, Any]]:
+    """Atomically claim up to `batch_size` open runs, oldest `available_at` first.
+
+    `available_at` is both readiness and lease expiry, so expired `processing`
+    rows are reclaimed by the same scan as fresh `pending` ones. BEGIN
+    IMMEDIATE takes the write lock up front so SQLITE_BUSY honours
+    busy_timeout (a deferred BEGIN upgrades at the first write and can
+    busy-fail immediately). Requires SQLite 3.35+ (`UPDATE...RETURNING`).
+    """
+    assert_sqlite_returning_support()
+    if batch_size <= 0:
+        return []
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            """
+            UPDATE trace_evaluations
+               SET status = 'processing',
+                   available_at = ?,
+                   attempts = attempts + 1,
+                   updated_at = ?
+             WHERE id IN (
+                     SELECT id FROM trace_evaluations
+                      WHERE status IN ('pending', 'processing')
+                        AND available_at <= ?
+                      ORDER BY available_at, id
+                      LIMIT ?
+                   )
+            RETURNING uuid, trace_uuid, org_uuid, agent_id, criteria, attempts,
+                      status, available_at
+            """,
+            (now + lease_seconds, now, now, batch_size),
+        )
+        rows = [_trace_eval_row(r) for r in cur.fetchall()]
+        conn.commit()
+    return rows
+
+
+def _upsert_trace_scores(
+    cur: sqlite3.Cursor,
+    *,
+    run_uuid: str,
+    trace_uuid: str,
+    org_uuid: str,
+    scores: List[Dict[str, Any]],
+    now: int,
+) -> None:
+    for score in scores:
+        cur.execute(
+            """
+            INSERT INTO trace_scores
+                (run_uuid, trace_uuid, evaluator_uuid, evaluator_version_id,
+                 org_uuid, match, score, reasoning, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (run_uuid, evaluator_uuid) DO UPDATE SET
+                evaluator_version_id = excluded.evaluator_version_id,
+                match = excluded.match,
+                score = excluded.score,
+                reasoning = excluded.reasoning,
+                completed_at = excluded.completed_at
+            """,
+            (
+                run_uuid,
+                trace_uuid,
+                score["evaluator_uuid"],
+                score["evaluator_version_id"],
+                org_uuid,
+                score["match"],
+                score["score"],
+                score.get("reasoning"),
+                now,
+            ),
+        )
+
+
+def settle_trace_evaluation_completed(
+    run_uuid: str,
+    scores: List[Dict[str, Any]],
+    *,
+    now: int,
+) -> str:
+    """Status-guarded complete: write scores only if this worker still owns the run.
+
+    Re-checks trace/agent liveness inside the same transaction. Returns
+    `completed`, `skipped` (deleted after claim), or `noop` (already settled).
+    """
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        run = cur.execute(
+            "SELECT uuid, trace_uuid, org_uuid, agent_id, status "
+            "FROM trace_evaluations WHERE uuid = ?",
+            (run_uuid,),
+        ).fetchone()
+        if run is None or run["status"] != "processing":
+            conn.rollback()
+            return "noop"
+        skip = _trace_scoring_skip_reason_on(
+            cur, run["org_uuid"], run["trace_uuid"], run["agent_id"]
+        )
+        if skip:
+            cur.execute(
+                "UPDATE trace_evaluations "
+                "SET status = 'skipped', error = ?, completed_at = ?, "
+                "updated_at = ? WHERE uuid = ? AND status = 'processing'",
+                (skip, now, now, run_uuid),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return "noop"
+            conn.commit()
+            return "skipped"
+        cur.execute(
+            "UPDATE trace_evaluations "
+            "SET status = 'completed', error = NULL, completed_at = ?, "
+            "updated_at = ? WHERE uuid = ? AND status = 'processing'",
+            (now, now, run_uuid),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return "noop"
+        _upsert_trace_scores(
+            cur,
+            run_uuid=run_uuid,
+            trace_uuid=run["trace_uuid"],
+            org_uuid=run["org_uuid"],
+            scores=scores,
+            now=now,
+        )
+        conn.commit()
+        return "completed"
+
+
+def settle_trace_evaluation_terminal(
+    run_uuid: str,
+    status: str,
+    *,
+    error: Optional[str],
+    now: int,
+) -> bool:
+    """Status-guarded `failed` / `skipped`. True if this worker wrote the row."""
+    if status not in ("failed", "skipped"):
+        raise ValueError(f"terminal status must be failed or skipped, got {status!r}")
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE trace_evaluations "
+            "SET status = ?, error = ?, completed_at = ?, updated_at = ? "
+            "WHERE uuid = ? AND status = 'processing'",
+            (status, error, now, now, run_uuid),
+        )
+        won = cur.rowcount == 1
+        if won:
+            conn.commit()
+        else:
+            conn.rollback()
+        return won
+
+
+def defer_trace_evaluation(
+    run_uuid: str,
+    *,
+    available_at: int,
+    now: int,
+    error: Optional[str] = None,
+) -> bool:
+    """Return a still-owned run to `pending` for retry. True if this worker wrote."""
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE trace_evaluations "
+            "SET status = 'pending', available_at = ?, updated_at = ?, error = ? "
+            "WHERE uuid = ? AND status = 'processing'",
+            (available_at, now, error, run_uuid),
+        )
+        won = cur.rowcount == 1
+        if won:
+            conn.commit()
+        else:
+            conn.rollback()
+        return won
