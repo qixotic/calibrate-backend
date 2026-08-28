@@ -8,6 +8,8 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+import db
+
 
 @pytest.fixture(scope="module")
 def app():
@@ -200,9 +202,11 @@ def test_list_agents_returns_trimmed_summary(client):
         "updated_at",
         "connection_verified",
         "has_default_inputs",
+        "auto_score_traces",
     }
     assert item["name"] == name
     assert item["type"] == "agent"
+    assert item["auto_score_traces"] is False
     assert item["created_at"]
     assert item["updated_at"]
 
@@ -446,18 +450,25 @@ def test_update_agent_with_api_key_cannot_self_attest_verification(client):
 # ============ Agent <-> Evaluator association ============
 
 
-def _create_evaluator(client, h, name=None):
-    """Create a minimal LLM evaluator owned by the caller's org."""
+def _create_evaluator(
+    client, h, name=None, evaluator_type="llm", variables=None
+):
+    """Create a minimal evaluator owned by the caller's org."""
+    version = {
+        "judge_model": "openai/gpt-4.1",
+        "system_prompt": (
+            "Judge {{criteria}} carefully" if variables else "Judge the reply."
+        ),
+    }
+    if variables is not None:
+        version["variables"] = variables
     resp = client.post(
         "/evaluators",
         json={
             "name": name or f"ev-{uuid.uuid4().hex[:6]}",
-            "evaluator_type": "llm",
+            "evaluator_type": evaluator_type,
             "output_type": "binary",
-            "version": {
-                "judge_model": "openai/gpt-4.1",
-                "system_prompt": "Judge the reply.",
-            },
+            "version": version,
         },
         headers=h,
     )
@@ -1026,3 +1037,449 @@ def test_presave_verify_sends_the_body_its_stated_type_expects(client, monkeypat
     assert sent["body"] == {
         "messages": [{"role": "user", "content": "Hello, are you there?"}]
     }
+
+
+# ============ auto_score_traces + eligibility ============
+
+
+def _unlink_all_evaluators(client, h, agent_uuid):
+    items = client.get(f"/agents/{agent_uuid}/evaluators", headers=h).json()["items"]
+    for ev in items:
+        r = client.delete(f"/agents/{agent_uuid}/evaluators/{ev['uuid']}", headers=h)
+        assert r.status_code == 200, r.text
+
+
+def _link_evaluators(client, h, agent_uuid, *evaluator_ids):
+    r = client.post(
+        f"/agents/{agent_uuid}/evaluators",
+        json={"evaluator_ids": list(evaluator_ids)},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+
+
+def _insert_run(org, agent_id, trace_uuid, status, **overrides):
+    row = {
+        "uuid": str(uuid.uuid4()),
+        "trace_uuid": trace_uuid,
+        "org_uuid": org,
+        "agent_id": agent_id,
+        "status": status,
+        "criteria": None,
+        "available_at": 0,
+        "attempts": 0,
+        "error": None,
+        "created_at": 1,
+        "updated_at": 1,
+        "completed_at": None,
+    }
+    row.update(overrides)
+    with db.get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO trace_evaluations "
+            "(uuid, trace_uuid, org_uuid, agent_id, status, criteria, "
+            "available_at, attempts, error, created_at, updated_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["uuid"],
+                row["trace_uuid"],
+                row["org_uuid"],
+                row["agent_id"],
+                row["status"],
+                row["criteria"],
+                row["available_at"],
+                row["attempts"],
+                row["error"],
+                row["created_at"],
+                row["updated_at"],
+                row["completed_at"],
+            ),
+        )
+        conn.commit()
+    return row["uuid"]
+
+
+def test_agent_reads_include_auto_score_traces_off_by_default(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-read-{uuid.uuid4().hex[:6]}")
+
+    got = client.get(f"/agents/{agent['uuid']}", headers=h)
+    assert got.status_code == 200, got.text
+    assert got.json()["auto_score_traces"] is False
+
+    listed = client.get("/agents", headers=h)
+    item = next(a for a in listed.json()["items"] if a["uuid"] == agent["uuid"])
+    assert item["auto_score_traces"] is False
+
+
+def test_omitting_auto_score_traces_leaves_it_unchanged(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-omit-{uuid.uuid4().hex[:6]}")
+    clean = _create_evaluator(client, h, name=f"omit-clean-{uuid.uuid4().hex[:6]}")
+    _unlink_all_evaluators(client, h, agent["uuid"])
+    _link_evaluators(client, h, agent["uuid"], clean)
+
+    enabled = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["auto_score_traces"] is True
+
+    renamed = f"flag-omit-renamed-{uuid.uuid4().hex[:6]}"
+    r = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"name": renamed},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == renamed
+    assert r.json()["auto_score_traces"] is True
+
+
+def test_enable_auto_score_traces_conversation_with_eligible_llm(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-on-{uuid.uuid4().hex[:6]}")
+    clean = _create_evaluator(client, h, name=f"conv-clean-{uuid.uuid4().hex[:6]}")
+    _unlink_all_evaluators(client, h, agent["uuid"])
+    _link_evaluators(client, h, agent["uuid"], clean)
+
+    r = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is True
+    fetched = client.get(f"/agents/{agent['uuid']}", headers=h).json()
+    assert fetched["auto_score_traces"] is True
+
+
+def test_enable_auto_score_traces_general_with_eligible_llm_general(client):
+    h = _signup(client)
+    created = client.post(
+        "/agents",
+        json={
+            "name": f"flag-gen-{uuid.uuid4().hex[:6]}",
+            "type": "agent",
+            "interaction_type": "general",
+        },
+        headers=h,
+    ).json()
+    clean = _create_evaluator(
+        client,
+        h,
+        name=f"gen-clean-{uuid.uuid4().hex[:6]}",
+        evaluator_type="llm-general",
+    )
+    _unlink_all_evaluators(client, h, created["uuid"])
+    _link_evaluators(client, h, created["uuid"], clean)
+
+    r = client.put(
+        f"/agents/{created['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is True
+    assert r.json()["interaction_type"] == "general"
+
+
+def test_enable_rejected_when_only_default_correctness_evaluator_is_linked(client):
+    """The seeded correctness defaults declare `{{criteria}}`, so a new agent
+    has zero eligible evaluators and cannot opt in."""
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-block-{uuid.uuid4().hex[:6]}")
+
+    r = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    body = r.json()["detail"]
+    assert body["error"] == (
+        "There are no eligible evaluators configured for this agent"
+    )
+    assert body["ineligible"]
+    assert {e["reason"] for e in body["ineligible"]} == {"declares_variables"}
+    assert client.get(f"/agents/{agent['uuid']}", headers=h).json()[
+        "auto_score_traces"
+    ] is False
+
+
+def test_enable_rejected_for_general_agent_with_only_default_evaluator(client):
+    h = _signup(client)
+    created = client.post(
+        "/agents",
+        json={
+            "name": f"flag-gen-block-{uuid.uuid4().hex[:6]}",
+            "type": "agent",
+            "interaction_type": "general",
+        },
+        headers=h,
+    ).json()
+
+    r = client.put(
+        f"/agents/{created['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    assert {e["reason"] for e in r.json()["detail"]["ineligible"]} == {
+        "declares_variables"
+    }
+
+
+def test_eligibility_endpoint_partitions_mixed_evaluator_types(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"elig-mix-{uuid.uuid4().hex[:6]}")
+    clean = _create_evaluator(client, h, name=f"mix-clean-{uuid.uuid4().hex[:6]}")
+    general = _create_evaluator(
+        client,
+        h,
+        name=f"mix-general-{uuid.uuid4().hex[:6]}",
+        evaluator_type="llm-general",
+    )
+    stt = _create_evaluator(
+        client, h, name=f"mix-stt-{uuid.uuid4().hex[:6]}", evaluator_type="stt"
+    )
+    _link_evaluators(client, h, agent["uuid"], clean, general, stt)
+
+    r = client.get(
+        f"/agents/{agent['uuid']}/trace-scoring-eligibility", headers=h
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body.keys()) == {"eligible", "ineligible"}
+    assert [e["evaluator_uuid"] for e in body["eligible"]] == [clean]
+    assert body["eligible"][0]["name"]
+    assert body["eligible"][0]["evaluator_version_id"]
+    by_id = {e["evaluator_uuid"]: e["reason"] for e in body["ineligible"]}
+    assert by_id[general] == "wrong_type_for_agent"
+    assert by_id[stt] == "wrong_type_for_agent"
+    assert "declares_variables" in by_id.values()
+
+
+def test_eligibility_endpoint_reports_each_disqualification_reason(client):
+    h = _signup(client)
+    conv = _create_agent(client, h, f"elig-reasons-{uuid.uuid4().hex[:6]}")
+    with_vars = _create_evaluator(
+        client,
+        h,
+        name=f"reason-vars-{uuid.uuid4().hex[:6]}",
+        variables=[{"name": "criteria"}],
+    )
+    wrong_type = _create_evaluator(
+        client,
+        h,
+        name=f"reason-type-{uuid.uuid4().hex[:6]}",
+        evaluator_type="llm-general",
+    )
+    agent_row = db.get_agent(conv["uuid"])
+    no_live = db.create_evaluator(
+        name=f"reason-nolive-{uuid.uuid4().hex[:6]}",
+        evaluator_type="llm",
+        org_uuid=agent_row["org_uuid"],
+    )
+    _unlink_all_evaluators(client, h, conv["uuid"])
+    _link_evaluators(client, h, conv["uuid"], with_vars, wrong_type)
+    db.add_evaluator_to_agent(conv["uuid"], no_live)
+
+    r = client.get(
+        f"/agents/{conv['uuid']}/trace-scoring-eligibility", headers=h
+    )
+    assert r.status_code == 200, r.text
+    by_id = {e["evaluator_uuid"]: e["reason"] for e in r.json()["ineligible"]}
+    assert by_id[with_vars] == "declares_variables"
+    assert by_id[wrong_type] == "wrong_type_for_agent"
+    assert by_id[no_live] == "no_live_version"
+    assert r.json()["eligible"] == []
+
+    blocked = client.put(
+        f"/agents/{conv['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    assert blocked.status_code == 422, blocked.text
+    assert {e["reason"] for e in blocked.json()["detail"]["ineligible"]} == {
+        "declares_variables",
+        "wrong_type_for_agent",
+        "no_live_version",
+    }
+
+
+def test_eligibility_endpoint_is_jwt_only_and_org_scoped(client):
+    ha = _signup(client)
+    agent = _create_agent(client, ha, f"elig-auth-{uuid.uuid4().hex[:6]}")
+    raw = _raw_key(client, ha)
+
+    keyed = client.get(
+        f"/agents/{agent['uuid']}/trace-scoring-eligibility",
+        headers={"X-API-Key": raw},
+    )
+    assert keyed.status_code == 403
+
+    missing = client.get(
+        f"/agents/{uuid.uuid4()}/trace-scoring-eligibility", headers=ha
+    )
+    assert missing.status_code == 404
+
+    from main import _build_public_openapi
+
+    assert (
+        "/agents/{agent_uuid}/trace-scoring-eligibility"
+        not in _build_public_openapi()["paths"]
+    )
+
+    hb = _signup(client)
+    other = client.get(
+        f"/agents/{agent['uuid']}/trace-scoring-eligibility", headers=hb
+    )
+    assert other.status_code == 403
+    assert "organization_uuid" not in other.json()
+
+
+def test_disable_auto_score_traces_deletes_pending_runs_only(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-off-{uuid.uuid4().hex[:6]}")
+    clean = _create_evaluator(client, h, name=f"off-clean-{uuid.uuid4().hex[:6]}")
+    _unlink_all_evaluators(client, h, agent["uuid"])
+    _link_evaluators(client, h, agent["uuid"], clean)
+    assert (
+        client.put(
+            f"/agents/{agent['uuid']}",
+            json={"auto_score_traces": True},
+            headers=h,
+        ).status_code
+        == 200
+    )
+
+    agent_row = db.get_agent(agent["uuid"])
+    org = agent_row["org_uuid"]
+    pending_trace = db.create_trace(
+        org_uuid=org,
+        agent_id=agent["uuid"],
+        input=[{"role": "user", "content": "hi"}],
+        output={"response": "hello", "tool_calls": None},
+    )
+    processing_trace = db.create_trace(
+        org_uuid=org,
+        agent_id=agent["uuid"],
+        input=[{"role": "user", "content": "hi"}],
+        output={"response": "hello", "tool_calls": None},
+    )
+    completed_trace = db.create_trace(
+        org_uuid=org,
+        agent_id=agent["uuid"],
+        input=[{"role": "user", "content": "hi"}],
+        output={"response": "hello", "tool_calls": None},
+    )
+    pending = _insert_run(org, agent["uuid"], pending_trace["uuid"], "pending")
+    processing = _insert_run(
+        org, agent["uuid"], processing_trace["uuid"], "processing"
+    )
+    completed = _insert_run(
+        org,
+        agent["uuid"],
+        completed_trace["uuid"],
+        "completed",
+        completed_at=5,
+    )
+
+    r = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"auto_score_traces": False},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is False
+
+    with db.get_db_connection() as conn:
+        remaining = {
+            row["uuid"]: row["status"]
+            for row in conn.execute(
+                "SELECT uuid, status FROM trace_evaluations "
+                "WHERE uuid IN (?, ?, ?)",
+                (pending, processing, completed),
+            ).fetchall()
+        }
+    assert pending not in remaining
+    assert remaining[processing] == "processing"
+    assert remaining[completed] == "completed"
+
+
+def test_omitting_auto_score_traces_does_not_delete_pending_runs(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-omit-runs-{uuid.uuid4().hex[:6]}")
+    clean = _create_evaluator(client, h, name=f"omit-run-{uuid.uuid4().hex[:6]}")
+    _unlink_all_evaluators(client, h, agent["uuid"])
+    _link_evaluators(client, h, agent["uuid"], clean)
+    client.put(
+        f"/agents/{agent['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    agent_row = db.get_agent(agent["uuid"])
+    trace = db.create_trace(
+        org_uuid=agent_row["org_uuid"],
+        agent_id=agent["uuid"],
+        input=[{"role": "user", "content": "hi"}],
+        output={"response": "hello", "tool_calls": None},
+    )
+    pending = _insert_run(
+        agent_row["org_uuid"], agent["uuid"], trace["uuid"], "pending"
+    )
+
+    r = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"name": f"flag-omit-runs-renamed-{uuid.uuid4().hex[:6]}"},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is True
+    with db.get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM trace_evaluations WHERE uuid = ?", (pending,)
+        ).fetchone()
+    assert row["status"] == "pending"
+
+
+def test_enable_auto_score_traces_with_api_key(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-key-{uuid.uuid4().hex[:6]}")
+    clean = _create_evaluator(client, h, name=f"key-clean-{uuid.uuid4().hex[:6]}")
+    _unlink_all_evaluators(client, h, agent["uuid"])
+    _link_evaluators(client, h, agent["uuid"], clean)
+    raw = _raw_key(client, h)
+
+    r = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"auto_score_traces": True},
+        headers={"X-API-Key": raw},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is True
+
+
+def test_duplicate_agent_does_not_copy_auto_score_traces(client):
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-dup-{uuid.uuid4().hex[:6]}")
+    clean = _create_evaluator(client, h, name=f"dup-clean-{uuid.uuid4().hex[:6]}")
+    _unlink_all_evaluators(client, h, agent["uuid"])
+    _link_evaluators(client, h, agent["uuid"], clean)
+    client.put(
+        f"/agents/{agent['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+
+    dup = client.post(
+        f"/agents/{agent['uuid']}/duplicate",
+        json={"name": f"flag-dup-copy-{uuid.uuid4().hex[:6]}"},
+        headers=h,
+    )
+    assert dup.status_code == 200, dup.text
+    copied = client.get(f"/agents/{dup.json()['uuid']}", headers=h).json()
+    assert copied["auto_score_traces"] is False

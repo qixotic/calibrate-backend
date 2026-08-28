@@ -4307,6 +4307,7 @@ def _parse_agent_row(row: sqlite3.Row) -> Dict[str, Any]:
     # Deserialize config from JSON string
     if agent.get("config"):
         agent["config"] = json.loads(agent["config"])
+    agent["auto_score_traces"] = bool(agent.get("auto_score_traces"))
 
     return agent
 
@@ -4364,8 +4365,15 @@ def update_agent(
     name: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
     interaction_type: Optional[str] = None,
+    auto_score_traces: Optional[bool] = None,
+    org_uuid: Optional[str] = None,
 ) -> bool:
-    """Update an agent. Returns True if the agent was found and updated."""
+    """Update an agent. Returns True if the agent was found and updated.
+
+    Turning `auto_score_traces` off deletes this agent's `pending`
+    `trace_evaluations` in the same transaction. `processing` and terminal
+    runs are left alone so in-flight judge spend is not thrown away.
+    """
     # Build dynamic update query
     updates = []
     params = []
@@ -4380,6 +4388,9 @@ def update_agent(
     if interaction_type is not None:
         updates.append("interaction_type = ?")
         params.append(interaction_type)
+    if auto_score_traces is not None:
+        updates.append("auto_score_traces = ?")
+        params.append(1 if auto_score_traces else 0)
 
     if not updates:
         return False
@@ -4394,10 +4405,14 @@ def update_agent(
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(query, params)
-        conn.commit()
         updated = cursor.rowcount > 0
+        if updated and auto_score_traces is False:
+            _delete_pending_trace_evaluations(cursor, agent_uuid, org_uuid)
         if updated:
+            conn.commit()
             logger.info(f"Updated agent with UUID: {agent_uuid}")
+        else:
+            conn.rollback()
         return updated
 
 
@@ -10378,3 +10393,34 @@ def soft_delete_traces(org_uuid: str, *, trace_ids: List[str]) -> int:
             deleted += cursor.rowcount or 0
         conn.commit()
     return deleted
+
+
+def _delete_pending_trace_evaluations(
+    cursor: sqlite3.Cursor,
+    agent_id: str,
+    org_uuid: Optional[str] = None,
+) -> int:
+    """Delete never-started runs for an agent. Leaves processing/terminal rows."""
+    if org_uuid:
+        cursor.execute(
+            "DELETE FROM trace_evaluations "
+            "WHERE agent_id = ? AND org_uuid = ? AND status = 'pending'",
+            (agent_id, org_uuid),
+        )
+    else:
+        cursor.execute(
+            "DELETE FROM trace_evaluations WHERE agent_id = ? AND status = 'pending'",
+            (agent_id,),
+        )
+    return cursor.rowcount or 0
+
+
+def delete_pending_trace_evaluations_for_agent(
+    agent_id: str, org_uuid: Optional[str] = None
+) -> int:
+    """Delete this agent's pending trace-scoring runs. Processing and terminal
+    runs are left in place."""
+    with get_db_connection() as conn:
+        deleted = _delete_pending_trace_evaluations(conn.cursor(), agent_id, org_uuid)
+        conn.commit()
+        return deleted

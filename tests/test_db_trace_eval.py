@@ -269,6 +269,78 @@ def test_same_version_scores_are_preserved_across_distinct_runs():
     assert rows[1]["reasoning"] == "rescore"
 
 
+def test_delete_pending_trace_evaluations_leaves_processing_and_terminal():
+    org = _org()
+    agent_id = str(uuid.uuid4())
+    pending_trace = _ingest_trace(org, agent_id=agent_id)
+    processing_trace = _ingest_trace(org, agent_id=agent_id)
+    completed_trace = _ingest_trace(org, agent_id=agent_id)
+    failed_trace = _ingest_trace(org, agent_id=agent_id)
+    skipped_trace = _ingest_trace(org, agent_id=agent_id)
+    other_agent_trace = _ingest_trace(org, agent_id="other-agent")
+
+    pending = _insert_run(
+        org, pending_trace["uuid"], agent_id=agent_id, status="pending"
+    )
+    processing = _insert_run(
+        org, processing_trace["uuid"], agent_id=agent_id, status="processing"
+    )
+    completed = _insert_run(
+        org,
+        completed_trace["uuid"],
+        agent_id=agent_id,
+        status="completed",
+        completed_at=5,
+    )
+    failed = _insert_run(
+        org, failed_trace["uuid"], agent_id=agent_id, status="failed", completed_at=6
+    )
+    skipped = _insert_run(
+        org, skipped_trace["uuid"], agent_id=agent_id, status="skipped", completed_at=7
+    )
+    other_pending = _insert_run(
+        org, other_agent_trace["uuid"], agent_id="other-agent", status="pending"
+    )
+
+    deleted = db.delete_pending_trace_evaluations_for_agent(agent_id, org)
+    assert deleted == 1
+    with db.get_db_connection() as conn:
+        remaining = {
+            r["uuid"]: r["status"]
+            for r in conn.execute(
+                "SELECT uuid, status FROM trace_evaluations "
+                "WHERE uuid IN (?, ?, ?, ?, ?, ?)",
+                (pending, processing, completed, failed, skipped, other_pending),
+            ).fetchall()
+        }
+    assert pending not in remaining
+    assert remaining[processing] == "processing"
+    assert remaining[completed] == "completed"
+    assert remaining[failed] == "failed"
+    assert remaining[skipped] == "skipped"
+    assert remaining[other_pending] == "pending"
+
+
+def test_delete_pending_without_org_uuid_still_scopes_to_agent():
+    org = _org()
+    agent_id = str(uuid.uuid4())
+    trace = _ingest_trace(org, agent_id=agent_id)
+    pending = _insert_run(org, trace["uuid"], agent_id=agent_id, status="pending")
+    deleted = db.delete_pending_trace_evaluations_for_agent(agent_id)
+    assert deleted == 1
+    with db.get_db_connection() as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM trace_evaluations WHERE uuid = ?", (pending,)
+            ).fetchone()
+            is None
+        )
+
+
+def test_update_agent_auto_score_traces_missing_row_is_false():
+    assert db.update_agent(str(uuid.uuid4()), auto_score_traces=True) is False
+
+
 def test_same_run_evaluator_is_unique():
     org = _org()
     trace = _ingest_trace(org)
