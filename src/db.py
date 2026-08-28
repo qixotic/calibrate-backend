@@ -10767,17 +10767,34 @@ def settle_trace_evaluation_terminal(
     error: Optional[str],
     now: int,
 ) -> bool:
-    """Status-guarded `failed` / `skipped`. True if this worker wrote the row."""
+    """Status-guarded `failed` / `skipped`. True if this worker wrote the row.
+
+    A trace/agent deleted after claim becomes `skipped` (`trace_deleted` /
+    `agent_deleted`) even when the caller asked for `failed`.
+    """
     if status not in ("failed", "skipped"):
         raise ValueError(f"terminal status must be failed or skipped, got {status!r}")
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
+        run = cur.execute(
+            "SELECT uuid, trace_uuid, org_uuid, agent_id, status "
+            "FROM trace_evaluations WHERE uuid = ?",
+            (run_uuid,),
+        ).fetchone()
+        if run is None or run["status"] != "processing":
+            conn.rollback()
+            return False
+        skip = _trace_scoring_skip_reason_on(
+            cur, run["org_uuid"], run["trace_uuid"], run["agent_id"]
+        )
+        final_status = "skipped" if skip else status
+        final_error = skip if skip else error
         cur.execute(
             "UPDATE trace_evaluations "
             "SET status = ?, error = ?, completed_at = ?, updated_at = ? "
             "WHERE uuid = ? AND status = 'processing'",
-            (status, error, now, now, run_uuid),
+            (final_status, final_error, now, now, run_uuid),
         )
         won = cur.rowcount == 1
         if won:
@@ -10794,16 +10811,38 @@ def defer_trace_evaluation(
     now: int,
     error: Optional[str] = None,
 ) -> bool:
-    """Return a still-owned run to `pending` for retry. True if this worker wrote."""
+    """Return a still-owned run to `pending` for retry. True if this worker wrote.
+
+    Deleted traces/agents skip instead of deferring, matching completed settlement.
+    """
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
-        cur.execute(
-            "UPDATE trace_evaluations "
-            "SET status = 'pending', available_at = ?, updated_at = ?, error = ? "
-            "WHERE uuid = ? AND status = 'processing'",
-            (available_at, now, error, run_uuid),
+        run = cur.execute(
+            "SELECT uuid, trace_uuid, org_uuid, agent_id, status "
+            "FROM trace_evaluations WHERE uuid = ?",
+            (run_uuid,),
+        ).fetchone()
+        if run is None or run["status"] != "processing":
+            conn.rollback()
+            return False
+        skip = _trace_scoring_skip_reason_on(
+            cur, run["org_uuid"], run["trace_uuid"], run["agent_id"]
         )
+        if skip:
+            cur.execute(
+                "UPDATE trace_evaluations "
+                "SET status = 'skipped', error = ?, completed_at = ?, "
+                "updated_at = ? WHERE uuid = ? AND status = 'processing'",
+                (skip, now, now, run_uuid),
+            )
+        else:
+            cur.execute(
+                "UPDATE trace_evaluations "
+                "SET status = 'pending', available_at = ?, updated_at = ?, error = ? "
+                "WHERE uuid = ? AND status = 'processing'",
+                (available_at, now, error, run_uuid),
+            )
         won = cur.rowcount == 1
         if won:
             conn.commit()

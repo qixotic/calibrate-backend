@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import random
+import shutil
 import subprocess
 import threading
 import uuid
@@ -141,6 +142,17 @@ def _passing_invoke(config, dataset, **kwargs):
             }
         )
     return ts.EvalOnlyCliResult(returncode=0, timed_out=False, results=results)
+
+
+class _FakePopen:
+    """Popen stand-in: `poll()` is None while `returncode` is None."""
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        if self.returncode is None:
+            self.returncode = -9
 
 
 def test_sqlite_returning_support_rejects_old_versions(monkeypatch):
@@ -412,7 +424,7 @@ def test_shuffled_results_still_map_and_incomplete_is_not_settled():
         assert db.get_trace_evaluation(run["uuid"])["status"] == "completed"
 
 
-def test_partial_results_settle_only_finished_runs():
+def test_partial_results_settle_finished_and_defer_the_rest():
     org = _org()
     first = _setup_pending(org)
     second = _setup_pending(org)
@@ -425,14 +437,17 @@ def test_partial_results_settle_only_finished_runs():
         kept = [row for row in result.results if row["test_case_id"] == keep_id]
         return ts.EvalOnlyCliResult(returncode=1, timed_out=False, results=kept)
 
-    ts.process_claimed_runs(claimed, now=5, invoke=partial)
+    rng = random.Random(0)
+    ts.process_claimed_runs(claimed, now=5, invoke=partial, rng=rng, max_attempts=5)
     assert db.get_trace_evaluation(first[4]["uuid"])["status"] == "completed"
     leftover = db.get_trace_evaluation(second[4]["uuid"])
-    assert leftover["status"] == "processing"
+    assert leftover["status"] == "pending"
+    assert leftover["available_at"] > 5
+    assert leftover["attempts"] == 1
     assert db.get_trace_scores(second[4]["uuid"]) == []
 
 
-def test_timeout_parses_partial_and_leaves_unfinished_processing():
+def test_timeout_parses_partial_and_defers_unfinished_with_jitter():
     org = _org()
     first = _setup_pending(org)
     second = _setup_pending(org)
@@ -447,9 +462,113 @@ def test_timeout_parses_partial_and_leaves_unfinished_processing():
             returncode=-9, timed_out=True, results=kept, error="timed out"
         )
 
-    ts.process_claimed_runs(claimed, now=5, invoke=timed_out)
+    rng = random.Random(1)
+    expected_at = ts.backoff_available_at(1, 5, random.Random(1))
+    ts.process_claimed_runs(claimed, now=5, invoke=timed_out, rng=rng, max_attempts=5)
     assert db.get_trace_evaluation(first[4]["uuid"])["status"] == "completed"
-    assert db.get_trace_evaluation(second[4]["uuid"])["status"] == "processing"
+    leftover = db.get_trace_evaluation(second[4]["uuid"])
+    assert leftover["status"] == "pending"
+    assert leftover["available_at"] == expected_at
+    assert "timed out" in leftover["error"]
+
+
+def test_partial_unfinished_hits_attempt_ceiling_without_reassembling():
+    org = _org()
+    first = _setup_pending(org)
+    second = _setup_pending(org)
+    leftover_uuid = second[4]["uuid"]
+    _isolate([first[4]["uuid"], leftover_uuid], at=0)
+    claimed = db.claim_trace_evaluations(now=1, lease_seconds=60, batch_size=10)
+
+    def partial(config, dataset, **kwargs):
+        result = _passing_invoke(config, dataset, **kwargs)
+        keep_id = first[4]["uuid"]
+        kept = [row for row in result.results if row["test_case_id"] == keep_id]
+        return ts.EvalOnlyCliResult(
+            returncode=1, timed_out=False, results=kept, error="partial"
+        )
+
+    ts.process_claimed_runs(
+        claimed, now=5, invoke=partial, rng=random.Random(2), max_attempts=2
+    )
+    assert db.get_trace_evaluation(first[4]["uuid"])["status"] == "completed"
+    deferred = db.get_trace_evaluation(leftover_uuid)
+    assert deferred["status"] == "pending"
+    assert deferred["available_at"] > 5
+
+    with db.get_db_connection() as conn:
+        conn.execute(
+            "UPDATE trace_evaluations SET available_at = 0, attempts = 2 WHERE uuid = ?",
+            (leftover_uuid,),
+        )
+        conn.commit()
+    _isolate([leftover_uuid], at=0)
+    claimed = db.claim_trace_evaluations(now=200, lease_seconds=60, batch_size=1)
+    assert claimed[0]["attempts"] == 3
+    ts.process_claimed_runs(
+        claimed, now=200, invoke=partial, rng=random.Random(3), max_attempts=2
+    )
+    failed = db.get_trace_evaluation(leftover_uuid)
+    assert failed["status"] == "failed"
+    assert failed["completed_at"] == 200
+    assert db.get_trace_evaluation(first[4]["uuid"])["status"] == "completed"
+    assert db.get_trace_scores(leftover_uuid) == []
+
+
+def test_deleted_during_failed_invoke_skips_instead_of_deferring():
+    org = _org()
+    agent, _, _, trace, run = _setup_pending(org)
+    _isolate([run["uuid"]], at=0)
+    claimed = db.claim_trace_evaluations(now=1, lease_seconds=60, batch_size=1)
+
+    def boom_and_delete(config, dataset, **kwargs):
+        db.soft_delete_traces(org, trace_ids=[trace["uuid"]])
+        raise RuntimeError("provider down")
+
+    ts.process_claimed_runs(claimed, now=5, invoke=boom_and_delete, max_attempts=5)
+    stored = db.get_trace_evaluation(run["uuid"])
+    assert stored["status"] == "skipped"
+    assert stored["error"] == "trace_deleted"
+    assert db.get_trace_scores(run["uuid"]) == []
+
+    org2 = _org()
+    agent2, _, _, _, run2 = _setup_pending(org2)
+    _isolate([run2["uuid"]], at=0)
+    claimed = db.claim_trace_evaluations(now=1, lease_seconds=60, batch_size=1)
+
+    def boom_and_delete_agent(config, dataset, **kwargs):
+        db.delete_agent(agent2["uuid"])
+        return ts.EvalOnlyCliResult(
+            returncode=1, timed_out=False, results=[], error="judge crashed"
+        )
+
+    ts.process_claimed_runs(claimed, now=5, invoke=boom_and_delete_agent)
+    stored2 = db.get_trace_evaluation(run2["uuid"])
+    assert stored2["status"] == "skipped"
+    assert stored2["error"] == "agent_deleted"
+    assert db.get_trace_scores(run2["uuid"]) == []
+
+
+def test_deleted_partial_leftover_skips_instead_of_deferring():
+    org = _org()
+    first = _setup_pending(org)
+    second = _setup_pending(org)
+    _isolate([first[4]["uuid"], second[4]["uuid"]], at=0)
+    claimed = db.claim_trace_evaluations(now=1, lease_seconds=60, batch_size=10)
+
+    def partial_then_delete(config, dataset, **kwargs):
+        db.soft_delete_traces(org, trace_ids=[second[3]["uuid"]])
+        result = _passing_invoke(config, dataset, **kwargs)
+        keep_id = first[4]["uuid"]
+        kept = [row for row in result.results if row["test_case_id"] == keep_id]
+        return ts.EvalOnlyCliResult(returncode=1, timed_out=False, results=kept)
+
+    ts.process_claimed_runs(claimed, now=5, invoke=partial_then_delete)
+    assert db.get_trace_evaluation(first[4]["uuid"])["status"] == "completed"
+    leftover = db.get_trace_evaluation(second[4]["uuid"])
+    assert leftover["status"] == "skipped"
+    assert leftover["error"] == "trace_deleted"
+    assert db.get_trace_scores(second[4]["uuid"]) == []
 
 
 def test_malformed_unknown_duplicate_output_is_not_settled():
@@ -641,7 +760,7 @@ def test_same_version_rescore_is_a_distinct_run():
 def test_invoke_eval_only_cli_uses_cli_seam_temp_files_and_new_session():
     captured = {}
 
-    class FakeProc:
+    class FakeProc(_FakePopen):
         def __init__(self, cmd):
             self.cmd = cmd
             self.pid = 4242
@@ -713,7 +832,7 @@ def test_invoke_eval_only_cli_uses_cli_seam_temp_files_and_new_session():
 def test_invoke_eval_only_cli_timeout_kills_process_group_and_parses_partial():
     killed = []
 
-    class FakeProc:
+    class FakeProc(_FakePopen):
         def __init__(self, cmd):
             self.cmd = cmd
             self.pid = 99
@@ -988,7 +1107,7 @@ def test_deleted_evaluators_are_omitted_unless_include_deleted():
 
 
 def test_invoke_eval_only_cli_nonzero_reads_stderr():
-    class FakeProc:
+    class FakeProc(_FakePopen):
         def __init__(self, cmd, kwargs):
             self.pid = 7
             self.returncode = 1
@@ -1011,7 +1130,7 @@ def test_invoke_eval_only_cli_nonzero_reads_stderr():
 def test_invoke_eval_only_cli_timeout_second_wait_still_times_out():
     killed = []
 
-    class FakeProc:
+    class FakeProc(_FakePopen):
         def __init__(self, cmd):
             self.cmd = cmd
             self.pid = 11
@@ -1034,7 +1153,7 @@ def test_invoke_eval_only_cli_timeout_second_wait_still_times_out():
 
 
 def test_invoke_eval_only_cli_stderr_read_failure_is_empty():
-    class FakeProc:
+    class FakeProc(_FakePopen):
         def __init__(self):
             self.pid = 3
             self.returncode = 2
@@ -1057,3 +1176,110 @@ def test_invoke_eval_only_cli_stderr_read_failure_is_empty():
         result = ts.invoke_eval_only_cli({"evaluators": []}, [], timeout_seconds=5)
     assert result.returncode == 2
     assert "exited 2" in result.error
+
+
+def test_invoke_timeout_falls_back_to_process_kill_when_group_kill_fails():
+    group_calls = []
+    killed = []
+
+    class FakeProc(_FakePopen):
+        def __init__(self, cmd):
+            self.cmd = cmd
+            self.pid = 44
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            if self.returncode is not None:
+                return self.returncode
+            raise subprocess.TimeoutExpired(self.cmd, timeout)
+
+        def kill(self):
+            killed.append(self.pid)
+            self.returncode = -9
+
+    with patch(
+        "trace_scoring.subprocess.Popen", lambda cmd, **kwargs: FakeProc(cmd)
+    ), patch(
+        "trace_scoring.get_calibrate_agent_cli", return_value="calibrate-agent"
+    ), patch(
+        "trace_scoring.kill_process_group",
+        lambda pid, job: group_calls.append((pid, job)) or False,
+    ):
+        result = ts.invoke_eval_only_cli({"evaluators": []}, [], timeout_seconds=1)
+    assert result.timed_out is True
+    assert result.returncode == -9
+    assert group_calls == [(44, "trace-scoring")]
+    assert killed == [44]
+
+
+def test_invoke_timeout_skips_tempdir_cleanup_while_process_alive():
+    rmtree_calls = []
+    captured = {}
+
+    class FakeProc(_FakePopen):
+        def __init__(self, cmd):
+            self.cmd = cmd
+            self.pid = 55
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(self.cmd, timeout)
+
+        def kill(self):
+            return None
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cwd"] = kwargs.get("cwd")
+        return FakeProc(cmd)
+
+    def tracking_rmtree(path, *args, **kwargs):
+        rmtree_calls.append(str(path))
+
+    with patch("trace_scoring.subprocess.Popen", fake_popen), patch(
+        "trace_scoring.get_calibrate_agent_cli", return_value="calibrate-agent"
+    ), patch("trace_scoring.kill_process_group", return_value=False), patch(
+        "trace_scoring.shutil.rmtree", tracking_rmtree
+    ):
+        result = ts.invoke_eval_only_cli({"evaluators": []}, [], timeout_seconds=1)
+    assert result.timed_out is True
+    assert result.returncode == -9
+    assert rmtree_calls == []
+    leftover = captured.get("cwd")
+    if leftover:
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+def test_reap_cli_process_noops_when_already_exited():
+    class FakeProc(_FakePopen):
+        def __init__(self):
+            self.pid = 1
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            raise AssertionError("already exited")
+
+        def kill(self):
+            raise AssertionError("already exited")
+
+    with patch("trace_scoring.kill_process_group") as killer:
+        ts._reap_cli_process(FakeProc())
+    killer.assert_not_called()
+
+
+def test_reap_cli_process_swallows_kill_oserror():
+    class FakeProc(_FakePopen):
+        def __init__(self):
+            self.pid = 8
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("cmd", timeout)
+
+        def kill(self):
+            raise OSError("esrch")
+
+    with patch("trace_scoring.kill_process_group", return_value=True):
+        ts._reap_cli_process(FakeProc())

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import shutil
 import subprocess
 import tempfile
 import time
@@ -470,6 +471,50 @@ def _truncate_error(detail: str) -> str:
     return text[: ERROR_MAX_CHARS - 3] + "..."
 
 
+def _wait_cli_process(proc: subprocess.Popen, timeout: float) -> None:
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _reap_cli_process(proc: subprocess.Popen) -> None:
+    """Kill the process group, then the Popen child, until it has exited.
+
+    Matches the simulation abort fallback (`kill_process_group` then
+    `process.kill()`). Callers must not delete the temp dir while `poll()`
+    is still None.
+    """
+    if proc.poll() is not None:
+        return
+    group_ok = kill_process_group(proc.pid, "trace-scoring")
+    _wait_cli_process(proc, 5)
+    if proc.poll() is not None:
+        return
+    logger.warning(
+        "trace-scoring: pid %s still alive after process-group kill (ok=%s); "
+        "falling back to process.kill()",
+        proc.pid,
+        group_ok,
+    )
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    _wait_cli_process(proc, 5)
+
+
+def _cleanup_cli_tempdir(tmp_path: Path, proc: Optional[subprocess.Popen]) -> None:
+    if proc is not None and proc.poll() is None:
+        logger.error(
+            "trace-scoring: leaving temp dir %s because pid %s is still running",
+            tmp_path,
+            proc.pid,
+        )
+        return
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def invoke_eval_only_cli(
     config: Dict[str, Any],
     dataset: List[Dict[str, Any]],
@@ -478,8 +523,10 @@ def invoke_eval_only_cli(
     parallel: int = CLI_PARALLEL,
 ) -> EvalOnlyCliResult:
     """Spawn `calibrate-agent llm --eval-only` with temp-file stdio and a timeout."""
-    with tempfile.TemporaryDirectory(prefix="trace-scoring-") as tmp:
-        tmp_path = Path(tmp)
+    tmp_path = Path(tempfile.mkdtemp(prefix="trace-scoring-"))
+    proc: Optional[subprocess.Popen] = None
+    timed_out = False
+    try:
         config_path = tmp_path / "config.json"
         dataset_path = tmp_path / "dataset.json"
         output_dir = tmp_path / "output"
@@ -502,7 +549,6 @@ def invoke_eval_only_cli(
             "-n",
             str(parallel),
         ]
-        timed_out = False
         with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
             proc = subprocess.Popen(
                 cmd,
@@ -516,11 +562,7 @@ def invoke_eval_only_cli(
                 proc.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                kill_process_group(proc.pid, "trace-scoring")
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
+                _reap_cli_process(proc)
         returncode = proc.returncode
         if returncode is None:
             returncode = -9 if timed_out else 0
@@ -542,6 +584,8 @@ def invoke_eval_only_cli(
             results=results,
             error=error,
         )
+    finally:
+        _cleanup_cli_tempdir(tmp_path, proc)
 
 
 def _fail_run(run: Dict[str, Any], error: str, now: int) -> None:
@@ -655,21 +699,14 @@ def process_claimed_runs(
         if scores is not None:
             complete[item.run["uuid"]] = scores
 
-    # Timeout, or a nonzero exit that still produced some complete items:
-    # leave the rest `processing` so the lease expires and only those retry.
-    # A whole-invocation miss (nonzero, nothing complete) defers with jitter
-    # so the next claim does not reassemble the identical failing batch.
-    leave_unfinished = cli_result.timed_out or (
-        cli_result.returncode != 0 and bool(complete)
-    )
+    # Finished peers settle; leftovers always defer-or-fail with jitter so a
+    # poison partial/timeout batch cannot sit in `processing` forever.
     default_error = cli_result.error or "incomplete evaluator results"
 
     for item in prepared:
         scores = complete.get(item.run["uuid"])
         if scores is not None:
             settle_trace_evaluation_completed(item.run["uuid"], scores, now=now)
-            continue
-        if leave_unfinished:
             continue
         _defer_or_fail(
             item.run,
