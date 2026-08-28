@@ -1232,6 +1232,38 @@ def test_enable_rejected_for_general_agent_with_only_default_evaluator(client):
     }
 
 
+def test_already_on_auto_score_true_survives_later_empty_eligibility(client):
+    """The 422 gate is only off→on. An already-on agent can send true again
+    after its linked set drifts to zero eligible evaluators."""
+    h = _signup(client)
+    agent = _create_agent(client, h, f"flag-drift-{uuid.uuid4().hex[:6]}")
+    clean = _create_evaluator(client, h, name=f"drift-clean-{uuid.uuid4().hex[:6]}")
+    _unlink_all_evaluators(client, h, agent["uuid"])
+    _link_evaluators(client, h, agent["uuid"], clean)
+    assert (
+        client.put(
+            f"/agents/{agent['uuid']}",
+            json={"auto_score_traces": True},
+            headers=h,
+        ).status_code
+        == 200
+    )
+
+    _unlink_all_evaluators(client, h, agent["uuid"])
+    eligibility = client.get(
+        f"/agents/{agent['uuid']}/trace-scoring-eligibility", headers=h
+    ).json()
+    assert eligibility["eligible"] == []
+
+    r = client.put(
+        f"/agents/{agent['uuid']}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_score_traces"] is True
+
+
 def test_eligibility_endpoint_partitions_mixed_evaluator_types(client):
     h = _signup(client)
     agent = _create_agent(client, h, f"elig-mix-{uuid.uuid4().hex[:6]}")

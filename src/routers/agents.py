@@ -977,7 +977,9 @@ def update_agent_endpoint(
         if agent.benchmark_models_verified is not None:
             agent.config["benchmark_models_verified"] = agent.benchmark_models_verified
 
-    if agent.auto_score_traces is True:
+    # Only the off→on flip is blocked. An already-on agent whose evaluators
+    # later all become ineligible stays on; ingest skips those runs.
+    if agent.auto_score_traces is True and not existing_agent.get("auto_score_traces"):
         resolution = resolve_trace_scoring(existing_agent)
         if not resolution.eligible:
             raise _enable_auto_score_rejected(resolution)

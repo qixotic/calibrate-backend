@@ -655,16 +655,21 @@ def process_claimed_runs(
     max_attempts: int = MAX_ATTEMPTS,
     timeout_seconds: int = CLI_TIMEOUT_SECONDS,
 ) -> None:
-    """Hydrate the immutable snapshot, invoke eval-only once, settle by id."""
+    """Hydrate the immutable snapshot, invoke eval-only once, settle by id.
+
+    `now` is claim/prepare time only. Completion, defer/backoff, failure, and
+    post-invoke deletion skips use a fresh `time.time()` after the CLI returns
+    so a long invoke cannot write `available_at` in the past.
+    """
     from db import settle_trace_evaluation_completed
 
     if not claimed:
         return
-    now = int(now if now is not None else time.time())
+    prepare_now = int(now if now is not None else time.time())
     invoke_fn = invoke or invoke_eval_only_cli
     prepared: List[_PreparedRun] = []
     for run in claimed:
-        item = _prepare_claimed_run(run, now)
+        item = _prepare_claimed_run(run, prepare_now)
         if item is not None:
             prepared.append(item)
     if not prepared:
@@ -677,9 +682,14 @@ def process_claimed_runs(
         )
     except Exception as exc:
         logger.exception("trace scoring CLI invoke failed")
+        settle_now = int(time.time())
         for item in prepared:
             _defer_or_fail(
-                item.run, now=now, error=str(exc), rng=rng, max_attempts=max_attempts
+                item.run,
+                now=settle_now,
+                error=str(exc),
+                rng=rng,
+                max_attempts=max_attempts,
             )
         return
 
@@ -702,15 +712,16 @@ def process_claimed_runs(
     # Finished peers settle; leftovers always defer-or-fail with jitter so a
     # poison partial/timeout batch cannot sit in `processing` forever.
     default_error = cli_result.error or "incomplete evaluator results"
+    settle_now = int(time.time())
 
     for item in prepared:
         scores = complete.get(item.run["uuid"])
         if scores is not None:
-            settle_trace_evaluation_completed(item.run["uuid"], scores, now=now)
+            settle_trace_evaluation_completed(item.run["uuid"], scores, now=settle_now)
             continue
         _defer_or_fail(
             item.run,
-            now=now,
+            now=settle_now,
             error=default_error,
             rng=rng,
             max_attempts=max_attempts,

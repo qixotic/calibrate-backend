@@ -463,13 +463,71 @@ def test_timeout_parses_partial_and_defers_unfinished_with_jitter():
         )
 
     rng = random.Random(1)
-    expected_at = ts.backoff_available_at(1, 5, random.Random(1))
     ts.process_claimed_runs(claimed, now=5, invoke=timed_out, rng=rng, max_attempts=5)
     assert db.get_trace_evaluation(first[4]["uuid"])["status"] == "completed"
     leftover = db.get_trace_evaluation(second[4]["uuid"])
     assert leftover["status"] == "pending"
-    assert leftover["available_at"] == expected_at
+    assert leftover["available_at"] > 5
     assert "timed out" in leftover["error"]
+
+
+_CLI_WALL_SECONDS = 25 * 60
+
+
+def test_settlement_timestamps_use_post_invoke_wall_clock(monkeypatch):
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(ts.time, "time", lambda: clock["t"])
+    org = _org()
+    first = _setup_pending(org)
+    second = _setup_pending(org)
+    _isolate([first[4]["uuid"], second[4]["uuid"]], at=0)
+    claimed = db.claim_trace_evaluations(now=1_000, lease_seconds=60, batch_size=10)
+
+    def slow_partial(config, dataset, **kwargs):
+        clock["t"] = 1_000 + _CLI_WALL_SECONDS
+        result = _passing_invoke(config, dataset, **kwargs)
+        keep_id = first[4]["uuid"]
+        kept = [row for row in result.results if row["test_case_id"] == keep_id]
+        return ts.EvalOnlyCliResult(
+            returncode=-9, timed_out=True, results=kept, error="timed out"
+        )
+
+    rng = random.Random(4)
+    expected_at = ts.backoff_available_at(
+        1, 1_000 + _CLI_WALL_SECONDS, random.Random(4)
+    )
+    ts.process_claimed_runs(
+        claimed, now=1_000, invoke=slow_partial, rng=rng, max_attempts=5
+    )
+    done = db.get_trace_evaluation(first[4]["uuid"])
+    leftover = db.get_trace_evaluation(second[4]["uuid"])
+    assert done["status"] == "completed"
+    assert done["completed_at"] == 1_000 + _CLI_WALL_SECONDS
+    assert leftover["status"] == "pending"
+    assert leftover["available_at"] == expected_at
+    assert leftover["available_at"] > 1_000 + _CLI_WALL_SECONDS
+
+
+def test_invoke_exception_backoff_stays_future_after_long_call(monkeypatch):
+    clock = {"t": 500.0}
+    monkeypatch.setattr(ts.time, "time", lambda: clock["t"])
+    org = _org()
+    _, _, _, _, run = _setup_pending(org)
+    _isolate([run["uuid"]], at=0)
+    claimed = db.claim_trace_evaluations(now=500, lease_seconds=60, batch_size=1)
+
+    def boom(config, dataset, **kwargs):
+        clock["t"] = 500 + _CLI_WALL_SECONDS
+        raise RuntimeError("provider down")
+
+    rng = random.Random(8)
+    expected_at = ts.backoff_available_at(1, 500 + _CLI_WALL_SECONDS, random.Random(8))
+    ts.process_claimed_runs(claimed, now=500, invoke=boom, rng=rng, max_attempts=5)
+    stored = db.get_trace_evaluation(run["uuid"])
+    assert stored["status"] == "pending"
+    assert stored["available_at"] == expected_at
+    assert stored["available_at"] > 500 + _CLI_WALL_SECONDS
+    assert stored["error"] and "provider down" in stored["error"]
 
 
 def test_partial_unfinished_hits_attempt_ceiling_without_reassembling():
@@ -510,7 +568,7 @@ def test_partial_unfinished_hits_attempt_ceiling_without_reassembling():
     )
     failed = db.get_trace_evaluation(leftover_uuid)
     assert failed["status"] == "failed"
-    assert failed["completed_at"] == 200
+    assert failed["completed_at"] is not None
     assert db.get_trace_evaluation(first[4]["uuid"])["status"] == "completed"
     assert db.get_trace_scores(leftover_uuid) == []
 
@@ -636,7 +694,7 @@ def test_whole_invocation_failure_defers_with_jitter_then_fails_at_ceiling():
     ts.process_claimed_runs(claimed, now=200, invoke=boom, max_attempts=2)
     failed = db.get_trace_evaluation(run["uuid"])
     assert failed["status"] == "failed"
-    assert failed["completed_at"] == 200
+    assert failed["completed_at"] is not None
 
 
 def test_deleted_trace_or_agent_skips_without_scores():
