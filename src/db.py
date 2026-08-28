@@ -1204,6 +1204,13 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        try:
+            cursor.execute(
+                "ALTER TABLE agents ADD COLUMN auto_score_traces INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # Add is_public and share_token columns for public sharing feature
         for table in ("jobs", "agent_test_jobs", "simulation_jobs"):
             try:
@@ -1540,6 +1547,92 @@ def init_db():
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_traces_org_created "
             "ON traces(org_uuid, deleted_at, created_at DESC, id DESC)"
+        )
+        conn.commit()
+
+        # Durable scoring runs. Status is the source of truth for "scored?"; a
+        # dead letter is just status='failed'. Initial scoring, a rescore, and a
+        # backfill are all rows here -- no kind column. A soft-deleted trace's
+        # open run is settled at claim, not via a delete trigger.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trace_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                trace_uuid TEXT NOT NULL,
+                org_uuid TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                criteria TEXT,
+                available_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                FOREIGN KEY (trace_uuid) REFERENCES traces(uuid),
+                FOREIGN KEY (org_uuid) REFERENCES organizations(uuid),
+                FOREIGN KEY (agent_id) REFERENCES agents(uuid)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_trace_eval_active "
+            "ON trace_evaluations (trace_uuid) "
+            "WHERE status IN ('pending', 'processing')"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trace_eval_claim "
+            "ON trace_evaluations (available_at) "
+            "WHERE status IN ('pending', 'processing')"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trace_eval_agent_status "
+            "ON trace_evaluations (agent_id, status, completed_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trace_eval_trace "
+            "ON trace_evaluations (trace_uuid, created_at DESC)"
+        )
+
+        # One score per (run, evaluator). Keyed on the run so a same-version
+        # rescore never overwrites earlier history. match XOR score: a binary
+        # match=0 must stay distinct from a rating of 0.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trace_scores (
+                run_uuid TEXT NOT NULL,
+                trace_uuid TEXT NOT NULL,
+                evaluator_uuid TEXT NOT NULL,
+                evaluator_version_id TEXT NOT NULL,
+                org_uuid TEXT NOT NULL,
+                match INTEGER,
+                score REAL,
+                reasoning TEXT,
+                completed_at INTEGER,
+                UNIQUE (run_uuid, evaluator_uuid),
+                -- SQLite CHECKs pass on UNKNOWN; `IS TRUE` makes both-NULL fail.
+                CHECK (
+                    (
+                        (match IN (0, 1) AND score IS NULL)
+                        OR
+                        (match IS NULL AND score IS NOT NULL)
+                    ) IS TRUE
+                ),
+                FOREIGN KEY (run_uuid) REFERENCES trace_evaluations(uuid),
+                FOREIGN KEY (trace_uuid) REFERENCES traces(uuid),
+                FOREIGN KEY (evaluator_uuid) REFERENCES evaluators(uuid),
+                FOREIGN KEY (org_uuid) REFERENCES organizations(uuid)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trace_scores_trace "
+            "ON trace_scores (trace_uuid, completed_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trace_scores_org_eval "
+            "ON trace_scores (org_uuid, evaluator_uuid, completed_at)"
         )
         conn.commit()
 

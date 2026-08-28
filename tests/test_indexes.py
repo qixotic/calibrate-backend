@@ -22,6 +22,12 @@ EXPECTED_INDEXES = [
     "idx_annotation_jobs_annotator",
     "idx_traces_org_agent_active",
     "idx_traces_org_created",
+    "ux_trace_eval_active",
+    "ix_trace_eval_claim",
+    "ix_trace_eval_agent_status",
+    "ix_trace_eval_trace",
+    "ix_trace_scores_trace",
+    "ix_trace_scores_org_eval",
 ]
 
 
@@ -139,3 +145,57 @@ def test_traces_default_list_sorts_from_the_index():
     )
     assert "idx_traces_org_created" in plan, plan
     assert "TEMP B-TREE" not in plan, plan
+
+
+def test_trace_eval_active_lookup_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_evaluations WHERE trace_uuid = ? "
+        "AND status IN ('pending', 'processing')",
+        ("trace",),
+    )
+    assert "ux_trace_eval_active" in plan, plan
+
+
+def test_trace_eval_claim_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_evaluations WHERE status IN ('pending', 'processing') "
+        "AND available_at <= ? ORDER BY available_at LIMIT 10",
+        (0,),
+    )
+    assert "ix_trace_eval_claim" in plan, plan
+
+
+def test_trace_eval_agent_status_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_evaluations WHERE agent_id = ? AND status = ? "
+        "ORDER BY completed_at",
+        ("agent", "failed"),
+    )
+    assert "ix_trace_eval_agent_status" in plan, plan
+
+
+def test_trace_eval_history_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_evaluations WHERE trace_uuid = ? "
+        "ORDER BY created_at DESC",
+        ("trace",),
+    )
+    assert "ix_trace_eval_trace" in plan, plan
+    assert "TEMP B-TREE" not in plan, plan
+
+
+def test_trace_scores_by_trace_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_scores WHERE trace_uuid = ? ORDER BY completed_at",
+        ("trace",),
+    )
+    assert "ix_trace_scores_trace" in plan, plan
+
+
+def test_trace_scores_by_org_eval_uses_index():
+    plan = _query_plan(
+        "SELECT * FROM trace_scores WHERE org_uuid = ? AND evaluator_uuid = ? "
+        "ORDER BY completed_at",
+        ("org", "eval"),
+    )
+    assert "ix_trace_scores_org_eval" in plan, plan
