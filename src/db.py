@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import logging
+import time
 import uuid
 from os.path import join
 import os
@@ -10285,6 +10286,76 @@ def count_live_traces(org_uuid: str) -> int:
         ).fetchone()[0]
 
 
+def _insert_trace_row(
+    cur: sqlite3.Cursor,
+    org_uuid: str,
+    agent_id: str,
+    input: Any,
+    output: Any,
+    message_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    metadata: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Insert one traces row on `cur` and return it. Does not commit."""
+    trace_uuid = str(uuid.uuid4())
+    cur.execute(
+        """
+        INSERT INTO traces
+            (uuid, org_uuid, agent_id, message_id, conversation_id,
+             input, output, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trace_uuid,
+            org_uuid,
+            agent_id,
+            message_id,
+            conversation_id,
+            json.dumps(input),
+            json.dumps(output),
+            json.dumps(metadata) if metadata is not None else None,
+        ),
+    )
+    row = cur.execute(
+        "SELECT * FROM traces WHERE uuid = ?", (trace_uuid,)
+    ).fetchone()
+    return _trace_row(row)
+
+
+def _insert_trace_eval_run(
+    cur: sqlite3.Cursor,
+    *,
+    trace_uuid: str,
+    org_uuid: str,
+    agent_id: str,
+    status: str,
+    criteria: Optional[str],
+    error: Optional[str],
+    now: int,
+    completed_at: Optional[int] = None,
+) -> None:
+    """Insert one trace_evaluations row on `cur`. Does not commit."""
+    cur.execute(
+        "INSERT INTO trace_evaluations "
+        "(uuid, trace_uuid, org_uuid, agent_id, status, criteria, "
+        "error, available_at, created_at, updated_at, completed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            str(uuid.uuid4()),
+            trace_uuid,
+            org_uuid,
+            agent_id,
+            status,
+            criteria,
+            error,
+            now,
+            now,
+            now,
+            completed_at,
+        ),
+    )
+
+
 def create_trace(
     org_uuid: str,
     agent_id: str,
@@ -10299,31 +10370,89 @@ def create_trace(
     Every call stores a new row. `message_id` is the caller's own label, not a
     key: matching on it meant a customer who reused one silently lost a turn.
     """
-    trace_uuid = str(uuid.uuid4())
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO traces
-                (uuid, org_uuid, agent_id, message_id, conversation_id,
-                 input, output, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                trace_uuid,
-                org_uuid,
-                agent_id,
-                message_id,
-                conversation_id,
-                json.dumps(input),
-                json.dumps(output),
-                json.dumps(metadata) if metadata is not None else None,
-            ),
+        row = _insert_trace_row(
+            conn.cursor(),
+            org_uuid,
+            agent_id,
+            input,
+            output,
+            message_id,
+            conversation_id,
+            metadata,
         )
         conn.commit()
-        row = conn.execute(
-            "SELECT * FROM traces WHERE uuid = ?", (trace_uuid,)
-        ).fetchone()
-        return _trace_row(row)
+        return row
+
+
+def create_trace_with_eval_run(
+    *,
+    org_uuid: str,
+    agent: Dict[str, Any],
+    input: Any,
+    output: Any,
+    message_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    metadata: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Insert a trace and, when auto-scoring is on, its immutable run together.
+
+    Resolution (`trace_scoring.resolve_scoring_plan`) runs before the write
+    lock so evaluator reads do not hold it. The inserts share one transaction
+    so a mid-write failure leaves neither row.
+
+    Uses BEGIN IMMEDIATE rather than a bare BEGIN: a deferred transaction
+    starts as a reader and only upgrades at the first write, which can fail
+    with SQLITE_BUSY without honouring busy_timeout. Taking the write lock
+    up front means the timeout applies.
+    """
+    plan = None
+    if agent.get("auto_score_traces"):
+        from trace_scoring import resolve_scoring_plan
+
+        plan = resolve_scoring_plan(agent)
+
+    now = int(time.time())
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = _insert_trace_row(
+            cur,
+            org_uuid,
+            agent["uuid"],
+            input,
+            output,
+            message_id,
+            conversation_id,
+            metadata,
+        )
+        if plan is not None:
+            skip_reason = plan.get("skip")
+            if skip_reason or not plan.get("evaluators"):
+                _insert_trace_eval_run(
+                    cur,
+                    trace_uuid=row["uuid"],
+                    org_uuid=org_uuid,
+                    agent_id=agent["uuid"],
+                    status="skipped",
+                    criteria=None,
+                    error=skip_reason or "no_usable_evaluators",
+                    now=now,
+                    completed_at=now,
+                )
+            else:
+                _insert_trace_eval_run(
+                    cur,
+                    trace_uuid=row["uuid"],
+                    org_uuid=org_uuid,
+                    agent_id=agent["uuid"],
+                    status="pending",
+                    criteria=json.dumps(plan),
+                    error=None,
+                    now=now,
+                )
+        conn.commit()
+        return row
 
 
 def list_traces(

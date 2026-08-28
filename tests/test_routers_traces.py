@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from unittest.mock import patch
 
 import pytest
 
+import db
 from routers.traces import MAX_DELETE_IDS, MAX_LIST_LIMIT
 from fastapi.testclient import TestClient
 
@@ -1971,3 +1973,179 @@ def test_convert_by_ids_keeps_the_plain_conflict_error(client):
     detail = res.json()["detail"]
     assert set(detail) == {"error", "trace_ids"}
     assert detail["error"] == "Some traces recorded no tool calls to assert"
+
+
+# ---------------------------------------------------------------------------
+# Auto-score ingest (run creation, public contract unchanged)
+# ---------------------------------------------------------------------------
+
+
+def _create_clean_evaluator(client, h, evaluator_type="llm"):
+    resp = client.post(
+        "/evaluators",
+        json={
+            "name": f"ev-{uuid.uuid4().hex[:6]}",
+            "evaluator_type": evaluator_type,
+            "output_type": "binary",
+            "version": {
+                "judge_model": "openai/gpt-4.1",
+                "system_prompt": "Judge the reply.",
+            },
+        },
+        headers=h,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    return body["uuid"], body["version_uuid"]
+
+
+def _unlink_all_evaluators(client, h, agent_uuid):
+    items = client.get(f"/agents/{agent_uuid}/evaluators", headers=h).json()["items"]
+    for ev in items:
+        r = client.delete(f"/agents/{agent_uuid}/evaluators/{ev['uuid']}", headers=h)
+        assert r.status_code == 200, r.text
+
+
+def _enable_auto_score(client, h, agent_uuid, evaluator_type="llm"):
+    ev_uuid, version_id = _create_clean_evaluator(client, h, evaluator_type)
+    _unlink_all_evaluators(client, h, agent_uuid)
+    r = client.post(
+        f"/agents/{agent_uuid}/evaluators",
+        json={"evaluator_ids": [ev_uuid]},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    enabled = client.put(
+        f"/agents/{agent_uuid}",
+        json={"auto_score_traces": True},
+        headers=h,
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["auto_score_traces"] is True
+    return ev_uuid, version_id
+
+
+def _runs_for_trace(trace_uuid: str):
+    with db.get_db_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM trace_evaluations WHERE trace_uuid = ?",
+            (trace_uuid,),
+        ).fetchall()
+
+
+def test_ingest_opted_out_creates_no_run_and_keeps_response_contract(client):
+    h, agent_id = _signup_with_agent(client)
+    mid = _mid()
+    body = _post_trace(client, h, _payload(agent_id, mid))
+
+    assert set(body) == {"uuid", "message_id", "conversation_id", "created_at"}
+    assert body["message_id"] == mid
+    assert body["conversation_id"] == "conv-1"
+    assert len(body["uuid"]) == 36
+    assert _runs_for_trace(body["uuid"]) == []
+
+
+def test_ingest_opted_in_conversation_creates_pending_response_run(client):
+    h, agent_id = _signup_with_agent(client)
+    ev_uuid, version_id = _enable_auto_score(client, h, agent_id)
+
+    body = _post_trace(client, h, _payload(agent_id, _mid()))
+    assert set(body) == {"uuid", "message_id", "conversation_id", "created_at"}
+
+    rows = _runs_for_trace(body["uuid"])
+    assert len(rows) == 1
+    assert rows[0]["status"] == "pending"
+    assert rows[0]["criteria"] is not None
+    snapshot = json.loads(rows[0]["criteria"])
+    assert snapshot == {
+        "type": "response",
+        "evaluators": [
+            {"evaluator_uuid": ev_uuid, "evaluator_version_id": version_id},
+        ],
+    }
+
+
+def test_ingest_opted_in_general_creates_pending_general_run(client):
+    h, agent_id = _signup_with_general_agent(client)
+    ev_uuid, version_id = _enable_auto_score(
+        client, h, agent_id, evaluator_type="llm-general"
+    )
+
+    body = _post_trace(client, h, _general_payload(agent_id, _mid()))
+    assert set(body) == {"uuid", "message_id", "conversation_id", "created_at"}
+
+    rows = _runs_for_trace(body["uuid"])
+    assert len(rows) == 1
+    snapshot = json.loads(rows[0]["criteria"])
+    assert snapshot["type"] == "general"
+    assert snapshot["evaluators"] == [
+        {"evaluator_uuid": ev_uuid, "evaluator_version_id": version_id},
+    ]
+    assert rows[0]["status"] == "pending"
+
+
+def test_ingest_eligibility_drift_creates_skipped_run(client):
+    h, agent_id = _signup_with_agent(client)
+    ev_uuid, _ = _enable_auto_score(client, h, agent_id)
+    r = client.delete(f"/agents/{agent_id}/evaluators/{ev_uuid}", headers=h)
+    assert r.status_code == 200, r.text
+    assert client.get(f"/agents/{agent_id}", headers=h).json()["auto_score_traces"] is True
+
+    body = _post_trace(client, h, _payload(agent_id, _mid()))
+    rows = _runs_for_trace(body["uuid"])
+    assert len(rows) == 1
+    assert rows[0]["status"] == "skipped"
+    assert rows[0]["error"] == "no_usable_evaluators"
+    assert rows[0]["criteria"] is None
+
+
+def test_ingest_opted_in_still_scopes_to_the_caller_org(client):
+    h_a, agent_a = _signup_with_agent(client)
+    h_b, _agent_b = _signup_with_agent(client)
+    _enable_auto_score(client, h_a, agent_a)
+
+    body = _post_trace(client, h_a, _payload(agent_a, _mid()))
+    denied = client.get(f"/traces/{body['uuid']}", headers=h_b)
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "This resource belongs to a different workspace"
+    assert client.get(f"/traces/{body['uuid']}", headers=h_a).status_code == 200
+    assert client.get("/traces", headers=h_b).json()["total"] == 0
+
+    agent = db.get_agent(agent_a)
+    rows = _runs_for_trace(body["uuid"])
+    assert len(rows) == 1
+    assert rows[0]["org_uuid"] == agent["org_uuid"]
+
+
+def test_ingest_opted_in_cap_still_returns_429(client, monkeypatch):
+    from routers import traces as traces_mod
+
+    h, agent_id = _signup_with_agent(client)
+    _enable_auto_score(client, h, agent_id)
+    monkeypatch.setattr(traces_mod, "MAX_TRACES_PER_WORKSPACE", 1)
+
+    first = _post_trace(client, h, _payload(agent_id, _mid()))
+    assert _runs_for_trace(first["uuid"])
+
+    capped = client.post("/traces", json=_payload(agent_id, _mid()), headers=h)
+    assert capped.status_code == 429
+    detail = capped.json()["detail"]
+    assert detail["current"] == 1
+    assert detail["max_traces"] == 1
+
+    with db.get_db_connection() as conn:
+        run_count = conn.execute(
+            "SELECT COUNT(*) c FROM trace_evaluations WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()["c"]
+    assert run_count == 1
+
+
+def test_ingest_opted_in_with_api_key_creates_a_run(client):
+    h, agent_id = _signup_with_agent(client)
+    _enable_auto_score(client, h, agent_id)
+    key_headers = _api_key_headers(client, h)
+
+    body = _post_trace(client, key_headers, _payload(agent_id, _mid()))
+    assert set(body) == {"uuid", "message_id", "conversation_id", "created_at"}
+    assert len(_runs_for_trace(body["uuid"])) == 1

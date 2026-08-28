@@ -27,7 +27,7 @@ from db import (
     add_test_to_agent,
     bulk_create_tests,
     count_live_traces,
-    create_trace,
+    create_trace_with_eval_run,
     get_agent,
     get_all_tests_summary,
     get_evaluator_versions_by_uuids,
@@ -469,9 +469,9 @@ async def ingest_trace(
             },
         )
 
-    row = create_trace(
+    row = create_trace_with_eval_run(
         org_uuid=ctx.org_uuid,
-        agent_id=payload.agent_id,
+        agent=agent,
         message_id=payload.message_id,
         conversation_id=payload.conversation_id,
         input=(
