@@ -6,6 +6,7 @@ so these tests write directly via raw SQL.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import uuid
 
@@ -348,3 +349,304 @@ def test_same_run_evaluator_is_unique():
     _insert_score(org, run, trace["uuid"], evaluator_version_id="v1")
     with pytest.raises(sqlite3.IntegrityError):
         _insert_score(org, run, trace["uuid"], evaluator_version_id="v2", match=0)
+
+
+def _make_evaluator(org, *, output_type="binary", scale=None, name=None):
+    ev = db.create_evaluator(
+        name=name or f"ev-{uuid.uuid4().hex[:6]}",
+        org_uuid=org,
+        output_type=output_type,
+        evaluator_type="llm",
+    )
+    output_config = None
+    if output_type == "rating":
+        output_config = {
+            "scale": scale
+            or [
+                {"value": 1, "name": "Low"},
+                {"value": 5, "name": "High"},
+            ]
+        }
+    version = db.create_evaluator_version(
+        ev, "openai/gpt-4.1", "Judge the reply.", output_config=output_config
+    )
+    return ev, version["uuid"]
+
+
+def test_trace_evaluator_passed_matches_cli_rule():
+    assert db.trace_evaluator_passed("binary", True, None, None) is True
+    assert db.trace_evaluator_passed("binary", 1, None, None) is True
+    assert db.trace_evaluator_passed("binary", False, None, None) is False
+    assert db.trace_evaluator_passed("binary", 0, None, None) is False
+    assert db.trace_evaluator_passed("rating", None, 5, 5) is True
+    assert db.trace_evaluator_passed("rating", None, 5.0, 5) is True
+    assert db.trace_evaluator_passed("rating", None, 4, 5) is False
+    assert db.trace_evaluator_passed("rating", None, 0, 5) is False
+    assert db.trace_evaluator_passed("rating", None, 5, None) is False
+
+
+def test_latest_run_summary_picks_newest_created_at():
+    org = _org()
+    trace = _ingest_trace(org)
+    ev, ver = _make_evaluator(org)
+    older = _insert_run(
+        org, trace["uuid"], status="completed", created_at=10, completed_at=11
+    )
+    newer = _insert_run(
+        org, trace["uuid"], status="completed", created_at=20, completed_at=21
+    )
+    _insert_score(
+        org, older, trace["uuid"], evaluator_uuid=ev, evaluator_version_id=ver, match=1
+    )
+    _insert_score(
+        org, newer, trace["uuid"], evaluator_uuid=ev, evaluator_version_id=ver, match=0
+    )
+
+    summaries = db.get_latest_trace_run_summaries(org, [trace["uuid"]])
+    assert summaries[trace["uuid"]] == {
+        "status": "completed",
+        "passed": False,
+        "n_passed": 0,
+        "n_total": 1,
+    }
+
+
+def test_latest_run_summary_tie_breaks_on_id():
+    org = _org()
+    trace = _ingest_trace(org)
+    ev, ver = _make_evaluator(org)
+    first = _insert_run(
+        org, trace["uuid"], status="completed", created_at=50, completed_at=50
+    )
+    second = _insert_run(
+        org, trace["uuid"], status="completed", created_at=50, completed_at=50
+    )
+    _insert_score(
+        org, first, trace["uuid"], evaluator_uuid=ev, evaluator_version_id=ver, match=1
+    )
+    _insert_score(
+        org,
+        second,
+        trace["uuid"],
+        evaluator_uuid=ev,
+        evaluator_version_id=ver,
+        match=0,
+    )
+    with db.get_db_connection() as conn:
+        ids = {
+            r["uuid"]: r["id"]
+            for r in conn.execute(
+                "SELECT uuid, id FROM trace_evaluations WHERE uuid IN (?, ?)",
+                (first, second),
+            ).fetchall()
+        }
+    assert ids[second] > ids[first]
+
+    summaries = db.get_latest_trace_run_summaries(org, [trace["uuid"]])
+    assert summaries[trace["uuid"]]["passed"] is False
+    assert summaries[trace["uuid"]]["n_passed"] == 0
+
+
+def test_latest_run_summary_omits_traces_with_no_run():
+    org = _org()
+    trace = _ingest_trace(org)
+    assert db.get_latest_trace_run_summaries(org, [trace["uuid"]]) == {}
+
+
+@pytest.mark.parametrize(
+    "status,error",
+    [
+        ("pending", None),
+        ("processing", None),
+        ("failed", "judge exploded"),
+        ("skipped", "no_usable_evaluators"),
+    ],
+)
+def test_latest_run_summary_non_completed_has_null_pass_counts(status, error):
+    org = _org()
+    trace = _ingest_trace(org)
+    _insert_run(
+        org,
+        trace["uuid"],
+        status=status,
+        error=error,
+        completed_at=None if status in ("pending", "processing") else 9,
+    )
+    summary = db.get_latest_trace_run_summaries(org, [trace["uuid"]])[trace["uuid"]]
+    assert summary == {
+        "status": status,
+        "passed": None,
+        "n_passed": None,
+        "n_total": None,
+    }
+
+
+def test_latest_run_summary_mixed_types_are_a_conjunction():
+    org = _org()
+    trace = _ingest_trace(org)
+    binary, binary_ver = _make_evaluator(org, output_type="binary")
+    rating, rating_ver = _make_evaluator(org, output_type="rating")
+    run = _insert_run(
+        org, trace["uuid"], status="completed", created_at=1, completed_at=2
+    )
+    _insert_score(
+        org,
+        run,
+        trace["uuid"],
+        evaluator_uuid=binary,
+        evaluator_version_id=binary_ver,
+        match=1,
+        score=None,
+    )
+    _insert_score(
+        org,
+        run,
+        trace["uuid"],
+        evaluator_uuid=rating,
+        evaluator_version_id=rating_ver,
+        match=None,
+        score=4,
+    )
+    summary = db.get_latest_trace_run_summaries(org, [trace["uuid"]])[trace["uuid"]]
+    assert summary == {
+        "status": "completed",
+        "passed": False,
+        "n_passed": 1,
+        "n_total": 2,
+    }
+
+    with db.get_db_connection() as conn:
+        conn.execute(
+            "UPDATE trace_scores SET score = 5 WHERE evaluator_uuid = ?", (rating,)
+        )
+        conn.commit()
+    both_pass = db.get_latest_trace_run_summaries(org, [trace["uuid"]])[trace["uuid"]]
+    assert both_pass == {
+        "status": "completed",
+        "passed": True,
+        "n_passed": 2,
+        "n_total": 2,
+    }
+
+
+def test_latest_run_summary_is_org_scoped():
+    org_a, org_b = _org(), _org()
+    trace_a = _ingest_trace(org_a)
+    ev, ver = _make_evaluator(org_a)
+    run = _insert_run(org_a, trace_a["uuid"], status="completed", completed_at=3)
+    _insert_score(
+        org_a, run, trace_a["uuid"], evaluator_uuid=ev, evaluator_version_id=ver, match=1
+    )
+    assert db.get_latest_trace_run_summaries(org_b, [trace_a["uuid"]]) == {}
+    assert db.get_latest_trace_run_summaries(org_a, [trace_a["uuid"]])[
+        trace_a["uuid"]
+    ]["passed"] is True
+
+
+def test_latest_run_summary_one_select_for_the_page(monkeypatch):
+    org = _org()
+    traces = [_ingest_trace(org) for _ in range(3)]
+    ev, ver = _make_evaluator(org)
+    for trace in traces:
+        run = _insert_run(org, trace["uuid"], status="completed", completed_at=4)
+        _insert_score(
+            org,
+            run,
+            trace["uuid"],
+            evaluator_uuid=ev,
+            evaluator_version_id=ver,
+            match=1,
+        )
+
+    executes = []
+    real_connect = db.get_db_connection
+
+    class _CountingConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=None):
+            executes.append(sql)
+            if params is None:
+                return self._conn.execute(sql)
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    @contextlib.contextmanager
+    def _counting():
+        with real_connect() as conn:
+            yield _CountingConn(conn)
+
+    monkeypatch.setattr(db, "get_db_connection", _counting)
+    result = db.get_latest_trace_run_summaries(org, [t["uuid"] for t in traces])
+    assert len(result) == 3
+    data_selects = [sql for sql in executes if "ROW_NUMBER()" in sql]
+    assert len(data_selects) == 1
+
+
+def test_scoring_history_is_newest_first_and_keeps_deleted_evaluator():
+    org = _org()
+    trace = _ingest_trace(org)
+    ev, ver = _make_evaluator(org, name="Original")
+    older = _insert_run(
+        org, trace["uuid"], status="completed", created_at=1, completed_at=2
+    )
+    newer = _insert_run(
+        org, trace["uuid"], status="completed", created_at=3, completed_at=4
+    )
+    _insert_score(
+        org, older, trace["uuid"], evaluator_uuid=ev, evaluator_version_id=ver, match=1
+    )
+    _insert_score(
+        org, newer, trace["uuid"], evaluator_uuid=ev, evaluator_version_id=ver, match=0
+    )
+    assert db.delete_evaluator(ev) is True
+
+    runs = db.list_trace_scoring_runs(org, trace["uuid"])
+    assert [r["run_uuid"] for r in runs] == [newer, older]
+    assert runs[0]["results"][0]["name"] == "Original"
+    assert runs[0]["results"][0]["passed"] is False
+    assert runs[1]["results"][0]["passed"] is True
+    assert db.list_trace_scoring_runs(_org(), trace["uuid"]) == []
+
+
+def test_scoring_history_reads_pinned_soft_deleted_version_scale():
+    org = _org()
+    trace = _ingest_trace(org)
+    ev, v1 = _make_evaluator(
+        org,
+        output_type="rating",
+        scale=[{"value": 1, "name": "Low"}, {"value": 5, "name": "High"}],
+    )
+    v2 = db.create_evaluator_version(
+        ev,
+        "openai/gpt-4.1",
+        "Judge the reply.",
+        output_config={
+            "scale": [{"value": 1, "name": "Low"}, {"value": 10, "name": "High"}]
+        },
+    )
+    assert db.set_evaluator_live_version(ev, v2["uuid"]) is True
+    assert db.soft_delete_evaluator_version(ev, v1) == "deleted"
+
+    run = _insert_run(
+        org, trace["uuid"], status="completed", created_at=1, completed_at=2
+    )
+    _insert_score(
+        org,
+        run,
+        trace["uuid"],
+        evaluator_uuid=ev,
+        evaluator_version_id=v1,
+        match=None,
+        score=5,
+    )
+    history = db.list_trace_scoring_runs(org, trace["uuid"])
+    result = history[0]["results"][0]
+    assert result["scale_min"] == 1
+    assert result["scale_max"] == 5
+    assert result["passed"] is True
+    summary = db.get_latest_trace_run_summaries(org, [trace["uuid"]])[trace["uuid"]]
+    assert summary["passed"] is True

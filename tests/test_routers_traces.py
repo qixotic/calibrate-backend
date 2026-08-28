@@ -2149,3 +2149,447 @@ def test_ingest_opted_in_with_api_key_creates_a_run(client):
     body = _post_trace(client, key_headers, _payload(agent_id, _mid()))
     assert set(body) == {"uuid", "message_id", "conversation_id", "created_at"}
     assert len(_runs_for_trace(body["uuid"])) == 1
+
+
+# ---------------------------------------------------------------------------
+# Score / status read API (JWT-only)
+# ---------------------------------------------------------------------------
+
+
+def _org_of(agent_id: str) -> str:
+    return db.get_agent(agent_id)["org_uuid"]
+
+
+def _insert_run(org: str, trace_uuid: str, **overrides) -> str:
+    row = {
+        "uuid": str(uuid.uuid4()),
+        "trace_uuid": trace_uuid,
+        "org_uuid": org,
+        "agent_id": "agent-1",
+        "status": "pending",
+        "criteria": None,
+        "available_at": 0,
+        "attempts": 0,
+        "error": None,
+        "created_at": 1,
+        "updated_at": 1,
+        "completed_at": None,
+    }
+    row.update(overrides)
+    with db.get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO trace_evaluations "
+            "(uuid, trace_uuid, org_uuid, agent_id, status, criteria, "
+            "available_at, attempts, error, created_at, updated_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["uuid"],
+                row["trace_uuid"],
+                row["org_uuid"],
+                row["agent_id"],
+                row["status"],
+                row["criteria"],
+                row["available_at"],
+                row["attempts"],
+                row["error"],
+                row["created_at"],
+                row["updated_at"],
+                row["completed_at"],
+            ),
+        )
+        conn.commit()
+    return row["uuid"]
+
+
+def _insert_score(org: str, run_uuid: str, trace_uuid: str, **overrides) -> None:
+    row = {
+        "run_uuid": run_uuid,
+        "trace_uuid": trace_uuid,
+        "evaluator_uuid": "eval-1",
+        "evaluator_version_id": "version-1",
+        "org_uuid": org,
+        "match": 1,
+        "score": None,
+        "reasoning": "ok",
+        "completed_at": 10,
+    }
+    row.update(overrides)
+    with db.get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO trace_scores "
+            "(run_uuid, trace_uuid, evaluator_uuid, evaluator_version_id, "
+            "org_uuid, match, score, reasoning, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["run_uuid"],
+                row["trace_uuid"],
+                row["evaluator_uuid"],
+                row["evaluator_version_id"],
+                row["org_uuid"],
+                row["match"],
+                row["score"],
+                row["reasoning"],
+                row["completed_at"],
+            ),
+        )
+        conn.commit()
+
+
+def _create_rating_evaluator(client, h, scale_max=5):
+    name = f"ev-{uuid.uuid4().hex[:6]}"
+    res = client.post(
+        "/evaluators",
+        json={
+            "name": name,
+            "evaluator_type": "llm",
+            "output_type": "rating",
+            "version": {
+                "judge_model": "openai/gpt-4.1",
+                "system_prompt": "Judge the reply.",
+                "output_config": {
+                    "scale": [
+                        {"value": 1, "name": "Low"},
+                        {"value": scale_max, "name": "High"},
+                    ]
+                },
+            },
+        },
+        headers=h,
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    return body["uuid"], body["version_uuid"], name
+
+
+def _list_item(client, h, trace_uuid):
+    items = client.get("/traces", headers=h).json()["items"]
+    return next(item for item in items if item["uuid"] == trace_uuid)
+
+
+def test_scores_endpoint_is_jwt_only(client):
+    h, agent_id = _signup_with_agent(client)
+    key_headers = _api_key_headers(client, h)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    path = f"/traces/{trace['uuid']}/scores"
+    assert client.get(path).status_code in (401, 403)
+    assert client.get(path, headers=key_headers).status_code in (401, 403)
+
+
+def test_scores_no_run_is_empty_and_list_fields_are_null(client):
+    h, agent_id = _signup_with_agent(client)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    scores = client.get(f"/traces/{trace['uuid']}/scores", headers=h)
+    assert scores.status_code == 200, scores.text
+    assert scores.json() == {"runs": []}
+    item = _list_item(client, h, trace["uuid"])
+    assert item["latest_run_status"] is None
+    assert item["passed"] is None
+    assert item["n_passed"] is None
+    assert item["n_total"] is None
+
+
+@pytest.mark.parametrize(
+    "status,error,completed_at",
+    [
+        ("pending", None, None),
+        ("processing", None, None),
+        ("failed", "judge exploded", 9),
+        ("skipped", "no_usable_evaluators", 9),
+    ],
+)
+def test_scores_and_list_for_non_completed_status(client, status, error, completed_at):
+    h, agent_id = _signup_with_agent(client)
+    org = _org_of(agent_id)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    run = _insert_run(
+        org,
+        trace["uuid"],
+        status=status,
+        error=error,
+        created_at=1,
+        completed_at=completed_at,
+        agent_id=agent_id,
+    )
+    scores = client.get(f"/traces/{trace['uuid']}/scores", headers=h).json()
+    assert len(scores["runs"]) == 1
+    run_body = scores["runs"][0]
+    assert run_body["run_uuid"] == run
+    assert run_body["status"] == status
+    assert run_body["error"] == error
+    assert run_body["results"] == []
+    assert run_body["created_at"] == "1970-01-01T00:00:01Z"
+    if completed_at is None:
+        assert run_body["completed_at"] is None
+    else:
+        assert run_body["completed_at"].endswith("Z")
+    item = _list_item(client, h, trace["uuid"])
+    assert item["latest_run_status"] == status
+    assert item["passed"] is None
+    assert item["n_passed"] is None
+    assert item["n_total"] is None
+
+
+def test_scores_completed_mixed_types_and_list_conjunction(client):
+    h, agent_id = _signup_with_agent(client)
+    org = _org_of(agent_id)
+    binary_id, binary_ver = _create_clean_evaluator(client, h)
+    rating_id, rating_ver, rating_name = _create_rating_evaluator(client, h, scale_max=5)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    run = _insert_run(
+        org,
+        trace["uuid"],
+        status="completed",
+        created_at=2,
+        completed_at=3,
+        agent_id=agent_id,
+    )
+    _insert_score(
+        org,
+        run,
+        trace["uuid"],
+        evaluator_uuid=binary_id,
+        evaluator_version_id=binary_ver,
+        match=1,
+        score=None,
+        reasoning="binary pass",
+    )
+    _insert_score(
+        org,
+        run,
+        trace["uuid"],
+        evaluator_uuid=rating_id,
+        evaluator_version_id=rating_ver,
+        match=None,
+        score=4,
+        reasoning="rating mid",
+    )
+    scores = client.get(f"/traces/{trace['uuid']}/scores", headers=h)
+    assert scores.status_code == 200, scores.text
+    results = {r["evaluator_uuid"]: r for r in scores.json()["runs"][0]["results"]}
+    assert results[binary_id]["output_type"] == "binary"
+    assert results[binary_id]["match"] is True
+    assert results[binary_id]["score"] is None
+    assert results[binary_id]["passed"] is True
+    assert results[binary_id]["evaluator_type"] == "llm"
+    assert results[rating_id]["output_type"] == "rating"
+    assert results[rating_id]["match"] is None
+    assert results[rating_id]["score"] == 4
+    assert results[rating_id]["scale_min"] == 1
+    assert results[rating_id]["scale_max"] == 5
+    assert results[rating_id]["passed"] is False
+    assert results[rating_id]["name"] == rating_name
+    item = _list_item(client, h, trace["uuid"])
+    assert item["latest_run_status"] == "completed"
+    assert item["passed"] is False
+    assert item["n_passed"] == 1
+    assert item["n_total"] == 2
+
+
+def test_list_uses_latest_run_scores_show_full_history(client):
+    h, agent_id = _signup_with_agent(client)
+    org = _org_of(agent_id)
+    ev, ver = _create_clean_evaluator(client, h)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    older = _insert_run(
+        org,
+        trace["uuid"],
+        status="completed",
+        created_at=10,
+        completed_at=11,
+        agent_id=agent_id,
+    )
+    newer = _insert_run(
+        org,
+        trace["uuid"],
+        status="completed",
+        created_at=20,
+        completed_at=21,
+        agent_id=agent_id,
+    )
+    _insert_score(
+        org,
+        older,
+        trace["uuid"],
+        evaluator_uuid=ev,
+        evaluator_version_id=ver,
+        match=1,
+    )
+    _insert_score(
+        org,
+        newer,
+        trace["uuid"],
+        evaluator_uuid=ev,
+        evaluator_version_id=ver,
+        match=0,
+    )
+    item = _list_item(client, h, trace["uuid"])
+    assert item["latest_run_status"] == "completed"
+    assert item["passed"] is False
+    assert item["n_passed"] == 0
+    assert item["n_total"] == 1
+    runs = client.get(f"/traces/{trace['uuid']}/scores", headers=h).json()["runs"]
+    assert [r["run_uuid"] for r in runs] == [newer, older]
+    assert runs[0]["results"][0]["passed"] is False
+    assert runs[1]["results"][0]["passed"] is True
+
+
+def test_scores_renamed_and_deleted_evaluator_keeps_history(client):
+    h, agent_id = _signup_with_agent(client)
+    org = _org_of(agent_id)
+    ev, ver = _create_clean_evaluator(client, h)
+    new_name = f"renamed-{uuid.uuid4().hex[:6]}"
+    renamed = client.put(f"/evaluators/{ev}", json={"name": new_name}, headers=h)
+    assert renamed.status_code == 200, renamed.text
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    run = _insert_run(
+        org,
+        trace["uuid"],
+        status="completed",
+        created_at=1,
+        completed_at=2,
+        agent_id=agent_id,
+    )
+    _insert_score(
+        org, run, trace["uuid"], evaluator_uuid=ev, evaluator_version_id=ver, match=1
+    )
+    before_delete = client.get(f"/traces/{trace['uuid']}/scores", headers=h).json()
+    assert before_delete["runs"][0]["results"][0]["name"] == new_name
+
+    deleted = client.delete(f"/evaluators/{ev}", headers=h)
+    assert deleted.status_code == 200, deleted.text
+    after_delete = client.get(f"/traces/{trace['uuid']}/scores", headers=h)
+    assert after_delete.status_code == 200, after_delete.text
+    result = after_delete.json()["runs"][0]["results"][0]
+    assert result["name"] == new_name
+    assert result["passed"] is True
+    item = _list_item(client, h, trace["uuid"])
+    assert item["passed"] is True
+
+
+def test_scores_pinned_soft_deleted_version_keeps_scale(client):
+    h, agent_id = _signup_with_agent(client)
+    org = _org_of(agent_id)
+    ev, v1, _name = _create_rating_evaluator(client, h, scale_max=5)
+    v2 = client.post(
+        f"/evaluators/{ev}/versions",
+        json={
+            "judge_model": "openai/gpt-4.1",
+            "system_prompt": "Judge the reply.",
+            "make_live": True,
+            "output_config": {
+                "scale": [
+                    {"value": 1, "name": "Low"},
+                    {"value": 10, "name": "High"},
+                ]
+            },
+        },
+        headers=h,
+    )
+    assert v2.status_code == 200, v2.text
+    deleted = client.delete(f"/evaluators/{ev}/versions/{v1}", headers=h)
+    assert deleted.status_code == 200, deleted.text
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    run = _insert_run(
+        org,
+        trace["uuid"],
+        status="completed",
+        created_at=1,
+        completed_at=2,
+        agent_id=agent_id,
+    )
+    _insert_score(
+        org,
+        run,
+        trace["uuid"],
+        evaluator_uuid=ev,
+        evaluator_version_id=v1,
+        match=None,
+        score=5,
+    )
+    result = client.get(f"/traces/{trace['uuid']}/scores", headers=h).json()["runs"][0][
+        "results"
+    ][0]
+    assert result["scale_max"] == 5
+    assert result["passed"] is True
+    assert _list_item(client, h, trace["uuid"])["passed"] is True
+
+
+def test_scores_cross_org_is_403(client):
+    h, agent_id = _signup_with_agent(client)
+    org = _org_of(agent_id)
+    ev, ver = _create_clean_evaluator(client, h)
+    trace = _post_trace(client, h, _payload(agent_id, _mid()))
+    run = _insert_run(
+        org,
+        trace["uuid"],
+        status="completed",
+        created_at=1,
+        completed_at=2,
+        agent_id=agent_id,
+    )
+    _insert_score(
+        org, run, trace["uuid"], evaluator_uuid=ev, evaluator_version_id=ver, match=1
+    )
+    other = _signup(client)
+    denied = client.get(f"/traces/{trace['uuid']}/scores", headers=other)
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "This resource belongs to a different workspace"
+    assert client.get("/traces", headers=other).json()["total"] == 0
+    unknown = client.get(
+        "/traces/00000000-0000-4000-8000-000000000001/scores", headers=h
+    )
+    assert unknown.status_code == 404
+
+
+def test_list_scoring_summary_is_one_batched_query_for_the_page(client, monkeypatch):
+    from routers import traces as traces_mod
+
+    h, agent_id = _signup_with_agent(client)
+    org = _org_of(agent_id)
+    ev, ver = _create_clean_evaluator(client, h)
+    traces = [_post_trace(client, h, _payload(agent_id, _mid())) for _ in range(3)]
+    for created_at, trace in enumerate(traces, start=1):
+        run = _insert_run(
+            org,
+            trace["uuid"],
+            status="completed",
+            created_at=created_at,
+            completed_at=created_at,
+            agent_id=agent_id,
+        )
+        _insert_score(
+            org,
+            run,
+            trace["uuid"],
+            evaluator_uuid=ev,
+            evaluator_version_id=ver,
+            match=1,
+        )
+
+    calls = []
+    real = traces_mod.get_latest_trace_run_summaries
+
+    def _counting(org_uuid, trace_uuids):
+        calls.append(list(trace_uuids))
+        return real(org_uuid, trace_uuids)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("list scoring must not do per-row lookups")
+
+    monkeypatch.setattr(traces_mod, "get_latest_trace_run_summaries", _counting)
+    monkeypatch.setattr(db, "get_trace_evaluation", _boom)
+    monkeypatch.setattr(db, "get_trace_scores", _boom)
+    monkeypatch.setattr(db, "get_evaluator", _boom)
+
+    page = client.get("/traces?limit=2", headers=h)
+    assert page.status_code == 200, page.text
+    assert len(calls) == 1
+    assert len(calls[0]) == 2
+    body = page.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 2
+    for item in body["items"]:
+        assert item["latest_run_status"] == "completed"
+        assert item["passed"] is True
+        assert item["n_passed"] == 1
+        assert item["n_total"] == 1
