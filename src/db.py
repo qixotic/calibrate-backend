@@ -10423,6 +10423,7 @@ def create_trace_with_eval_run(
     up front means the timeout applies.
     """
     plan = None
+    pending_run = False
     if agent.get("auto_score_traces"):
         from trace_scoring import resolve_scoring_plan
 
@@ -10467,8 +10468,16 @@ def create_trace_with_eval_run(
                     error=None,
                     now=now,
                 )
+                pending_run = True
         conn.commit()
-        return row
+
+    if pending_run:
+        import trace_scoring_nudge
+
+        # After commit, so a worker cannot claim a run that then rolls back.
+        # Skipped / opted-out ingests do not wake the pool.
+        trace_scoring_nudge.set()
+    return row
 
 
 def list_traces(

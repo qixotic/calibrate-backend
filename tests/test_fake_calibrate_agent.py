@@ -425,3 +425,65 @@ def test_provider_status_run_check_short_circuits_under_flag():
 
     assert providers, "expected a non-empty healthy provider set"
     assert all(info.get("status") == "pass" for info in providers.values())
+
+
+def test_claim_and_score_batch_end_to_end_with_fake_cli():
+    """Opted-in trace scoring through the real fake — no subprocess patch."""
+    import trace_scoring as ts
+
+    user_uuid = db.create_user("F", "AI", f"fai-{os.urandom(4).hex()}@x.com")
+    org_uuid = db.get_personal_org_for_user(user_uuid)["uuid"]
+    agent_uuid = db.create_agent(
+        name=f"a-{os.urandom(4).hex()}", org_uuid=org_uuid, user_id=user_uuid
+    )
+    ev_uuid = db.create_evaluator(
+        name=f"acc-{os.urandom(4).hex()}",
+        evaluator_type="llm",
+        output_type="binary",
+        owner_user_id=user_uuid,
+        org_uuid=org_uuid,
+    )
+    version = db.create_evaluator_version(
+        ev_uuid, judge_model="m", system_prompt="judge this"
+    )
+    db.set_evaluator_live_version(ev_uuid, version["uuid"])
+    db.add_evaluator_to_agent(agent_uuid, ev_uuid)
+    db.update_agent(agent_uuid, auto_score_traces=True)
+    agent = db.get_agent(agent_uuid)
+
+    trace = db.create_trace_with_eval_run(
+        org_uuid=org_uuid,
+        agent=agent,
+        input=[{"role": "user", "content": "hi"}],
+        output={"response": "hello", "tool_calls": None},
+    )
+    with db.get_db_connection() as conn:
+        run = conn.execute(
+            "SELECT * FROM trace_evaluations WHERE trace_uuid = ?",
+            (trace["uuid"],),
+        ).fetchone()
+    assert run["status"] == "pending"
+
+    with db.get_db_connection() as conn:
+        conn.execute(
+            "UPDATE trace_evaluations SET available_at = 2000000000 "
+            "WHERE status IN ('pending', 'processing')"
+        )
+        conn.execute(
+            "UPDATE trace_evaluations SET available_at = 0 WHERE uuid = ?",
+            (run["uuid"],),
+        )
+        conn.commit()
+
+    with patch.dict(os.environ, {"FAKE_AI_PROVIDERS": "1"}):
+        claimed = ts.claim_and_score_batch(now=10, batch_size=1, lease_seconds=60)
+
+    assert [row["uuid"] for row in claimed] == [run["uuid"]]
+    settled = db.get_trace_evaluation(run["uuid"])
+    assert settled["status"] == "completed", settled
+    scores = db.get_trace_scores(run["uuid"])
+    assert len(scores) == 1
+    assert scores[0]["evaluator_uuid"] == ev_uuid
+    assert scores[0]["match"] == 1
+    assert scores[0]["score"] is None
+    assert "Simulated judge reasoning" in (scores[0]["reasoning"] or "")

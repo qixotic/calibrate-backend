@@ -2,8 +2,8 @@
 
 Shared by the agent opt-in API, ingest-time run creation, and the scoring
 loop. Lives outside `routers/` so `db.py` can call it without importing a
-router. There is no lifespan worker here — callers (tests, later PR 6)
-drive `claim_and_score_batch`.
+router. The lifespan worker in `workers.trace_scoring` drives
+`claim_and_score_batch`; tests may call it directly.
 """
 
 from __future__ import annotations

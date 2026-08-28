@@ -54,6 +54,20 @@ def initialized_db():
     yield
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _disable_trace_scoring_pool():
+    """Keep the lifespan pool off unless a test module re-enables it.
+
+    Most TestClient modules ingest opted-in traces and assert `pending`.
+    A live worker would race those assertions.
+    """
+    from workers.trace_scoring import set_pool_enabled
+
+    set_pool_enabled(False)
+    yield
+    set_pool_enabled(True)
+
+
 @pytest.fixture(autouse=True)
 def _clear_s3_client_cache():
     """Drop the cached boto3 client between tests.
