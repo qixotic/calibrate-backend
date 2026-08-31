@@ -241,10 +241,24 @@ def is_name_taken(
         return cursor.fetchone() is not None
 
 
+# `claim_trace_eval_runs` claims with UPDATE...RETURNING, added in SQLite 3.35.
+SQLITE_RETURNING_MIN = (3, 35, 0)
+
+
+def assert_sqlite_returning_support() -> None:
+    """Fail at boot rather than at the first scoring claim on an old libsqlite."""
+    if sqlite3.sqlite_version_info < SQLITE_RETURNING_MIN:
+        raise RuntimeError(
+            f"SQLite {sqlite3.sqlite_version} is too old for trace scoring "
+            "(needs 3.35+ for UPDATE...RETURNING)"
+        )
+
+
 def init_db():
     """Initialize the database and create tables if they don't exist."""
     # Ensure the data directory exists
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    assert_sqlite_returning_support()
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -10631,3 +10645,331 @@ def delete_pending_trace_eval_runs_for_agent(
         deleted = _delete_pending_trace_eval_runs(conn.cursor(), agent_id, org_uuid)
         conn.commit()
         return deleted
+
+
+def _trace_scoring_skip_reason_on(
+    cur: sqlite3.Cursor, org_uuid: str, trace_uuid: str, agent_id: str
+) -> Optional[trace_scoring.TraceEvalSettleSkipReason]:
+    """Why this run can no longer be scored, or None if both rows are live.
+
+    Takes a cursor so settlement can re-check inside its own transaction —
+    either row can be soft-deleted between claim and settle, and a score
+    written for a deleted trace is invisible to every read path but still
+    counts in aggregates.
+    """
+    trace = cur.execute(
+        "SELECT deleted_at FROM traces WHERE uuid = ? AND org_uuid = ?",
+        (trace_uuid, org_uuid),
+    ).fetchone()
+    if trace is None or trace["deleted_at"] is not None:
+        return trace_scoring.TraceEvalSettleSkipReason.TRACE_DELETED
+    agent = cur.execute(
+        "SELECT deleted_at FROM agents WHERE uuid = ?", (agent_id,)
+    ).fetchone()
+    if agent is None or agent["deleted_at"] is not None:
+        return trace_scoring.TraceEvalSettleSkipReason.AGENT_DELETED
+    return None
+
+
+def trace_scoring_skip_reason(
+    org_uuid: str, trace_uuid: str, agent_id: str
+) -> Optional[trace_scoring.TraceEvalSettleSkipReason]:
+    """Committed-read variant of `_trace_scoring_skip_reason_on`, for claim time."""
+    with get_db_connection() as conn:
+        return _trace_scoring_skip_reason_on(
+            conn.cursor(), org_uuid, trace_uuid, agent_id
+        )
+
+
+def get_trace_eval_run(run_uuid: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM trace_eval_runs WHERE uuid = ?", (run_uuid,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_trace_eval_scores(run_uuid: str) -> List[Dict[str, Any]]:
+    """This run's scores, ordered for stable reads."""
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trace_eval_scores WHERE run_uuid = ? ORDER BY evaluator_uuid",
+            (run_uuid,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def claim_trace_eval_runs(
+    *,
+    now: int,
+    lease_seconds: int,
+    batch_size: int,
+) -> List[Dict[str, Any]]:
+    """Claim up to `batch_size` open runs, oldest `available_at` first.
+
+    `available_at` carries both meanings — when a pending run becomes ready, and
+    when a processing run's lease expires — so one range scan picks up fresh,
+    timed-out, and backed-off work and no sweeper is needed. Claiming stamps the
+    next lease into the same column.
+
+    BEGIN IMMEDIATE takes the write lock up front: a deferred transaction starts
+    as a reader and can fail SQLITE_BUSY when it upgrades, without honouring
+    busy_timeout.
+    """
+    if batch_size <= 0:
+        return []
+    open_statuses = [s.value for s in trace_scoring.OPEN_TRACE_EVAL_RUN_STATUSES]
+    placeholders = ",".join("?" for _ in open_statuses)
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            f"""
+            UPDATE trace_eval_runs
+               SET status = ?,
+                   available_at = ?,
+                   attempts = attempts + 1,
+                   updated_at = ?
+             WHERE id IN (
+                     SELECT id FROM trace_eval_runs
+                      WHERE status IN ({placeholders})
+                        AND available_at <= ?
+                      ORDER BY available_at, id
+                      LIMIT ?
+                   )
+            RETURNING uuid, trace_uuid, org_uuid, agent_id, scoring_plan, attempts,
+                      status, available_at
+            """,
+            (
+                trace_scoring.TraceEvalRunStatus.PROCESSING.value,
+                now + lease_seconds,
+                now,
+                *open_statuses,
+                now,
+                batch_size,
+            ),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+        conn.commit()
+    return rows
+
+
+def _upsert_trace_eval_scores(
+    cur: sqlite3.Cursor,
+    *,
+    run_uuid: str,
+    trace_uuid: str,
+    org_uuid: str,
+    scores: List[Dict[str, Any]],
+    now: int,
+) -> None:
+    """Write this run's scores. Keyed on the run, so a retry of the same run
+    overwrites its own rows while a rescore (a different run) never touches
+    them."""
+    for score in scores:
+        cur.execute(
+            """
+            INSERT INTO trace_eval_scores
+                (run_uuid, trace_uuid, evaluator_uuid, evaluator_version_id,
+                 org_uuid, value, output_type, reasoning, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (run_uuid, evaluator_uuid) DO UPDATE SET
+                evaluator_version_id = excluded.evaluator_version_id,
+                value = excluded.value,
+                output_type = excluded.output_type,
+                reasoning = excluded.reasoning,
+                completed_at = excluded.completed_at
+            """,
+            (
+                run_uuid,
+                trace_uuid,
+                score["evaluator_uuid"],
+                score["evaluator_version_id"],
+                org_uuid,
+                score["value"],
+                score["output_type"],
+                score.get("reasoning"),
+                now,
+            ),
+        )
+
+
+def _claimed_run_for_update(
+    cur: sqlite3.Cursor, run_uuid: str
+) -> Optional[sqlite3.Row]:
+    """The run if this worker still owns it, else None.
+
+    Settlement is guarded on `processing` rather than on a claim token: the
+    snapshot is immutable from creation, so every worker that ever runs a given
+    run does identical work and only "is it still open" matters.
+
+    This is the ONLY guard each settle path needs. Callers hold the write lock
+    from BEGIN IMMEDIATE, so nothing can move the row between this read and
+    their UPDATE; the `status` predicate they still carry is belt-and-braces.
+    """
+    row = cur.execute(
+        "SELECT uuid, trace_uuid, org_uuid, agent_id, status "
+        "FROM trace_eval_runs WHERE uuid = ?",
+        (run_uuid,),
+    ).fetchone()
+    if row is None or row["status"] != trace_scoring.TraceEvalRunStatus.PROCESSING.value:
+        return None
+    return row
+
+
+def _mark_skipped(
+    cur: sqlite3.Cursor,
+    run_uuid: str,
+    reason: trace_scoring.TraceEvalSettleSkipReason,
+    now: int,
+) -> None:
+    cur.execute(
+        "UPDATE trace_eval_runs SET status = ?, error = ?, completed_at = ?, "
+        "updated_at = ? WHERE uuid = ? AND status = ?",
+        (
+            trace_scoring.TraceEvalRunStatus.SKIPPED.value,
+            reason.value,
+            now,
+            now,
+            run_uuid,
+            trace_scoring.TraceEvalRunStatus.PROCESSING.value,
+        ),
+    )
+
+
+def settle_trace_eval_run_completed(
+    run_uuid: str,
+    scores: List[Dict[str, Any]],
+    *,
+    now: int,
+) -> str:
+    """Complete a run and write its scores, if this worker still owns it.
+
+    Returns `completed`, `skipped` (the trace or agent was deleted during the
+    judge call), or `noop` (someone else already settled it). The scores are
+    written in the same transaction as the status flip, so a run is never
+    `completed` with no rows and never carries rows it did not settle.
+    """
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        run = _claimed_run_for_update(cur, run_uuid)
+        if run is None:
+            conn.rollback()
+            return "noop"
+        skip = _trace_scoring_skip_reason_on(
+            cur, run["org_uuid"], run["trace_uuid"], run["agent_id"]
+        )
+        if skip is not None:
+            _mark_skipped(cur, run_uuid, skip, now)
+            conn.commit()
+            return "skipped"
+        cur.execute(
+            "UPDATE trace_eval_runs SET status = ?, error = NULL, completed_at = ?, "
+            "updated_at = ? WHERE uuid = ? AND status = ?",
+            (
+                trace_scoring.TraceEvalRunStatus.COMPLETED.value,
+                now,
+                now,
+                run_uuid,
+                trace_scoring.TraceEvalRunStatus.PROCESSING.value,
+            ),
+        )
+        _upsert_trace_eval_scores(
+            cur,
+            run_uuid=run_uuid,
+            trace_uuid=run["trace_uuid"],
+            org_uuid=run["org_uuid"],
+            scores=scores,
+            now=now,
+        )
+        conn.commit()
+        return "completed"
+
+
+def settle_trace_eval_run_terminal(
+    run_uuid: str,
+    *,
+    status: trace_scoring.TraceEvalRunStatus,
+    error: Optional[str],
+    now: int,
+) -> bool:
+    """Bury a run as `failed` or `skipped`. True if this worker wrote the row.
+
+    A trace or agent deleted since the claim becomes `skipped` whatever the
+    caller asked for: "the judge could not run" is not the interesting fact
+    once the thing being scored is gone.
+    """
+    if status not in (
+        trace_scoring.TraceEvalRunStatus.FAILED,
+        trace_scoring.TraceEvalRunStatus.SKIPPED,
+    ):
+        raise ValueError(f"terminal status must be failed or skipped, got {status!r}")
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        run = _claimed_run_for_update(cur, run_uuid)
+        if run is None:
+            conn.rollback()
+            return False
+        skip = _trace_scoring_skip_reason_on(
+            cur, run["org_uuid"], run["trace_uuid"], run["agent_id"]
+        )
+        if skip is not None:
+            _mark_skipped(cur, run_uuid, skip, now)
+        else:
+            cur.execute(
+                "UPDATE trace_eval_runs SET status = ?, error = ?, completed_at = ?, "
+                "updated_at = ? WHERE uuid = ? AND status = ?",
+                (
+                    status.value,
+                    error,
+                    now,
+                    now,
+                    run_uuid,
+                    trace_scoring.TraceEvalRunStatus.PROCESSING.value,
+                ),
+            )
+        conn.commit()
+        return True
+
+
+def defer_trace_eval_run(
+    run_uuid: str,
+    *,
+    available_at: int,
+    now: int,
+    error: Optional[str] = None,
+) -> bool:
+    """Return a still-owned run to `pending` for a later retry.
+
+    A deleted trace or agent skips instead, matching completed settlement —
+    there is nothing left to retry against.
+    """
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        run = _claimed_run_for_update(cur, run_uuid)
+        if run is None:
+            conn.rollback()
+            return False
+        skip = _trace_scoring_skip_reason_on(
+            cur, run["org_uuid"], run["trace_uuid"], run["agent_id"]
+        )
+        if skip is not None:
+            _mark_skipped(cur, run_uuid, skip, now)
+        else:
+            cur.execute(
+                "UPDATE trace_eval_runs SET status = ?, available_at = ?, "
+                "updated_at = ?, error = ? WHERE uuid = ? AND status = ?",
+                (
+                    trace_scoring.TraceEvalRunStatus.PENDING.value,
+                    available_at,
+                    now,
+                    error,
+                    run_uuid,
+                    trace_scoring.TraceEvalRunStatus.PROCESSING.value,
+                ),
+            )
+        conn.commit()
+        return True

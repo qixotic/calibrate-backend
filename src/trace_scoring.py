@@ -19,6 +19,18 @@ from shared_enums import (
 # Stored on a skipped `trace_eval_runs.error` when ingest cannot build a plan.
 TraceEvalSkipReason = Literal["unsupported_interaction_type", "no_usable_evaluators"]
 
+
+class TraceEvalSettleSkipReason(str, Enum):
+    """Why a claimed run was abandoned. Also stored on `error`.
+
+    Separate from `TraceEvalSkipReason`: these are reachable only after a run
+    exists, so ingest can never write one and a reader can tell where a skip
+    came from.
+    """
+
+    TRACE_DELETED = "trace_deleted"
+    AGENT_DELETED = "agent_deleted"
+
 # Subset of TestType that traces can score.
 TraceScorableEvaluationType = Literal["response", "general"]
 
