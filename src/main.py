@@ -80,6 +80,10 @@ from utils import (
 )
 from job_recovery import recover_pending_jobs
 from provider_status import available_provider_names, provider_status_monitor
+from workers.trace_scoring import (
+    shutdown_trace_scoring_pool,
+    start_trace_scoring_pool,
+)
 
 
 # Set up logger
@@ -97,6 +101,7 @@ async def lifespan(app: FastAPI):
     logger.info("Checking for in_progress jobs to recover...")
     recover_pending_jobs()
     provider_status_task = asyncio.create_task(provider_status_monitor.refresh_loop())
+    trace_scoring_pool = start_trace_scoring_pool()
     try:
         yield
     finally:
@@ -105,6 +110,9 @@ async def lifespan(app: FastAPI):
             await provider_status_task
         except asyncio.CancelledError:
             pass
+        # Stop new claims and wait for in-flight batches to settle. A run's
+        # lease is the backstop if the process is killed outright.
+        await shutdown_trace_scoring_pool(trace_scoring_pool)
         logger.info("Application shutting down")
 
 

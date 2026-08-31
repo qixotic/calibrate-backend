@@ -8,8 +8,9 @@ the backend. For each ``[cli, <subcommand>, ...flags]`` a worker spawns, it
 writes the output files that worker's reader expects, then exits 0.
 
 Output shapes mirror the readers in ``routers/agent_tests.py``, ``stt.py``,
-``tts.py``, ``simulations.py``, and ``annotation_eval_runner.py``. The constants
-below are asserted by the frontend integration tests — keep them stable.
+``tts.py``, ``simulations.py``, ``annotation_eval_runner.py``, and
+``trace_scoring.py``. The constants below are asserted by the frontend
+integration tests — keep them stable.
 """
 
 import csv
@@ -170,13 +171,12 @@ def _llm_judge_results(
         if not name:
             continue
         ev = ev_by_name.get(name, {})
+        judgement = {"reasoning": FAKE_REASONING, "evaluator_id": _ev_uuid(ev)}
         if ev.get("type") == "rating":
-            judge_results[name] = {
-                "reasoning": FAKE_REASONING,
-                "score": _ev_scale_max(ev),
-            }
+            judgement["score"] = _ev_scale_max(ev)
         else:
-            judge_results[name] = {"reasoning": FAKE_REASONING, "match": True}
+            judgement["match"] = True
+        judge_results[name] = judgement
     return judge_results
 
 

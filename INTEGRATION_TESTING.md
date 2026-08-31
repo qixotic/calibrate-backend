@@ -1,9 +1,9 @@
 # Integration testing without real AI cost
 
 Set `FAKE_AI_PROVIDERS=1` to run the full **run → results** pipeline (LLM tests,
-benchmarks, STT, TTS, text/voice simulations, annotation evaluator runs) with **no
-real LLM/STT/TTS provider call, no API key, and no cost**. Use it in CI and local
-E2E; never set it in production.
+benchmarks, STT, TTS, text/voice simulations, annotation evaluator runs, trace
+scoring) with **no real LLM/STT/TTS provider call, no API key, and no cost**. Use
+it in CI and local E2E; never set it in production.
 
 ## How it works
 
@@ -61,7 +61,7 @@ Every evaluator verdict is a PASS; every rating is scale-max.
 Any `calibrate-agent` change is a **three-file change** — do all three in one commit:
 
 1. the real worker/reader in `routers/agent_tests.py`, `stt.py`, `tts.py`,
-   `simulations.py`, or `annotation_eval_runner.py`;
+   `simulations.py`, `annotation_eval_runner.py`, or `trace_scoring.py`;
 2. [src/testing/fake_calibrate_agent.py](src/testing/fake_calibrate_agent.py) so its
    canned output still matches (and `SUPPORTED_SUBCOMMANDS` if the subcommand set
    changed);
