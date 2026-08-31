@@ -8,6 +8,7 @@ seam or the fake's per-subcommand output contract.
 
 import asyncio
 import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -410,6 +411,64 @@ def test_annotation_eval_run_job_end_to_end_with_fake_cli(task_type):
     assert created, f"no evaluator_runs created for task_type={task_type}"
     assert all(r["status"] == "completed" for r in created), created
     assert all(r["item_id"] == "item-1" for r in created)
+
+
+@pytest.mark.parametrize(
+    "interaction_type,evaluator_type,trace",
+    [
+        (
+            "conversation",
+            "llm",
+            {
+                "input": [{"role": "user", "content": "hi"}],
+                "output": {"response": "hello", "tool_calls": None},
+            },
+        ),
+        ("general", "llm-general", {"input": "summarize", "output": {"response": "done"}}),
+    ],
+)
+def test_trace_scoring_claim_and_settle_end_to_end_with_fake_cli(
+    interaction_type, evaluator_type, trace
+):
+    """Drive the scoring engine's real CLI seam for both interaction types."""
+    import trace_scoring as ts
+
+    user_uuid = db.create_user("F", "AI", f"fai-{os.urandom(4).hex()}@x.com")
+    org_uuid = db.get_personal_org_for_user(user_uuid)["uuid"]
+    agent_uuid = db.create_agent(
+        name=f"a-{os.urandom(4).hex()}",
+        org_uuid=org_uuid,
+        user_id=user_uuid,
+        interaction_type=interaction_type,
+    )
+    ev_uuid = db.create_evaluator(
+        name=f"acc-{os.urandom(4).hex()}",
+        evaluator_type=evaluator_type,
+        output_type="binary",
+        owner_user_id=user_uuid,
+        org_uuid=org_uuid,
+    )
+    version = db.create_evaluator_version(
+        ev_uuid, judge_model="m", system_prompt="judge this"
+    )
+    db.set_evaluator_live_version(ev_uuid, version["uuid"])
+    db.add_evaluator_to_agent(agent_uuid, ev_uuid)
+    db.update_agent(agent_uuid, auto_score_traces=True)
+
+    agent = db.get_agent(agent_uuid)
+    row = db.create_trace_with_eval_run(org_uuid=org_uuid, agent=agent, **trace)
+
+    with patch.dict(os.environ, {"FAKE_AI_PROVIDERS": "1"}):
+        claimed = ts.claim_and_score_batch(now=int(time.time()) + 5)
+
+    run = next(r for r in claimed if r["trace_uuid"] == row["uuid"])
+    settled = db.get_trace_eval_run(run["uuid"])
+    assert settled["status"] == ts.TraceEvalRunStatus.COMPLETED.value, settled["error"]
+    scores = db.get_trace_eval_scores(run["uuid"])
+    assert [(s["evaluator_uuid"], s["value"], s["output_type"]) for s in scores] == [
+        (ev_uuid, 1, "binary")
+    ]
+    assert scores[0]["evaluator_version_id"] == version["uuid"]
 
 
 def test_provider_status_run_check_short_circuits_under_flag():

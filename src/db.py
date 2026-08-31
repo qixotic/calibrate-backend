@@ -5551,22 +5551,25 @@ def get_evaluator(evaluator_uuid: str) -> Optional[Dict[str, Any]]:
 
 def get_evaluators_by_uuids(
     evaluator_uuids: List[str],
+    include_deleted: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Bulk variant of `get_evaluator` — single query for many UUIDs.
-    Returns `{uuid: evaluator_row}`; missing or soft-deleted UUIDs are
-    omitted from the result. Use this when a caller would otherwise loop
-    `get_evaluator(...)` per id (N+1)."""
+    Returns `{uuid: evaluator_row}`; missing UUIDs are omitted. Soft-deleted
+    rows are omitted unless `include_deleted=True`, which trace scoring needs
+    to reproduce a run against an evaluator deleted after it was pinned. Use
+    this when a caller would otherwise loop `get_evaluator(...)` per id (N+1)."""
     if not evaluator_uuids:
         return {}
     unique_uuids = list({u for u in evaluator_uuids if u})
     if not unique_uuids:
         return {}
     placeholders = ",".join("?" for _ in unique_uuids)
+    deleted_clause = "" if include_deleted else " AND deleted_at IS NULL"
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             f"SELECT * FROM evaluators "
-            f"WHERE uuid IN ({placeholders}) AND deleted_at IS NULL",
+            f"WHERE uuid IN ({placeholders}){deleted_clause}",
             unique_uuids,
         )
         return {row["uuid"]: _parse_evaluator_row(row) for row in cursor.fetchall()}

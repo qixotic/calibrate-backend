@@ -1,8 +1,18 @@
-"""Unit tests for trace-scoring eligibility / plan resolution."""
+"""Unit tests for trace-scoring eligibility, plan resolution, and the pure
+engine helpers.
+
+Anything touching the DB or the claim/settle transactions lives in
+`test_trace_eval_claim.py`.
+"""
 
 from __future__ import annotations
 
+import json
+import random
 import uuid
+from dataclasses import asdict
+
+import pytest
 
 import db
 import trace_scoring as ts
@@ -187,3 +197,234 @@ def test_resolve_live_evaluators_pairs_version_or_none():
     )
     assert result.ineligible[0].evaluator_uuid == bare_ev
     assert result.ineligible[0].reason == ts.IneligibleReason.NO_LIVE_VERSION
+
+
+def _plan(evaluation_type="response", pins=(("ev-1", "ver-1"),)) -> ts.ScoringPlan:
+    return ts.ScoringPlan(
+        evaluation_type=evaluation_type,
+        evaluators=[
+            ts.ScoringPlanPin(evaluator_uuid=e, evaluator_version_id=v) for e, v in pins
+        ],
+    )
+
+
+def test_a_serialized_plan_parses_back_to_the_same_dataclass():
+    plan = _plan(pins=(("ev-1", "ver-1"), ("ev-2", "ver-2")))
+    assert ts.parse_scoring_plan(json.dumps(asdict(plan))) == plan
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "",
+        "{not json",
+        123,
+        json.dumps([]),
+        json.dumps({"evaluation_type": "conversation", "evaluators": [{"a": 1}]}),
+        json.dumps({"evaluators": [{"evaluator_uuid": "e", "evaluator_version_id": "v"}]}),
+        json.dumps({"evaluation_type": "response"}),
+        json.dumps({"evaluation_type": "response", "evaluators": []}),
+        json.dumps({"evaluation_type": "response", "evaluators": "nope"}),
+        json.dumps({"evaluation_type": "response", "evaluators": ["ev-1"]}),
+        json.dumps({"evaluation_type": "response", "evaluators": [{"evaluator_uuid": "e"}]}),
+        json.dumps(
+            {"evaluation_type": "response", "evaluators": [{"evaluator_version_id": "v"}]}
+        ),
+        json.dumps(
+            {
+                "evaluation_type": "response",
+                "evaluators": [
+                    {"evaluator_uuid": "e", "evaluator_version_id": "v1"},
+                    {"evaluator_uuid": "e", "evaluator_version_id": "v2"},
+                ],
+            }
+        ),
+    ],
+)
+def test_an_unusable_snapshot_never_parses_into_a_partial_plan(raw):
+    assert ts.parse_scoring_plan(raw) is None
+
+
+def test_results_are_indexed_by_id_and_a_repeated_id_drops_both():
+    entries = [
+        {"test_case_id": "run-1", "metrics": {}},
+        {"test_case": {"id": "run-2"}, "metrics": {}},
+        {"test_case_id": "run-3", "metrics": {}},
+        {"test_case_id": "run-3", "metrics": {}},
+    ]
+    indexed = ts.index_cli_results(entries)
+    assert sorted(indexed) == ["run-1", "run-2"]
+
+
+def test_entries_with_no_id_and_a_non_list_file_are_ignored():
+    assert ts.index_cli_results("not a list") == {}
+    assert ts.index_cli_results([{"metrics": {}}, "junk", None]) == {}
+
+
+def _hydrated(uuid_: str, output_type: str) -> dict:
+    return {
+        "uuid": uuid_,
+        "output_type": output_type,
+        "evaluator_version_id": f"{uuid_}-version",
+    }
+
+
+def test_a_verdict_maps_by_evaluator_id_ahead_of_its_runtime_name():
+    entry = {
+        "metrics": {
+            "judge_results": {
+                "renamed since the run": {
+                    "evaluator_id": "ev-1",
+                    "match": True,
+                    "reasoning": "ok",
+                }
+            }
+        }
+    }
+    scores = ts.map_item_scores(
+        entry,
+        pins=[ts.ScoringPlanPin(evaluator_uuid="ev-1", evaluator_version_id="ev-1-version")],
+        name_to_uuid={},
+        hydrated_by_uuid={"ev-1": _hydrated("ev-1", "binary")},
+    )
+    assert scores == [
+        {
+            "evaluator_uuid": "ev-1",
+            "evaluator_version_id": "ev-1-version",
+            "value": 1,
+            "output_type": "binary",
+            "reasoning": "ok",
+        }
+    ]
+
+
+def test_a_verdict_falls_back_to_the_runtime_name_when_the_runner_sends_no_id():
+    entry = {"metrics": {"judge_results": {"Correctness-ab12": {"score": 3}}}}
+    scores = ts.map_item_scores(
+        entry,
+        pins=[ts.ScoringPlanPin(evaluator_uuid="ev-1", evaluator_version_id="ev-1-version")],
+        name_to_uuid={"Correctness-ab12": "ev-1"},
+        hydrated_by_uuid={"ev-1": _hydrated("ev-1", "rating")},
+    )
+    assert scores == [
+        {
+            "evaluator_uuid": "ev-1",
+            "evaluator_version_id": "ev-1-version",
+            "value": 3.0,
+            "output_type": "rating",
+            "reasoning": None,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "judge_results",
+    [
+        {"Unknown": {"match": True}},
+        {"A": {"match": True}, "B": {"evaluator_id": "ev-1", "match": False}},
+        {"A": "not a dict"},
+        {"A": {"reasoning": "no verdict at all"}},
+        {"A": {"match": "maybe"}},
+        {},
+    ],
+)
+def test_a_result_that_cannot_be_read_cleanly_leaves_the_run_unsettled(judge_results):
+    entry = {"metrics": {"judge_results": judge_results}}
+    assert (
+        ts.map_item_scores(
+            entry,
+            pins=[
+                ts.ScoringPlanPin(evaluator_uuid="ev-1", evaluator_version_id="ev-1-version")
+            ],
+            name_to_uuid={"A": "ev-1", "B": "ev-1"},
+            hydrated_by_uuid={"ev-1": _hydrated("ev-1", "binary")},
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("entry", [{}, {"metrics": "nope"}, {"metrics": {"judge_results": []}}])
+def test_a_result_with_no_judge_block_leaves_the_run_unsettled(entry):
+    assert (
+        ts.map_item_scores(
+            entry,
+            pins=[
+                ts.ScoringPlanPin(evaluator_uuid="ev-1", evaluator_version_id="ev-1-version")
+            ],
+            name_to_uuid={},
+            hydrated_by_uuid={"ev-1": _hydrated("ev-1", "binary")},
+        )
+        is None
+    )
+
+
+def test_a_result_missing_one_of_two_pinned_evaluators_is_unsettleable():
+    entry = {"metrics": {"judge_results": {"A": {"evaluator_id": "ev-1", "match": True}}}}
+    assert (
+        ts.map_item_scores(
+            entry,
+            pins=[
+                ts.ScoringPlanPin(evaluator_uuid="ev-1", evaluator_version_id="ev-1-version"),
+                ts.ScoringPlanPin(evaluator_uuid="ev-2", evaluator_version_id="ev-2-version"),
+            ],
+            name_to_uuid={},
+            hydrated_by_uuid={
+                "ev-1": _hydrated("ev-1", "binary"),
+                "ev-2": _hydrated("ev-2", "binary"),
+            },
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "judgement,output_type",
+    [
+        ({"score": None}, "rating"),
+        ({"reasoning": "no score key"}, "rating"),
+        ({"score": "high"}, "rating"),
+        ({"score": True}, "rating"),
+    ],
+)
+def test_a_rating_without_a_usable_number_is_rejected_before_the_insert(
+    judgement, output_type
+):
+    """`trace_eval_scores.value` is NOT NULL, so a verdict the schema would
+    reject has to fail here — inside the settle transaction it would be an
+    IntegrityError, not a retryable run."""
+    assert ts._typed_score(judgement, output_type) is None
+
+
+def test_a_binary_verdict_normalizes_truthy_and_falsy_forms():
+    assert ts._typed_score({"match": 1}, "binary")["value"] == 1
+    assert ts._typed_score({"match": 0}, "binary")["value"] == 0
+
+
+def test_non_string_reasoning_is_coerced_rather_than_dropped():
+    assert ts._typed_score({"match": True, "reasoning": 7}, "binary")["reasoning"] == "7"
+
+
+def test_backoff_grows_with_attempts_and_never_lands_on_one_instant():
+    """Without jitter a whole-batch failure defers every run to the same
+    moment, and the next claim reassembles the identical failing batch."""
+    delays = {ts.backoff_available_at(1, 0, random.Random(seed)) for seed in range(20)}
+    assert len(delays) > 1
+    assert min(delays) >= ts._BACKOFF_BASE_SECONDS
+    assert ts.backoff_available_at(6, 0, random.Random(1)) >= ts._BACKOFF_CAP_SECONDS
+
+
+def test_a_long_error_is_truncated_and_an_empty_one_still_says_something():
+    assert ts._truncate_error("") == "scoring failed"
+    truncated = ts._truncate_error("x" * (ts.ERROR_MAX_CHARS + 500))
+    assert len(truncated) == ts.ERROR_MAX_CHARS
+    assert truncated.endswith("...")
+
+
+def test_a_results_file_that_is_missing_or_mid_rewrite_reads_as_nothing_finished(tmp_path):
+    assert ts.parse_results_json(tmp_path / "missing.json") == []
+    partial = tmp_path / "results.json"
+    partial.write_text('[{"test_case_id": "run-1"')
+    assert ts.parse_results_json(partial) == []
+    partial.write_text('{"not": "a list"}')
+    assert ts.parse_results_json(partial) == []
