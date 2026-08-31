@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-from llm_judge import build_test_evaluators_payload
+from llm_judge import _scale_bounds, build_test_evaluators_payload
 from shared_enums import (
     REQUIRED_EVALUATOR_TYPE_BY_TEST_TYPE,
     AgentInteractionType,
@@ -87,6 +87,34 @@ OPEN_TRACE_EVAL_RUN_STATUSES: tuple[TraceEvalRunStatus, ...] = (
     TraceEvalRunStatus.PENDING,
     TraceEvalRunStatus.PROCESSING,
 )
+
+
+def scale_bounds_from_output_config(raw: Any) -> tuple[float | None, float | None]:
+    """Numeric min/max of a rating rubric, from the stored JSON TEXT or a dict."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return (None, None)
+    if not isinstance(raw, dict):
+        return (None, None)
+    return _scale_bounds(raw)
+
+
+def trace_evaluator_passed(
+    output_type: str | None, value: Any, scale_max: Any
+) -> bool:
+    """CLI pass rule (`_evaluator_passed`): binary passes on 1, rating at scale_max."""
+    if value is None:
+        return False
+    if output_type == "rating":
+        if scale_max is None:
+            return False
+        try:
+            return int(value) == int(scale_max)
+        except (TypeError, ValueError):
+            return False
+    return bool(value)
 
 
 @dataclass(frozen=True)

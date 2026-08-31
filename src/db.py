@@ -10711,6 +10711,165 @@ def get_trace_eval_scores(run_uuid: str) -> List[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
+def _hydrate_trace_score_row(row: sqlite3.Row) -> Dict[str, Any]:
+    output_type = row["output_type"]
+    scale_min, scale_max = (
+        trace_scoring.scale_bounds_from_output_config(row["output_config"])
+        if output_type == "rating"
+        else (None, None)
+    )
+    return {
+        "evaluator_uuid": row["evaluator_uuid"],
+        "name": row["evaluator_name"] or row["evaluator_uuid"],
+        "evaluator_type": row["evaluator_type"],
+        "output_type": output_type,
+        "scale_min": scale_min,
+        "scale_max": scale_max,
+        "value": row["value"],
+        "reasoning": row["reasoning"],
+        "evaluator_version_id": row["evaluator_version_id"],
+        "passed": trace_scoring.trace_evaluator_passed(
+            output_type, row["value"], scale_max
+        ),
+    }
+
+
+def _trace_run_summary_from_scores(
+    status: str, scores: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    if status != trace_scoring.TraceEvalRunStatus.COMPLETED.value:
+        return {
+            "status": status,
+            "passed": None,
+            "n_passed": None,
+            "n_total": None,
+        }
+    n_total = len(scores)
+    n_passed = sum(1 for s in scores if s["passed"])
+    return {
+        "status": status,
+        "passed": n_passed == n_total,
+        "n_passed": n_passed,
+        "n_total": n_total,
+    }
+
+
+# Scores join through the pinned version for the rating scale, and through the
+# evaluator row for name/type -- soft-deleted evaluators and historical versions
+# still resolve, so a finished run renders after later edits or deletes.
+_TRACE_SCORE_JOIN_SQL = """
+LEFT JOIN trace_eval_scores ts
+  ON ts.run_uuid = runs.uuid AND ts.org_uuid = runs.org_uuid
+LEFT JOIN evaluators e
+  ON e.uuid = ts.evaluator_uuid
+LEFT JOIN evaluator_versions ev
+  ON ev.uuid = ts.evaluator_version_id
+"""
+
+_TRACE_SCORE_SELECT_SQL = """
+    runs.uuid AS run_uuid,
+    runs.trace_uuid AS trace_uuid,
+    runs.org_uuid AS org_uuid,
+    runs.status AS status,
+    runs.error AS error,
+    runs.created_at AS created_at,
+    runs.completed_at AS completed_at,
+    ts.evaluator_uuid AS evaluator_uuid,
+    ts.value AS value,
+    ts.output_type AS output_type,
+    ts.reasoning AS reasoning,
+    ts.evaluator_version_id AS evaluator_version_id,
+    e.name AS evaluator_name,
+    e.evaluator_type AS evaluator_type,
+    ev.output_config AS output_config
+"""
+
+
+def get_latest_trace_run_summaries(
+    org_uuid: str, trace_uuids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Latest run per trace (created_at DESC, id DESC) plus its row-summary.
+
+    One SELECT for the given page of trace ids. Traces with no run are omitted.
+    Non-completed runs contribute `status` only; `passed`/`n_passed`/`n_total`
+    stay None so a pending retry cannot blend with an older completed run.
+    """
+    if not trace_uuids:
+        return {}
+    unique = list(dict.fromkeys(trace_uuids))
+    placeholders = ",".join("?" * len(unique))
+    sql = f"""
+        WITH ranked AS (
+            SELECT uuid, trace_uuid, org_uuid, status, error,
+                   created_at, completed_at, id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY trace_uuid
+                       ORDER BY created_at DESC, id DESC
+                   ) AS rn
+            FROM trace_eval_runs
+            WHERE org_uuid = ? AND trace_uuid IN ({placeholders})
+        ),
+        runs AS (
+            SELECT * FROM ranked WHERE rn = 1
+        )
+        SELECT {_TRACE_SCORE_SELECT_SQL}
+        FROM runs
+        {_TRACE_SCORE_JOIN_SQL}
+        ORDER BY runs.trace_uuid, ts.evaluator_uuid
+    """
+    with get_db_connection() as conn:
+        rows = conn.execute(sql, [org_uuid] + unique).fetchall()
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        tid = row["trace_uuid"]
+        if tid not in grouped:
+            grouped[tid] = {"status": row["status"], "scores": []}
+        if row["evaluator_uuid"] is not None:
+            grouped[tid]["scores"].append(_hydrate_trace_score_row(row))
+    return {
+        tid: _trace_run_summary_from_scores(data["status"], data["scores"])
+        for tid, data in grouped.items()
+    }
+
+
+def list_trace_scoring_runs(org_uuid: str, trace_uuid: str) -> List[Dict[str, Any]]:
+    """Every run for a trace, newest first, each with hydrated per-evaluator results."""
+    sql = f"""
+        WITH runs AS (
+            SELECT uuid, trace_uuid, org_uuid, status, error,
+                   created_at, completed_at, id
+            FROM trace_eval_runs
+            WHERE org_uuid = ? AND trace_uuid = ?
+        )
+        SELECT {_TRACE_SCORE_SELECT_SQL}
+        FROM runs
+        {_TRACE_SCORE_JOIN_SQL}
+        ORDER BY runs.created_at DESC, runs.id DESC, ts.evaluator_uuid
+    """
+    with get_db_connection() as conn:
+        rows = conn.execute(sql, (org_uuid, trace_uuid)).fetchall()
+
+    runs: List[Dict[str, Any]] = []
+    index: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        run_uuid = row["run_uuid"]
+        if run_uuid not in index:
+            run = {
+                "run_uuid": run_uuid,
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "completed_at": row["completed_at"],
+                "error": row["error"],
+                "results": [],
+            }
+            index[run_uuid] = run
+            runs.append(run)
+        if row["evaluator_uuid"] is not None:
+            index[run_uuid]["results"].append(_hydrate_trace_score_row(row))
+    return runs
+
+
 def claim_trace_eval_runs(
     *,
     now: int,

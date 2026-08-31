@@ -428,3 +428,28 @@ def test_a_results_file_that_is_missing_or_mid_rewrite_reads_as_nothing_finished
     assert ts.parse_results_json(partial) == []
     partial.write_text('{"not": "a list"}')
     assert ts.parse_results_json(partial) == []
+
+
+def test_trace_evaluator_passed_matches_cli_rule():
+    assert ts.trace_evaluator_passed("binary", 1, None) is True
+    assert ts.trace_evaluator_passed("binary", 0, None) is False
+    assert ts.trace_evaluator_passed("binary", None, None) is False
+    assert ts.trace_evaluator_passed("rating", 5, 5) is True
+    assert ts.trace_evaluator_passed("rating", 5.0, 5) is True
+    assert ts.trace_evaluator_passed("rating", 4, 5) is False
+    assert ts.trace_evaluator_passed("rating", 0, 5) is False
+    assert ts.trace_evaluator_passed("rating", 5, None) is False
+    assert ts.trace_evaluator_passed("rating", None, 5) is False
+    assert ts.trace_evaluator_passed("rating", "high", 5) is False
+
+
+def test_scale_bounds_read_stored_text_and_tolerate_junk():
+    assert ts.scale_bounds_from_output_config(
+        '{"scale": [{"value": 1, "name": "Low"}, {"value": 5, "name": "High"}]}'
+    ) == (1, 5)
+    assert ts.scale_bounds_from_output_config(
+        {"scale": [{"value": 2}, {"value": 4}]}
+    ) == (2, 4)
+    assert ts.scale_bounds_from_output_config("not json") == (None, None)
+    assert ts.scale_bounds_from_output_config(None) == (None, None)
+    assert ts.scale_bounds_from_output_config({"scale": []}) == (None, None)

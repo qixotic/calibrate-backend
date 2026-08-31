@@ -6,6 +6,7 @@ so these tests write directly via raw SQL.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import uuid
 
@@ -385,3 +386,90 @@ def test_same_run_evaluator_is_unique():
     _insert_score(org, run, trace["uuid"], evaluator_version_id="v1")
     with pytest.raises(sqlite3.IntegrityError):
         _insert_score(org, run, trace["uuid"], evaluator_version_id="v2", value=0)
+
+
+# The read helpers' user-facing contract (latest-run summary fields, full
+# history, pass rule, hydration of deleted evaluators and pinned versions) is
+# pinned in test_routers_traces.py. These three cover only what the endpoints
+# cannot reach: the id tie-break, the helpers' own org filters, and the
+# single-statement guarantee behind the "no N+1" rule.
+
+
+def test_latest_run_summary_tie_breaks_on_id():
+    org = _org()
+    trace = _ingest_trace(org)
+    first = _insert_run(
+        org, trace["uuid"], status="completed", created_at=50, completed_at=50
+    )
+    second = _insert_run(
+        org, trace["uuid"], status="completed", created_at=50, completed_at=50
+    )
+    _insert_score(org, first, trace["uuid"], value=1)
+    _insert_score(org, second, trace["uuid"], value=0)
+    with db.get_db_connection() as conn:
+        ids = {
+            r["uuid"]: r["id"]
+            for r in conn.execute(
+                "SELECT uuid, id FROM trace_eval_runs WHERE uuid IN (?, ?)",
+                (first, second),
+            ).fetchall()
+        }
+    assert ids[second] > ids[first]
+
+    summary = db.get_latest_trace_run_summaries(org, [trace["uuid"]])[trace["uuid"]]
+    assert summary["passed"] is False
+    assert summary["n_passed"] == 0
+
+
+def test_score_read_helpers_are_org_scoped():
+    org_a, org_b = _org(), _org()
+    trace = _ingest_trace(org_a)
+    run = _insert_run(org_a, trace["uuid"], status="completed", completed_at=3)
+    _insert_score(org_a, run, trace["uuid"], value=1)
+    assert db.get_latest_trace_run_summaries(org_b, [trace["uuid"]]) == {}
+    assert db.list_trace_scoring_runs(org_b, trace["uuid"]) == []
+    assert (
+        db.get_latest_trace_run_summaries(org_a, [trace["uuid"]])[trace["uuid"]][
+            "passed"
+        ]
+        is True
+    )
+    assert db.list_trace_scoring_runs(org_a, trace["uuid"])[0]["results"][0][
+        "passed"
+    ] is True
+
+
+def test_latest_run_summary_one_select_for_the_page(monkeypatch):
+    org = _org()
+    traces = [_ingest_trace(org) for _ in range(3)]
+    for trace in traces:
+        run = _insert_run(org, trace["uuid"], status="completed", completed_at=4)
+        _insert_score(org, run, trace["uuid"], value=1)
+
+    executes = []
+    real_connect = db.get_db_connection
+
+    class _CountingConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=None):
+            executes.append(sql)
+            if params is None:
+                return self._conn.execute(sql)
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    @contextlib.contextmanager
+    def _counting():
+        with real_connect() as conn:
+            yield _CountingConn(conn)
+
+    monkeypatch.setattr(db, "get_db_connection", _counting)
+    result = db.get_latest_trace_run_summaries(org, [t["uuid"] for t in traces])
+    assert len(result) == 3
+    data_selects = [sql for sql in executes if "ROW_NUMBER()" in sql]
+    assert len(data_selects) == 1
+    assert len(executes) == 1
