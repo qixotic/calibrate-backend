@@ -852,7 +852,22 @@ def process_claimed_runs(
                 max_attempts=max_attempts,
             )
             continue
-        settle_trace_eval_run_completed(item.run["uuid"], scores, now=settle_now)
+        try:
+            settle_trace_eval_run_completed(item.run["uuid"], scores, now=settle_now)
+        except Exception as exc:
+            # A settle failure (a busy write, say) must not raise through the
+            # batch: the run would stay `processing` -- invisible to the attempt
+            # ceiling until its lease expires -- and strand every run after it.
+            logger.exception(
+                "trace-scoring: settling run %s raised", item.run["uuid"]
+            )
+            _defer_or_fail(
+                item.run,
+                now=settle_now,
+                error=str(exc),
+                rng=rng,
+                max_attempts=max_attempts,
+            )
 
 
 def claim_and_score_batch(

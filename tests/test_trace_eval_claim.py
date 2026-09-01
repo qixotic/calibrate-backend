@@ -632,6 +632,47 @@ def test_an_invocation_that_raises_defers_every_run_in_the_batch():
         assert row["available_at"] > 1000
 
 
+def test_a_settle_failure_defers_that_run_and_spares_the_rest_of_the_batch(
+    monkeypatch,
+):
+    """A busy write inside one run's settle transaction must not raise through
+    the batch: the failing run defers for a retry and the runs after it still
+    settle, instead of the whole tail stranding in `processing` until the
+    lease expires."""
+    org = _org()
+    agent = _agent(org)
+    evaluator_uuid, version_uuid = _evaluator(org, name="Correctness")
+    run_a = _run(org, agent, _trace(org, agent), [(evaluator_uuid, version_uuid)])
+    run_b = _run(org, agent, _trace(org, agent), [(evaluator_uuid, version_uuid)])
+
+    real_settle = db.settle_trace_eval_run_completed
+
+    def flaky_settle(run_uuid, scores, *, now):
+        if run_uuid == run_a:
+            raise RuntimeError("database table is locked")
+        return real_settle(run_uuid, scores, now=now)
+
+    monkeypatch.setattr(db, "settle_trace_eval_run_completed", flaky_settle)
+    ts.claim_and_score_batch(
+        now=1000,
+        invoke=_invoker(
+            [
+                _judged(run_a, {"Correctness": {"match": True, "reasoning": "ok"}}),
+                _judged(run_b, {"Correctness": {"match": True, "reasoning": "ok"}}),
+            ]
+        ),
+        rng=random.Random(5),
+    )
+
+    deferred = db.get_trace_eval_run(run_a)
+    assert deferred["status"] == RunStatus.PENDING.value
+    assert deferred["error"] == "database table is locked"
+    assert deferred["available_at"] > 1000
+    assert db.get_trace_eval_scores(run_a) == []
+    assert _status(run_b) == RunStatus.COMPLETED.value
+    assert [s["value"] for s in db.get_trace_eval_scores(run_b)] == [1]
+
+
 def test_retries_stop_at_the_ceiling_and_the_run_is_buried():
     org = _org()
     agent = _agent(org)
